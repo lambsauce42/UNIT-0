@@ -28,6 +28,8 @@ dist/
 build/
 out/
 coverage/
+test-results/
+playwright-report/
 
 # Caches
 .cache/

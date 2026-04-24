@@ -1,0 +1,31 @@
+{
+  "name": "unit-0",
+  "version": "0.1.0",
+  "private": true,
+  "main": "dist/main/main.js",
+  "scripts": {
+    "dev": "concurrently -k \"vite --host 127.0.0.1\" \"wait-on http://127.0.0.1:5173 && npm run build:main && cross-env VITE_DEV_SERVER_URL=http://127.0.0.1:5173 electron .\"",
+    "build": "npm run build:main && vite build",
+    "build:main": "tsc -p tsconfig.main.json",
+    "test": "playwright test",
+    "test:visible": "cross-env UNIT0_E2E_WINDOW_MODE=visible playwright test"
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "^5.0.4",
+    "electron": "^39.1.2",
+    "lucide-react": "^0.468.0",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "vite": "^7.1.12"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.56.1",
+    "@types/node": "^24.8.1",
+    "@types/react": "^19.2.2",
+    "@types/react-dom": "^19.2.2",
+    "concurrently": "^9.2.1",
+    "cross-env": "^10.1.0",
+    "typescript": "^5.9.3",
+    "wait-on": "^9.0.1"
+  }
+}
