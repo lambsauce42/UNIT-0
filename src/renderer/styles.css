@@ -149,6 +149,103 @@ button {
   opacity: 1;
 }
 
+.workspace-context-menu {
+  position: fixed;
+  z-index: 40;
+  min-width: 140px;
+  padding: 4px;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  background: var(--bg-panel);
+  box-shadow: 0 16px 36px var(--shadow-strong);
+  -webkit-app-region: no-drag;
+}
+
+.workspace-context-menu button {
+  display: block;
+  width: 100%;
+  min-height: 30px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-primary);
+  text-align: left;
+}
+
+.workspace-context-menu button:hover {
+  background: var(--bg-hover);
+}
+
+.dialog-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: grid;
+  place-items: start center;
+  padding-top: 92px;
+  background: rgba(8, 12, 18, 0.52);
+  -webkit-app-region: no-drag;
+}
+
+.workspace-name-dialog {
+  display: grid;
+  width: min(360px, calc(100vw - 32px));
+  gap: 12px;
+  padding: 16px;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  background: var(--bg-panel);
+  box-shadow: 0 18px 42px var(--shadow-strong);
+}
+
+.workspace-name-dialog label {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.workspace-name-dialog input {
+  width: 100%;
+  height: 34px;
+  padding: 0 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  outline: none;
+  background: var(--bg-panel-soft);
+  color: var(--text-primary);
+  font: inherit;
+}
+
+.workspace-name-dialog input:focus {
+  border-color: var(--accent-strong);
+  box-shadow: 0 0 0 2px var(--accent-muted);
+}
+
+.dialog-actions {
+  display: flex;
+  justify-content: end;
+  gap: 8px;
+}
+
+.dialog-actions button {
+  min-width: 76px;
+  height: 30px;
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  background: var(--bg-panel-soft);
+  color: var(--text-primary);
+}
+
+.dialog-actions button[type="submit"] {
+  border-color: var(--accent);
+  background: var(--accent-muted);
+  color: var(--accent-strong);
+}
+
+.dialog-actions button:disabled {
+  opacity: 0.45;
+}
+
 .window-tools,
 .applet-actions {
   display: flex;
@@ -202,20 +299,81 @@ button {
   align-items: center;
   min-height: 42px;
   padding: 0 14px;
+  border: 0;
   border-bottom: 1px solid var(--border-subtle);
+  background: transparent;
+  color: inherit;
+  cursor: default;
+  text-align: left;
+}
+
+.manager-row:hover {
+  background: var(--bg-hover);
 }
 
 .manager-row:last-child {
   border-bottom: 0;
 }
 
-.applet-grid {
+.workspace-layout,
+.layout-branch,
+.layout-leaf {
+  min-width: 0;
+  min-height: 0;
+}
+
+.workspace-empty {
   display: grid;
   height: 100%;
-  min-height: 0;
-  grid-template-columns: minmax(320px, 1fr) minmax(360px, 1.05fr) minmax(330px, 0.92fr);
-  grid-template-rows: minmax(260px, 1fr) minmax(260px, 1fr);
+  place-items: center;
+  border: 1px solid var(--border-subtle);
+  border-radius: 6px;
+  background: var(--bg-panel);
+}
+
+.empty-spawn-button {
+  display: inline-flex;
+  align-items: center;
   gap: 8px;
+  height: 34px;
+  padding: 0 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  background: var(--bg-panel-soft);
+  color: var(--text-primary);
+}
+
+.empty-spawn-button:hover {
+  background: var(--bg-hover);
+}
+
+.workspace-layout {
+  display: flex;
+  height: 100%;
+  gap: 8px;
+}
+
+.layout-root {
+  height: 100%;
+}
+
+.layout-row {
+  flex-direction: row;
+}
+
+.layout-column {
+  flex-direction: column;
+}
+
+.layout-branch,
+.layout-leaf {
+  display: flex;
+}
+
+.layout-branch > .workspace-layout,
+.layout-branch > .layout-leaf,
+.layout-leaf > .applet-frame {
+  flex: 1 1 auto;
 }
 
 .applet-frame {
@@ -227,31 +385,6 @@ button {
   border: 1px solid var(--border-subtle);
   border-radius: 6px;
   background: var(--bg-panel);
-}
-
-.applet-terminal {
-  grid-column: 1;
-  grid-row: 1;
-}
-
-.applet-browser {
-  grid-column: 2;
-  grid-row: 1;
-}
-
-.applet-fileViewer {
-  grid-column: 1;
-  grid-row: 2;
-}
-
-.applet-sandbox {
-  grid-column: 2;
-  grid-row: 2;
-}
-
-.applet-chat {
-  grid-column: 3;
-  grid-row: 1 / span 2;
 }
 
 .applet-header {
@@ -477,13 +610,7 @@ button {
 }
 
 @media (max-width: 1120px) {
-  .applet-grid {
-    grid-template-columns: minmax(280px, 1fr) minmax(280px, 1fr);
-    grid-template-rows: repeat(3, minmax(240px, 1fr));
-  }
-
-  .applet-chat {
-    grid-column: 1 / span 2;
-    grid-row: 3;
+  .layout-root.layout-row {
+    flex-direction: column;
   }
 }

@@ -2,6 +2,8 @@ import {
   Bot,
   Code2,
   Columns2,
+  PanelRight,
+  PanelTop,
   Globe,
   Grid2X2,
   Monitor,
@@ -23,6 +25,7 @@ import type {
   TabHostState,
   UnitState,
   Workspace,
+  WorkspaceLayoutNode,
   WorkspaceTab
 } from "../shared/types";
 import { closeHitRectForTab, closeRectForTab, insertionIndexForX, titleRectForTab } from "./tabGeometry";
@@ -41,6 +44,10 @@ type PendingDrag = {
   captureOwned: boolean;
   captureElement: HTMLElement | null;
 };
+
+type WorkspaceNameDialogState =
+  | { mode: "create"; title: string }
+  | { mode: "rename"; workspaceId: string; title: string };
 
 const iconByKind: Record<AppletKind, typeof SquareTerminal> = {
   terminal: SquareTerminal,
@@ -121,9 +128,15 @@ function WorkspaceTabStrip({ host, state, windowId }: { host: TabHostState; stat
   const publishRafRef = useRef<number | null>(null);
   const localDragRafRef = useRef<number | null>(null);
   const publishBoundsRef = useRef<() => void>(() => undefined);
-  const lastProjectionLogRef = useRef("");
-  const lastDomDragLogRef = useRef("");
   const [, forceRender] = useState(0);
+  const [nameDialog, setNameDialog] = useState<WorkspaceNameDialogState | null>(null);
+  const [contextMenu, setContextMenu] = useState<{
+    tabId: string;
+    workspaceId: string;
+    title: string;
+    left: number;
+    top: number;
+  } | null>(null);
 
   const tabIdsKey = host.tabIds.join("|");
   const baseTabs = useMemo(() => host.tabIds.map((tabId) => state.tabs[tabId]).filter(Boolean), [tabIdsKey, state.tabs]);
@@ -209,22 +222,6 @@ function WorkspaceTabStrip({ host, state, windowId }: { host: TabHostState; stat
         displayLeftsRef.current.set(item.tab.id, item.left);
       }
     }
-    const projectionKey = JSON.stringify({
-      windowId,
-      orderedTabIds: orderedTabs.map((tab) => tab.id),
-      targetLefts: tabLayout.map((item) => ({ tabId: item.tab.id, left: item.left, width: item.width })),
-      drag: state.dragSession
-        ? {
-            tabId: state.dragSession.tabId,
-            floating: state.dragSession.floating,
-            target: state.dragSession.currentTarget
-          }
-        : null
-    });
-    if (projectionKey !== lastProjectionLogRef.current) {
-      lastProjectionLogRef.current = projectionKey;
-      window.unitApi.tabs.debugLog("renderer.strip.projection", JSON.parse(projectionKey) as Record<string, unknown>);
-    }
     schedulePublishBounds();
   }, [tabLayout]);
 
@@ -276,6 +273,11 @@ function WorkspaceTabStrip({ host, state, windowId }: { host: TabHostState; stat
   useEffect(() => {
     const onResize = () => schedulePublishBounds();
     const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && (nameDialog || contextMenu)) {
+        setNameDialog(null);
+        setContextMenu(null);
+        return;
+      }
       if (event.key === "Escape") {
         pendingDragRef.current = null;
         void window.unitApi.tabs.cancelDrag();
@@ -284,6 +286,7 @@ function WorkspaceTabStrip({ host, state, windowId }: { host: TabHostState; stat
     window.addEventListener("resize", onResize);
     window.addEventListener("focus", onResize);
     window.addEventListener("keydown", onKeyDown);
+    window.addEventListener("pointerdown", dismissContextMenu);
     const resizeObserver = new ResizeObserver(onResize);
     if (stripRef.current) {
       resizeObserver.observe(stripRef.current);
@@ -297,8 +300,9 @@ function WorkspaceTabStrip({ host, state, windowId }: { host: TabHostState; stat
       window.removeEventListener("resize", onResize);
       window.removeEventListener("focus", onResize);
       window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("pointerdown", dismissContextMenu);
     };
-  }, []);
+  }, [contextMenu, nameDialog]);
 
   useEffect(() => {
     const onPointerMove = (event: PointerEvent) => {
@@ -311,15 +315,6 @@ function WorkspaceTabStrip({ host, state, windowId }: { host: TabHostState; stat
       if (!drag.dragging && crossedThreshold && !drag.beginRequested) {
         drag.dragging = true;
         drag.beginRequested = true;
-        window.unitApi.tabs.debugLog("renderer.drag.threshold", {
-          windowId,
-          tabId: drag.tabId,
-          startClient: { x: drag.startClientX, y: drag.startClientY },
-          currentClient: { x: event.clientX, y: event.clientY },
-          startScreen: { x: drag.startScreenX, y: drag.startScreenY },
-          currentScreen: { x: event.screenX, y: event.screenY },
-          hotSpot: { x: drag.hotSpotX, y: drag.hotSpotY }
-        });
         void window.unitApi.tabs.beginDrag({
           tabId: drag.tabId,
           sourceWindowId: windowId,
@@ -328,11 +323,6 @@ function WorkspaceTabStrip({ host, state, windowId }: { host: TabHostState; stat
           hotSpotX: drag.hotSpotX,
           hotSpotY: drag.hotSpotY
         }).then((result) => {
-          window.unitApi.tabs.debugLog("renderer.drag.begin-result", {
-            windowId,
-            tabId: drag.tabId,
-            captureOwned: result.captureOwned
-          });
           if (!result.captureOwned) {
             return;
           }
@@ -341,11 +331,6 @@ function WorkspaceTabStrip({ host, state, windowId }: { host: TabHostState; stat
             current.captureOwned = true;
             if (current.captureElement?.hasPointerCapture?.(event.pointerId)) {
               current.captureElement.releasePointerCapture(event.pointerId);
-              window.unitApi.tabs.debugLog("renderer.drag.capture-release", {
-                windowId,
-                tabId: drag.tabId,
-                pointerId: event.pointerId
-              });
             }
             pendingDragRef.current = null;
           }
@@ -367,11 +352,6 @@ function WorkspaceTabStrip({ host, state, windowId }: { host: TabHostState; stat
       }
       pendingDragRef.current = null;
       if (drag.dragging && !drag.captureOwned) {
-        window.unitApi.tabs.debugLog("renderer.drag.finish-local", {
-          windowId,
-          tabId: drag.tabId,
-          point: { x: event.screenX, y: event.screenY }
-        });
         void window.unitApi.tabs.finishDrag({
           screenX: event.screenX,
           screenY: event.screenY
@@ -406,11 +386,6 @@ function WorkspaceTabStrip({ host, state, windowId }: { host: TabHostState; stat
       });
     };
     const onPointerUp = (event: PointerEvent) => {
-      window.unitApi.tabs.debugLog("renderer.drag.finish-adopted-target", {
-        windowId,
-        tabId: drag.tabId,
-        point: { x: event.screenX, y: event.screenY }
-      });
       void window.unitApi.tabs.finishDrag({
         screenX: event.screenX,
         screenY: event.screenY
@@ -444,71 +419,6 @@ function WorkspaceTabStrip({ host, state, windowId }: { host: TabHostState; stat
       state.dragSession.currentTarget?.windowId === windowId
   );
   const stripRect = stripRef.current?.getBoundingClientRect() ?? null;
-
-  useLayoutEffect(() => {
-    const drag = state.dragSession;
-    if (!drag || drag.currentTarget?.windowId !== windowId) {
-      return;
-    }
-    const frame = window.requestAnimationFrame(() => {
-      const strip = stripRef.current;
-      const tabElements = [...document.querySelectorAll<HTMLElement>(`[data-tab-id="${drag.tabId}"]`)];
-      const stripBounds = strip?.getBoundingClientRect() ?? null;
-      const payload = {
-        windowId,
-        tabId: drag.tabId,
-        floating: drag.floating,
-        ownerWindowId: drag.ownerWindowId,
-        targetWindowId: drag.currentTarget?.windowId ?? null,
-        insertionIndex: drag.currentTarget?.insertionIndex ?? null,
-        currentScreen: drag.currentScreen,
-        hotSpot: drag.hotSpot,
-        renderDraggedInTargetLayer,
-        orderedTabIds: orderedTabs.map((tab) => tab.id),
-        stripRect: stripBounds ? rectToDebug(stripBounds) : null,
-        elementCount: tabElements.length,
-        elements: tabElements.map((element) => {
-          const rect = element.getBoundingClientRect();
-          const style = window.getComputedStyle(element);
-          return {
-            className: element.className,
-            dataWorkspaceTab: element.getAttribute("data-workspace-tab"),
-            testId: element.getAttribute("data-testid"),
-            ariaHidden: element.getAttribute("aria-hidden"),
-            rect: rectToDebug(rect),
-            display: style.display,
-            visibility: style.visibility,
-            opacity: style.opacity,
-            zIndex: style.zIndex,
-            transform: style.transform,
-            clippedByStrip: stripBounds
-              ? rect.right <= stripBounds.left ||
-                rect.left >= stripBounds.right ||
-                rect.bottom <= stripBounds.top ||
-                rect.top >= stripBounds.bottom
-              : null
-          };
-        })
-      };
-      const key = JSON.stringify(payload);
-      if (key !== lastDomDragLogRef.current) {
-        lastDomDragLogRef.current = key;
-        window.unitApi.tabs.debugLog("renderer.drag.dom-target", payload);
-      }
-    });
-    return () => window.cancelAnimationFrame(frame);
-  }, [
-    state.dragSession?.tabId,
-    state.dragSession?.floating,
-    state.dragSession?.ownerWindowId,
-    state.dragSession?.currentTarget?.windowId,
-    state.dragSession?.currentTarget?.insertionIndex,
-    state.dragSession?.currentScreen.x,
-    state.dragSession?.currentScreen.y,
-    renderDraggedInTargetLayer,
-    orderedTabs,
-    windowId
-  ]);
 
   const renderTab = (tab: WorkspaceTab, index: number, draggedLayer: boolean) => {
     const workspace = state.workspaces[tab.workspaceId];
@@ -553,6 +463,7 @@ function WorkspaceTabStrip({ host, state, windowId }: { host: TabHostState; stat
           if (event.button !== 0 || tab.pinned || closeHitContains(event, event.currentTarget, tab)) {
             return;
           }
+          setContextMenu(null);
           event.currentTarget.setPointerCapture(event.pointerId);
           const rect = event.currentTarget.getBoundingClientRect();
           pendingDragRef.current = {
@@ -569,21 +480,25 @@ function WorkspaceTabStrip({ host, state, windowId }: { host: TabHostState; stat
             captureOwned: false,
             captureElement: event.currentTarget
           };
-          window.unitApi.tabs.debugLog("renderer.drag.pointer-down", {
-            windowId,
-            tabId: tab.id,
-            rect: {
-              left: Math.round(rect.left),
-              top: Math.round(rect.top),
-              right: Math.round(rect.right),
-              bottom: Math.round(rect.bottom),
-              width: Math.round(rect.width),
-              height: Math.round(rect.height)
-            },
-            point: { x: event.screenX, y: event.screenY },
-            hotSpot: { x: event.clientX - rect.left, y: event.clientY - rect.top }
-          });
           forceRender((value) => value + 1);
+        }}
+        onClick={() => {
+          if (tab.pinned) {
+            void window.unitApi.tabs.activate({ windowId, tabId: tab.id });
+          }
+        }}
+        onContextMenu={(event) => {
+          event.preventDefault();
+          if (tab.workspaceId === "manager") {
+            return;
+          }
+          setContextMenu({
+            tabId: tab.id,
+            workspaceId: tab.workspaceId,
+            title: tab.title,
+            left: event.clientX,
+            top: event.clientY
+          });
         }}
         style={{
           width: layout?.width,
@@ -625,11 +540,59 @@ function WorkspaceTabStrip({ host, state, windowId }: { host: TabHostState; stat
         style={{ transform: `translateX(${totalTabsWidth + 8}px)` }}
         type="button"
         aria-label="New workspace"
+        onClick={() => {
+          setContextMenu(null);
+          setNameDialog({ mode: "create", title: "" });
+        }}
       >
         <Plus size={18} />
       </button>
+      {contextMenu ? (
+        <div
+          className="workspace-context-menu"
+          data-testid="workspace-context-menu"
+          onPointerDown={(event) => event.stopPropagation()}
+          role="menu"
+          style={{ left: contextMenu.left, top: contextMenu.top }}
+        >
+          <button
+            data-testid="workspace-context-rename"
+            onClick={() => {
+              setNameDialog({ mode: "rename", workspaceId: contextMenu.workspaceId, title: contextMenu.title });
+              setContextMenu(null);
+            }}
+            role="menuitem"
+            type="button"
+          >
+            Rename
+          </button>
+        </div>
+      ) : null}
+      {nameDialog ? (
+        <WorkspaceNameDialog
+          initialTitle={nameDialog.title}
+          mode={nameDialog.mode}
+          onCancel={() => setNameDialog(null)}
+          onSubmit={(title) => {
+            if (nameDialog.mode === "create") {
+              void window.unitApi.workspaces.createWorkspace({ windowId, title });
+            } else {
+              void window.unitApi.workspaces.renameWorkspace({ workspaceId: nameDialog.workspaceId, title });
+            }
+            setNameDialog(null);
+          }}
+        />
+      ) : null}
     </div>
   );
+
+  function dismissContextMenu(event: PointerEvent): void {
+    const target = event.target;
+    if (target instanceof Element && target.closest(".workspace-context-menu")) {
+      return;
+    }
+    setContextMenu(null);
+  }
 
   function closeHitContains(event: React.PointerEvent<HTMLElement>, element: HTMLElement, tab: WorkspaceTab): boolean {
     if (!tab.closable) {
@@ -641,16 +604,77 @@ function WorkspaceTabStrip({ host, state, windowId }: { host: TabHostState; stat
   }
 }
 
+function WorkspaceNameDialog({
+  initialTitle,
+  mode,
+  onCancel,
+  onSubmit
+}: {
+  initialTitle: string;
+  mode: "create" | "rename";
+  onCancel: () => void;
+  onSubmit: (title: string) => void;
+}) {
+  const [title, setTitle] = useState(initialTitle);
+  const inputRef = useRef<HTMLInputElement | null>(null);
+  const trimmedTitle = title.trim();
+  useEffect(() => {
+    inputRef.current?.focus();
+    inputRef.current?.select();
+  }, []);
+  return (
+    <div className="dialog-backdrop" data-testid="workspace-name-dialog" role="presentation">
+      <form
+        className="workspace-name-dialog"
+        onSubmit={(event) => {
+          event.preventDefault();
+          if (trimmedTitle) {
+            onSubmit(trimmedTitle);
+          }
+        }}
+      >
+        <label htmlFor="workspace-title-input">{mode === "create" ? "Workspace name" : "Rename workspace"}</label>
+        <input
+          id="workspace-title-input"
+          ref={inputRef}
+          value={title}
+          onChange={(event) => setTitle(event.target.value)}
+          aria-label="Workspace name"
+        />
+        <div className="dialog-actions">
+          <button onClick={onCancel} type="button">
+            Cancel
+          </button>
+          <button disabled={!trimmedTitle} type="submit">
+            {mode === "create" ? "Create" : "Rename"}
+          </button>
+        </div>
+      </form>
+    </div>
+  );
+}
+
 function WorkspaceManagerSurface({ state }: { state: UnitState }) {
   const workspaces = Object.values(state.workspaces).filter((workspace) => workspace.id !== "manager");
+  const primaryHost = state.hosts[state.primaryWindowId];
   return (
     <section className="workspace-manager" data-testid="workspace-manager">
       <div className="manager-list">
         {workspaces.map((workspace) => (
-          <div className="manager-row" key={workspace.id}>
+          <button
+            className="manager-row"
+            data-testid={`workspace-manager-row-${workspace.id}`}
+            key={workspace.id}
+            onClick={() => {
+              if (primaryHost) {
+                void window.unitApi.workspaces.openWorkspaceTab({ windowId: primaryHost.windowId, workspaceId: workspace.id });
+              }
+            }}
+            type="button"
+          >
             <span>{workspace.title}</span>
             <span>{workspace.applets.length}</span>
-          </div>
+          </button>
         ))}
       </div>
     </section>
@@ -658,44 +682,141 @@ function WorkspaceManagerSurface({ state }: { state: UnitState }) {
 }
 
 function WorkspaceSurface({ state, workspace }: { state: UnitState; workspace: Workspace }) {
-  const applets = useMemo(
+  const appletsById = useMemo(
     () =>
-      workspace.applets
-        .map((instance) => ({
-          instance,
-          session: state.appletSessions[instance.sessionId]
-        }))
-        .filter((item): item is { instance: typeof item.instance; session: AppletSession } => Boolean(item.session)),
+      new Map(
+        workspace.applets.map((instance) => [
+          instance.id,
+          {
+            instance,
+            session: state.appletSessions[instance.sessionId]
+          }
+        ])
+      ),
     [state.appletSessions, workspace.applets]
   );
   return (
     <section className="workspace-surface" data-testid="workspace-surface">
-      <div className="applet-grid">
-        {applets.map(({ instance, session }) => (
-          <AppletFrame key={instance.id} session={session} area={instance.area} />
-        ))}
-      </div>
+      {workspace.layout ? (
+        <WorkspaceLayout node={workspace.layout} appletsById={appletsById} workspaceId={workspace.id} root />
+      ) : (
+        <div className="workspace-empty" data-testid="workspace-empty">
+          <button
+            className="empty-spawn-button"
+            type="button"
+            onClick={() => {
+              void window.unitApi.applets.createApplet({ workspaceId: workspace.id, kind: "terminal" });
+            }}
+          >
+            <SquareTerminal size={17} />
+            <span>New terminal</span>
+          </button>
+        </div>
+      )}
     </section>
   );
 }
 
-function AppletFrame({ session, area }: { session: AppletSession; area: string }) {
-  const Icon = iconByKind[session.kind];
+function WorkspaceLayout({
+  node,
+  appletsById,
+  workspaceId,
+  root = false
+}: {
+  node: WorkspaceLayoutNode;
+  appletsById: Map<string, { instance: Workspace["applets"][number]; session: AppletSession | undefined }>;
+  workspaceId: string;
+  root?: boolean;
+}) {
+  if (node.type === "leaf") {
+    const applet = appletsById.get(node.appletInstanceId);
+    if (!applet?.session) {
+      throw new Error(`Layout leaf references missing applet instance ${node.appletInstanceId}`);
+    }
+    return (
+      <div className="layout-leaf" data-testid={`layout-leaf-${node.appletInstanceId}`}>
+        <AppletFrame session={applet.session} instanceId={applet.instance.id} leafId={node.id} workspaceId={workspaceId} />
+      </div>
+    );
+  }
+  const firstBasis = `${node.ratio * 100}%`;
+  const secondBasis = `${(1 - node.ratio) * 100}%`;
   return (
-    <section className={`applet-frame applet-${area}`} data-testid={`applet-${session.kind}`}>
+    <div
+      className={`workspace-layout layout-split layout-${node.direction} ${root ? "layout-root" : ""}`}
+      data-testid={root ? "workspace-layout" : undefined}
+      data-layout-direction={node.direction}
+    >
+      <div className="layout-branch" style={{ flex: `${node.ratio} 1 ${firstBasis}` }}>
+        <WorkspaceLayout node={node.first} appletsById={appletsById} workspaceId={workspaceId} />
+      </div>
+      <div className="layout-branch" style={{ flex: `${1 - node.ratio} 1 ${secondBasis}` }}>
+        <WorkspaceLayout node={node.second} appletsById={appletsById} workspaceId={workspaceId} />
+      </div>
+    </div>
+  );
+}
+
+function AppletFrame({
+  session,
+  instanceId,
+  leafId,
+  workspaceId
+}: {
+  session: AppletSession;
+  instanceId: string;
+  leafId: string;
+  workspaceId: string;
+}) {
+  const Icon = iconByKind[session.kind];
+  const createTerminal = (splitDirection: "row" | "column") => {
+    void window.unitApi.applets.createApplet({
+      workspaceId,
+      kind: "terminal",
+      targetLeafId: leafId,
+      splitDirection
+    });
+  };
+  return (
+    <section className="applet-frame" data-testid={`applet-${session.kind}`} data-applet-instance-id={instanceId}>
       <header className="applet-header">
         <div className="applet-title">
           <Icon size={15} />
           <span>{session.title}</span>
         </div>
         <div className="applet-actions">
-          <button className="icon-button" type="button" aria-label={`${session.title} add`}>
+          <button
+            className="icon-button"
+            type="button"
+            aria-label={`${session.title} add terminal`}
+            onClick={() => createTerminal("row")}
+          >
             <Plus size={16} />
           </button>
-          <button className="icon-button" type="button" aria-label={`${session.title} split`}>
-            <Columns2 size={16} />
+          <button
+            className="icon-button"
+            type="button"
+            aria-label={`${session.title} split right`}
+            onClick={() => createTerminal("row")}
+          >
+            <PanelRight size={16} />
           </button>
-          <button className="icon-button" type="button" aria-label={`${session.title} close`}>
+          <button
+            className="icon-button"
+            type="button"
+            aria-label={`${session.title} split down`}
+            onClick={() => createTerminal("column")}
+          >
+            <PanelTop size={16} />
+          </button>
+          <button
+            className="icon-button"
+            type="button"
+            aria-label={`${session.title} close`}
+            onClick={() => {
+              void window.unitApi.applets.closeAppletInstance({ workspaceId, appletInstanceId: instanceId });
+            }}
+          >
             <Trash2 size={15} />
           </button>
           <button className="icon-button" type="button" aria-label={`${session.title} menu`}>
@@ -807,17 +928,6 @@ function toClientRect(rect: DOMRect): RectLike {
     top: rect.top,
     right: rect.right,
     bottom: rect.bottom
-  };
-}
-
-function rectToDebug(rect: DOMRect): Record<string, number> {
-  return {
-    left: Math.round(rect.left),
-    top: Math.round(rect.top),
-    right: Math.round(rect.right),
-    bottom: Math.round(rect.bottom),
-    width: Math.round(rect.width),
-    height: Math.round(rect.height)
   };
 }
 

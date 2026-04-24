@@ -1,14 +1,18 @@
 import { app, BrowserWindow, Menu, ipcMain, screen } from "electron";
-import fs from "node:fs";
 import path from "node:path";
 import type {
   AppletSession,
   BeginTabDragPayload,
   BootstrapPayload,
+  CloseAppletInstancePayload,
   CloseTabPayload,
+  CreateAppletPayload,
+  CreateWorkspacePayload,
   FinishTabDragPayload,
+  OpenWorkspaceTabPayload,
   RectLike,
   RegisterStripBoundsPayload,
+  RenameWorkspacePayload,
   TabDragSession,
   TabDropTarget,
   TabHostSnapshot,
@@ -16,8 +20,10 @@ import type {
   UnitState,
   UpdateTabDragPayload,
   Workspace,
+  AppletInstance,
   WorkspaceTab
 } from "../shared/types.js";
+import { WorkspaceStateStore } from "./workspaceStateStore.js";
 
 const preloadPath = path.join(__dirname, "../preload/preload.js");
 const rendererEntry = path.join(__dirname, "../renderer/index.html");
@@ -30,67 +36,11 @@ let overlayWindowsVisible = false;
 
 const DROP_SLOP = { left: 8, top: 4, right: 8, bottom: 40 };
 const TAB_PREVIEW_SIZE = { width: 220, height: 46 };
-const TAB_DEBUG = process.env.UNIT0_TAB_DEBUG !== "0";
-const TAB_DEBUG_VERBOSE = process.env.UNIT0_TAB_DEBUG_VERBOSE === "1";
 const TEST_WINDOW_MODE = process.env.UNIT0_E2E_WINDOW_MODE;
 const HIDE_TEST_WINDOWS = process.env.NODE_ENV === "test" && TEST_WINDOW_MODE !== "visible";
-const debugLogPath = path.join(process.cwd(), "logs", "tab-drag-debug.log");
-let debugSeq = 0;
-const stripDebugKeys = new Map<number, string>();
-
-function debugLog(event: string, data: Record<string, unknown> = {}): void {
-  if (!TAB_DEBUG) {
-    return;
-  }
-  const entry = {
-    seq: ++debugSeq,
-    t: new Date().toISOString(),
-    event,
-    ...data
-  };
-  const line = `[tab-drag] ${JSON.stringify(entry)}`;
-  console.log(line);
-  try {
-    fs.mkdirSync(path.dirname(debugLogPath), { recursive: true });
-    fs.appendFileSync(debugLogPath, `${line}\n`, "utf8");
-  } catch (error) {
-    console.warn("[tab-drag] failed to write debug log", error);
-  }
-}
-
-function rectDebug(rect: RectLike | Electron.Rectangle | undefined): Record<string, number> | null {
-  if (!rect) {
-    return null;
-  }
-  if ("right" in rect) {
-    return {
-      left: Math.round(rect.left),
-      top: Math.round(rect.top),
-      right: Math.round(rect.right),
-      bottom: Math.round(rect.bottom),
-      width: Math.round(rect.right - rect.left),
-      height: Math.round(rect.bottom - rect.top)
-    };
-  }
-  return {
-    left: Math.round(rect.x),
-    top: Math.round(rect.y),
-    right: Math.round(rect.x + rect.width),
-    bottom: Math.round(rect.y + rect.height),
-    width: Math.round(rect.width),
-    height: Math.round(rect.height)
-  };
-}
 
 function uniqueWindowIds(windowIds: number[]): number[] {
   return [...new Set(windowIds)];
-}
-
-function pointDebug(point: { x?: number; y?: number; screenX?: number; screenY?: number }): Record<string, number> {
-  return {
-    x: Math.round(point.x ?? point.screenX ?? 0),
-    y: Math.round(point.y ?? point.screenY ?? 0)
-  };
 }
 
 type DragFinishResult =
@@ -117,76 +67,24 @@ const pendingAlignments = new Map<number, PendingAlignment>();
 const earlyClosedDragSourceWindowIds = new Set<number>();
 
 class TabRegistry {
-  readonly appletSessions: Record<string, AppletSession> = {
-    "session-terminal": { id: "session-terminal", kind: "terminal", title: "Terminal" },
-    "session-file-viewer": { id: "session-file-viewer", kind: "fileViewer", title: "File Viewer" },
-    "session-browser": { id: "session-browser", kind: "browser", title: "Browser" },
-    "session-chat": { id: "session-chat", kind: "chat", title: "Chat" },
-    "session-sandbox": { id: "session-sandbox", kind: "sandbox", title: "Sandbox" }
-  };
-
-  readonly workspaces: Record<string, Workspace> = {
-    manager: { id: "manager", title: "Workspace Manager", applets: [] },
-    atlas: {
-      id: "atlas",
-      title: "Project Atlas",
-      applets: [
-        { id: "atlas-terminal", sessionId: "session-terminal", area: "terminal" },
-        { id: "atlas-browser", sessionId: "session-browser", area: "browser" },
-        { id: "atlas-file-viewer", sessionId: "session-file-viewer", area: "fileViewer" },
-        { id: "atlas-sandbox", sessionId: "session-sandbox", area: "sandbox" },
-        { id: "atlas-chat", sessionId: "session-chat", area: "chat" }
-      ]
-    },
-    redesign: {
-      id: "redesign",
-      title: "Website Redesign",
-      applets: [
-        { id: "redesign-browser", sessionId: "session-browser", area: "browser" },
-        { id: "redesign-chat", sessionId: "session-chat", area: "chat" },
-        { id: "redesign-file-viewer", sessionId: "session-file-viewer", area: "fileViewer" }
-      ]
-    },
-    lab: {
-      id: "lab",
-      title: "VM Lab",
-      applets: [
-        { id: "lab-sandbox", sessionId: "session-sandbox", area: "sandbox" },
-        { id: "lab-terminal", sessionId: "session-terminal", area: "terminal" }
-      ]
-    },
-    research: {
-      id: "research",
-      title: "Research",
-      applets: [
-        { id: "research-browser", sessionId: "session-browser", area: "browser" },
-        { id: "research-chat", sessionId: "session-chat", area: "chat" }
-      ]
-    }
-  };
-
-  readonly tabs: Record<string, WorkspaceTab> = {
-    "tab-manager": {
-      id: "tab-manager",
-      title: "Workspace Manager",
-      workspaceId: "manager",
-      pinned: true,
-      closable: false
-    },
-    "tab-atlas": { id: "tab-atlas", title: "Project Atlas", workspaceId: "atlas", pinned: false, closable: true },
-    "tab-redesign": { id: "tab-redesign", title: "Website Redesign", workspaceId: "redesign", pinned: false, closable: true },
-    "tab-lab": { id: "tab-lab", title: "VM Lab", workspaceId: "lab", pinned: false, closable: true },
-    "tab-research": { id: "tab-research", title: "Research", workspaceId: "research", pinned: false, closable: true }
-  };
-
+  readonly appletSessions: Record<string, AppletSession>;
+  readonly workspaces: Record<string, Workspace>;
+  readonly tabs: Record<string, WorkspaceTab>;
   readonly hosts: Record<number, TabHostState> = {};
   readonly stripBounds = new Map<number, RegisterStripBoundsPayload>();
   primaryWindowId = 0;
   dragSession: TabDragSession | null = null;
   shuttingDown = false;
-  private updateCount = 0;
+  private readonly primaryHostSnapshot: TabHostSnapshot;
   private lastTargetKey = "";
-  private lastDropDiagnostics: Record<string, unknown> | null = null;
+
+  constructor(private readonly store: WorkspaceStateStore) {
+    const model = store.load();
+    this.appletSessions = model.appletSessions;
+    this.workspaces = model.workspaces;
+    this.tabs = model.tabs;
+    this.primaryHostSnapshot = model.primaryHost;
+  }
 
   snapshot(): UnitState {
     return structuredClone({
@@ -215,27 +113,19 @@ class TabRegistry {
         activeTabId: options.tabId,
         isPrimary: false
       };
-      debugLog("registry.window.register", {
-        windowId,
-        primary: false,
-        tabId: options.tabId,
-        host: this.hosts[windowId]
-      });
       return;
     }
-    const tabIds = isFirst ? ["tab-manager", "tab-atlas", "tab-redesign", "tab-lab", "tab-research"] : [];
+    const tabIds = isFirst ? [...this.primaryHostSnapshot.tabIds] : [];
     this.hosts[windowId] = {
       windowId,
       tabIds,
-      activeTabId: tabIds.includes("tab-atlas") ? "tab-atlas" : (tabIds[0] ?? ""),
+      activeTabId: isFirst && tabIds.includes(this.primaryHostSnapshot.activeTabId)
+        ? this.primaryHostSnapshot.activeTabId
+        : (tabIds[0] ?? ""),
       isPrimary: isFirst
     };
-    debugLog("registry.window.register", {
-      windowId,
-      primary: isFirst,
-      tabIds,
-      activeTabId: this.hosts[windowId].activeTabId
-    });
+    this.normalizeHost(this.hosts[windowId]);
+    this.persistPrimaryHost();
   }
 
   activate(windowId: number, tabId: string): void {
@@ -244,55 +134,26 @@ class TabRegistry {
       return;
     }
     host.activeTabId = tabId;
+    this.persistPrimaryHost();
   }
 
   registerStripBounds(payload: RegisterStripBoundsPayload): void {
     const normalized = normalizeStripBounds(payload);
     this.stripBounds.set(payload.windowId, normalized);
-    const logPayload = {
-      windowId: normalized.windowId,
-      rawBounds: rectDebug(payload.bounds),
-      bounds: rectDebug(normalized.bounds),
-      correction: stripCorrection(payload.windowId),
-      hostTabIds: this.hosts[normalized.windowId]?.tabIds ?? [],
-      activeTabId: this.hosts[normalized.windowId]?.activeTabId ?? null,
-      metrics: normalized.tabMetrics.map((metric) => ({
-        tabId: metric.tabId,
-        left: Math.round(metric.left),
-        width: Math.round(metric.width),
-        center: Math.round(metric.left + metric.width / 2)
-      }))
-    };
-    const debugKey = JSON.stringify(logPayload);
-    if (TAB_DEBUG_VERBOSE || stripDebugKeys.get(normalized.windowId) !== debugKey) {
-      stripDebugKeys.set(normalized.windowId, debugKey);
-      debugLog("strip.bounds.register", logPayload);
-    }
     alignPendingWindow(normalized);
   }
 
   beginDrag(payload: BeginTabDragPayload): boolean {
     if (this.dragSession) {
-      debugLog("drag.begin.reject.active-session", { payload });
       return false;
     }
     const tab = this.tabs[payload.tabId];
     const sourceHost = this.hosts[payload.sourceWindowId];
     if (!tab || tab.pinned || !sourceHost) {
-      debugLog("drag.begin.reject.invalid-source", {
-        payload,
-        tabExists: Boolean(tab),
-        pinned: tab?.pinned ?? null,
-        sourceHostExists: Boolean(sourceHost)
-      });
       return false;
     }
     const originalIndex = sourceHost.tabIds.indexOf(payload.tabId);
     if (originalIndex === -1) {
-      debugLog("drag.begin.reject.tab-not-in-source", {
-        payload,
-        sourceTabIds: sourceHost.tabIds
-      });
       return false;
     }
     const previousActiveByWindow = Object.fromEntries(
@@ -311,18 +172,7 @@ class TabRegistry {
       floating: false,
       finishing: false
     };
-    this.updateCount = 0;
     this.lastTargetKey = "";
-    debugLog("drag.begin.accept", {
-      tabId: payload.tabId,
-      title: tab.title,
-      sourceWindowId: payload.sourceWindowId,
-      sourceTabIds: sourceHost.tabIds,
-      originalIndex,
-      start: pointDebug({ screenX: payload.screenX, screenY: payload.screenY }),
-      hotSpot: pointDebug({ x: payload.hotSpotX, y: payload.hotSpotY }),
-      stripWindows: [...this.stripBounds.keys()]
-    });
     this.updateDrag({ screenX: payload.screenX, screenY: payload.screenY });
     return true;
   }
@@ -336,26 +186,9 @@ class TabRegistry {
     const target = this.validTarget(this.dropTargetFor(payload.screenX, payload.screenY));
     session.currentTarget = target;
     session.floating = target === null;
-    this.updateCount += 1;
     const nextKey = target ? `${target.windowId}:${target.insertionIndex}` : "floating";
     const targetChanged = nextKey !== this.lastTargetKey;
-    if (targetChanged || this.updateCount % 12 === 0) {
-      debugLog("drag.update.target", {
-        count: this.updateCount,
-        tabId: session.tabId,
-        point: pointDebug({ screenX: payload.screenX, screenY: payload.screenY }),
-        floating: session.floating,
-        target: target
-          ? {
-              windowId: target.windowId,
-              insertionIndex: target.insertionIndex,
-              screenRect: rectDebug(target.screenRect),
-              targetHostTabIds: this.hosts[target.windowId]?.tabIds ?? []
-            }
-          : null,
-        ownerWindowId: session.ownerWindowId,
-        diagnostics: this.lastDropDiagnostics
-      });
+    if (targetChanged) {
       this.lastTargetKey = nextKey;
     }
     const earlyCloseResult = this.maybeCloseEmptyDetachedSourceDuringDrag();
@@ -370,26 +203,11 @@ class TabRegistry {
     const updateResult = this.updateDrag({ screenX: payload.screenX, screenY: payload.screenY });
     session.finishing = true;
     const target = this.validTarget(session.currentTarget);
-    debugLog("drag.finish.start", {
-      tabId: session.tabId,
-      point: pointDebug({ screenX: payload.screenX, screenY: payload.screenY }),
-      target: target
-        ? { windowId: target.windowId, insertionIndex: target.insertionIndex, screenRect: rectDebug(target.screenRect) }
-        : null,
-      floating: !target,
-      diagnostics: this.lastDropDiagnostics
-    });
     if (target) {
       this.moveDraggedTabTo(target.windowId, target.insertionIndex);
       const closeWindowIds = uniqueWindowIds([...this.emptyDetachedWindowIds(), ...updateResult.closeWindowIds]);
       this.dragSession = null;
-      debugLog("drag.finish.attach", {
-        tabId: session.tabId,
-        targetWindowId: target.windowId,
-        insertionIndex: target.insertionIndex,
-        targetTabIds: this.hosts[target.windowId]?.tabIds ?? [],
-        closeWindowIds
-      });
+      this.persistPrimaryHost();
       return { action: "none", closeWindowIds };
     }
     this.floatDraggedTab();
@@ -402,13 +220,7 @@ class TabRegistry {
       closeWindowIds
     };
     this.dragSession = null;
-    debugLog("drag.finish.detach", {
-      tabId: session.tabId,
-      createAt: { x: result.x, y: result.y },
-      release: pointDebug({ screenX: payload.screenX, screenY: payload.screenY }),
-      hotSpot: pointDebug(session.hotSpot),
-      closeWindowIds
-    });
+    this.persistPrimaryHost();
     return result;
   }
 
@@ -418,12 +230,6 @@ class TabRegistry {
       return;
     }
     session.finishing = true;
-    debugLog("drag.cancel", {
-      tabId: session.tabId,
-      touchedHosts: Object.keys(session.touchedHostSnapshots),
-      point: pointDebug(session.currentScreen),
-      target: session.currentTarget
-    });
     for (const [windowIdText, snapshot] of Object.entries(session.touchedHostSnapshots)) {
       const windowId = Number(windowIdText);
       if (earlyClosedDragSourceWindowIds.has(windowId)) {
@@ -446,6 +252,7 @@ class TabRegistry {
     }
     earlyClosedDragSourceWindowIds.clear();
     this.dragSession = null;
+    this.persistPrimaryHost();
   }
 
   closeTab(payload: CloseTabPayload): { closeWindowIds: number[] } {
@@ -456,7 +263,75 @@ class TabRegistry {
     }
     host.tabIds = host.tabIds.filter((id) => id !== payload.tabId);
     this.normalizeHost(host);
+    this.persistPrimaryHost();
     return { closeWindowIds: this.shouldCloseEmptyDetached(payload.windowId) ? [payload.windowId] : [] };
+  }
+
+  createWorkspace(windowId: number, title: string): Workspace {
+    const host = this.hosts[windowId];
+    if (!host || this.dragSession) {
+      throw new Error(`Cannot create workspace in window ${windowId}`);
+    }
+    const created = this.store.createWorkspace(title);
+    this.workspaces[created.workspace.id] = created.workspace;
+    this.tabs[created.tab.id] = created.tab;
+    this.addTabToHost(host, created.tab.id);
+    this.persistPrimaryHost();
+    return structuredClone(created.workspace);
+  }
+
+  openWorkspaceTab(windowId: number, workspaceId: string): void {
+    const host = this.hosts[windowId];
+    const workspace = this.workspaces[workspaceId];
+    if (!host || !workspace || this.dragSession) {
+      throw new Error(`Cannot open workspace ${workspaceId} in window ${windowId}`);
+    }
+    const tab = this.store.openWorkspaceTab(workspaceId);
+    this.tabs[tab.id] = tab;
+    this.addTabToHost(host, tab.id);
+    this.persistPrimaryHost();
+  }
+
+  renameWorkspace(workspaceId: string, title: string): void {
+    const renamed = this.store.renameWorkspace(workspaceId, title);
+    const workspace = this.workspaces[workspaceId];
+    if (!workspace) {
+      throw new Error(`Workspace ${workspaceId} does not exist`);
+    }
+    workspace.title = renamed.title;
+    for (const tab of Object.values(this.tabs)) {
+      if (tab.workspaceId === workspaceId) {
+        tab.title = renamed.title;
+      }
+    }
+  }
+
+  createApplet(payload: CreateAppletPayload): AppletInstance {
+    const workspace = this.workspaces[payload.workspaceId];
+    if (!workspace || this.dragSession) {
+      throw new Error(`Cannot create applet in workspace ${payload.workspaceId}`);
+    }
+    const result = this.store.createApplet(payload);
+    this.workspaces[payload.workspaceId] = result.workspace;
+    for (const [sessionId, session] of Object.entries(result.appletSessions)) {
+      this.appletSessions[sessionId] = session;
+    }
+    if (!result.instance) {
+      throw new Error("Applet creation did not return an applet instance");
+    }
+    return structuredClone(result.instance);
+  }
+
+  closeAppletInstance(payload: CloseAppletInstancePayload): void {
+    const workspace = this.workspaces[payload.workspaceId];
+    if (!workspace || this.dragSession) {
+      throw new Error(`Cannot close applet instance ${payload.appletInstanceId}`);
+    }
+    const result = this.store.closeAppletInstance(payload.workspaceId, payload.appletInstanceId);
+    this.workspaces[payload.workspaceId] = result.workspace;
+    if (result.deletedSessionId) {
+      delete this.appletSessions[result.deletedSessionId];
+    }
   }
 
   windowClosed(windowId: number): void {
@@ -491,12 +366,15 @@ class TabRegistry {
       }
     }
     this.normalizeHost(primary);
+    this.persistPrimaryHost();
   }
 
   beginShutdown(): number[] {
+    this.mergeDetachedTabsIntoPrimaryHost();
     this.shuttingDown = true;
     this.dragSession = null;
     hideCaptureOverlays();
+    this.persistPrimaryHost();
     return Object.keys(this.hosts)
       .map((value) => Number(value))
       .filter((windowId) => windowId !== this.primaryWindowId);
@@ -513,13 +391,6 @@ class TabRegistry {
     if (currentOwner === targetWindowId && targetHost.tabIds.indexOf(session.tabId) === insertAt) {
       session.ownerWindowId = targetWindowId;
       session.floating = false;
-      debugLog("drag.move.noop", {
-        tabId: session.tabId,
-        targetWindowId,
-        targetIndex,
-        insertAt,
-        tabIds: targetHost.tabIds
-      });
       return;
     }
     if (currentOwner !== null) {
@@ -535,15 +406,6 @@ class TabRegistry {
     this.restorePreviousActive(targetHost);
     session.ownerWindowId = targetWindowId;
     session.floating = false;
-    debugLog("drag.move.commit", {
-      tabId: session.tabId,
-      fromWindowId: currentOwner,
-      targetWindowId,
-      targetIndex,
-      insertAt,
-      targetTabIds: targetHost.tabIds,
-      sourceTabIds: currentOwner !== null ? (this.hosts[currentOwner]?.tabIds ?? null) : null
-    });
   }
 
   private floatDraggedTab(): void {
@@ -561,11 +423,6 @@ class TabRegistry {
     session.ownerWindowId = null;
     session.floating = true;
     session.currentTarget = null;
-    debugLog("drag.float.commit", {
-      tabId: session.tabId,
-      previousOwner: owner,
-      remainingTabIds: owner !== null ? (this.hosts[owner]?.tabIds ?? []) : []
-    });
   }
 
   private maybeCloseEmptyDetachedSourceDuringDrag(): DragUpdateResult {
@@ -589,19 +446,6 @@ class TabRegistry {
     sourceHost.activeTabId = "";
     session.ownerWindowId = null;
     earlyClosedDragSourceWindowIds.add(session.sourceWindowId);
-    debugLog("drag.source.empty-detached-close", {
-      tabId: session.tabId,
-      sourceWindowId: session.sourceWindowId,
-      target: session.currentTarget
-        ? {
-            windowId: session.currentTarget.windowId,
-            insertionIndex: session.currentTarget.insertionIndex,
-            screenRect: rectDebug(session.currentTarget.screenRect)
-          }
-        : null,
-      floating: session.floating,
-      point: pointDebug(session.currentScreen)
-    });
     return { closeWindowIds: [session.sourceWindowId], captureOverlayPointer: true, stateChanged: true, targetChanged: false };
   }
 
@@ -615,12 +459,6 @@ class TabRegistry {
       tabIds: [...host.tabIds],
       activeTabId: host.activeTabId
     };
-    debugLog("drag.snapshot.host", {
-      tabId: session.tabId,
-      windowId,
-      tabIds: host.tabIds,
-      activeTabId: host.activeTabId
-    });
   }
 
   private restorePreviousActive(host: TabHostState): void {
@@ -658,27 +496,11 @@ class TabRegistry {
           bottom: screenY - session.hotSpot.y + TAB_PREVIEW_SIZE.height
         }
       : null;
-    const strips: Array<Record<string, unknown>> = [];
     for (const strip of this.stripBounds.values()) {
       const expanded = this.expandRect(strip.bounds, DROP_SLOP);
       const pointerInside = this.pointInRect(screenX, screenY, expanded);
       const ghostIntersects = Boolean(dragRect && this.rectsIntersect(dragRect, expanded));
       const insertionIndex = this.insertionIndexFor(strip, screenX);
-      strips.push({
-        windowId: strip.windowId,
-        bounds: rectDebug(strip.bounds),
-        expanded: rectDebug(expanded),
-        pointerInside,
-        ghostIntersects,
-        insertionIndex,
-        hostTabIds: this.hosts[strip.windowId]?.tabIds ?? [],
-        metrics: strip.tabMetrics.map((metric) => ({
-          tabId: metric.tabId,
-          left: Math.round(metric.left),
-          width: Math.round(metric.width),
-          center: Math.round(metric.left + metric.width / 2)
-        }))
-      });
       if (!pointerInside && !ghostIntersects) {
         continue;
       }
@@ -697,16 +519,7 @@ class TabRegistry {
         ((rightCenter.x - screenX) ** 2 + (rightCenter.y - screenY) ** 2)
       );
     });
-    const selected = candidates[0] ?? null;
-    this.lastDropDiagnostics = {
-      point: pointDebug({ screenX, screenY }),
-      ghostRect: rectDebug(dragRect ?? undefined),
-      stripCount: this.stripBounds.size,
-      candidateCount: candidates.length,
-      selected: selected ? { windowId: selected.windowId, insertionIndex: selected.insertionIndex } : null,
-      strips
-    };
-    return selected;
+    return candidates[0] ?? null;
   }
 
   private insertionIndexFor(strip: RegisterStripBoundsPayload, screenX: number): number {
@@ -723,32 +536,10 @@ class TabRegistry {
       }
       const center = metric.left + metric.width / 2;
       if (screenX < center) {
-        const index = this.clampedInsertionIndex(host, candidateOrder.indexOf(tabId), draggedTabId);
-        if (TAB_DEBUG_VERBOSE) {
-          debugLog("drag.insertion.before-center", {
-            windowId: strip.windowId,
-            screenX: Math.round(screenX),
-            beforeTabId: tabId,
-            center: Math.round(center),
-            candidateOrder,
-            draggedTabId,
-            index
-          });
-        }
-        return index;
+        return this.clampedInsertionIndex(host, candidateOrder.indexOf(tabId), draggedTabId);
       }
     }
-    const index = this.clampedInsertionIndex(host, candidateOrder.length, draggedTabId);
-    if (TAB_DEBUG_VERBOSE) {
-      debugLog("drag.insertion.end", {
-        windowId: strip.windowId,
-        screenX: Math.round(screenX),
-        candidateOrder,
-        draggedTabId,
-        index
-      });
-    }
-    return index;
+    return this.clampedInsertionIndex(host, candidateOrder.length, draggedTabId);
   }
 
   private clampedInsertionIndex(host: TabHostState, targetIndex: number, draggedTabId?: string): number {
@@ -778,6 +569,48 @@ class TabRegistry {
       host.tabIds = host.tabIds.filter((id) => id !== tabId);
       this.normalizeHost(host);
     }
+    this.persistPrimaryHost();
+  }
+
+  private addTabToHost(host: TabHostState, tabId: string): void {
+    this.removeTabFromAllHosts(tabId);
+    if (host.isPrimary) {
+      const firstMovable = this.firstMovableIndex(host);
+      host.tabIds.splice(Math.max(firstMovable, host.tabIds.length), 0, tabId);
+    } else {
+      host.tabIds.push(tabId);
+    }
+    host.activeTabId = tabId;
+    this.normalizeHost(host);
+  }
+
+  private mergeDetachedTabsIntoPrimaryHost(): void {
+    const primary = this.hosts[this.primaryWindowId];
+    if (!primary) {
+      return;
+    }
+    for (const host of Object.values(this.hosts)) {
+      if (host.windowId === this.primaryWindowId) {
+        continue;
+      }
+      for (const tabId of host.tabIds) {
+        if (!primary.tabIds.includes(tabId)) {
+          primary.tabIds.push(tabId);
+        }
+      }
+    }
+    this.normalizeHost(primary);
+  }
+
+  private persistPrimaryHost(): void {
+    const primary = this.hosts[this.primaryWindowId];
+    if (!primary) {
+      return;
+    }
+    this.store.savePrimaryHost({
+      tabIds: [...primary.tabIds],
+      activeTabId: primary.activeTabId
+    });
   }
 
   private findOwner(tabId: string): number | null {
@@ -822,7 +655,12 @@ class TabRegistry {
   }
 }
 
-const registry = new TabRegistry();
+let registry: TabRegistry;
+
+function workspaceDatabasePath(): string {
+  const dataDir = process.env.UNIT0_DATA_DIR ?? app.getPath("userData");
+  return path.join(dataDir, "unit0.sqlite");
+}
 
 function payloadFor(windowId: number): BootstrapPayload {
   return { windowId, state: registry.snapshot() };
@@ -937,17 +775,6 @@ function createWindow(options: { tabId?: string; x?: number; y?: number; primary
 }
 
 function handleDragFinish(result: DragFinishResult, alignment?: Omit<PendingAlignment, "timeout" | "closeWindowIds">): void {
-  debugLog("drag.finish.handle-result", {
-    result,
-    alignment: alignment
-      ? {
-          tabId: alignment.tabId,
-          screenX: alignment.screenX,
-          screenY: alignment.screenY,
-          hotSpot: alignment.hotSpot
-        }
-      : null
-  });
   if (result.action === "create-window") {
     const browserWindow = createWindow({ tabId: result.tabId, x: result.x, y: result.y });
     if (alignment) {
@@ -955,10 +782,6 @@ function handleDragFinish(result: DragFinishResult, alignment?: Omit<PendingAlig
         pendingAlignments.delete(browserWindow.id);
         closeEmptyWindows(result.closeWindowIds);
         closeDragWindows();
-        debugLog("drag.detach.align.timeout", {
-          windowId: browserWindow.id,
-          tabId: result.tabId
-        });
       }, 350);
       pendingAlignments.set(browserWindow.id, { ...alignment, closeWindowIds: result.closeWindowIds, timeout });
       return;
@@ -997,15 +820,7 @@ function syncDragOverlayState(reason: string): void {
   }
   overlayWindowsVisible = shouldShow;
   overlayPointerCapturing = shouldCapture;
-  debugLog("overlay.state.sync", {
-    reason,
-    overlayCount: captureOverlays.size,
-    visible: shouldShow,
-    capturePointer: shouldCapture,
-    tabId: session?.tabId ?? null,
-    floating: session?.floating ?? null,
-    targetWindowId: session?.currentTarget?.windowId ?? null
-  });
+  void reason;
   for (const overlay of captureOverlays.values()) {
     if (!overlay.isDestroyed()) {
       overlay.setIgnoreMouseEvents(!shouldCapture);
@@ -1027,14 +842,6 @@ function alignPendingWindow(payload: RegisterStripBoundsPayload): void {
   const metric = payload.tabMetrics.find((item) => item.tabId === pending.tabId);
   const browserWindow = windows.get(payload.windowId);
   if (!metric || !browserWindow || browserWindow.isDestroyed()) {
-    debugLog("drag.detach.align.waiting", {
-      windowId: payload.windowId,
-      tabId: pending.tabId,
-      hasMetric: Boolean(metric),
-      hasWindow: Boolean(browserWindow),
-      destroyed: browserWindow?.isDestroyed() ?? null,
-      metrics: payload.tabMetrics
-    });
     return;
   }
   const desiredLeft = pending.screenX - pending.hotSpot.x;
@@ -1044,18 +851,6 @@ function alignPendingWindow(payload: RegisterStripBoundsPayload): void {
     Math.round(currentBounds.x + desiredLeft - metric.left),
     Math.round(currentBounds.y + desiredTop - payload.bounds.top)
   );
-  debugLog("drag.detach.align.success", {
-    windowId: payload.windowId,
-    tabId: pending.tabId,
-    release: { x: pending.screenX, y: pending.screenY },
-    hotSpot: pending.hotSpot,
-    desiredLeft: Math.round(desiredLeft),
-    desiredTop: Math.round(desiredTop),
-    metric: { tabId: metric.tabId, left: Math.round(metric.left), width: Math.round(metric.width) },
-    stripBounds: rectDebug(payload.bounds),
-    oldWindowBounds: rectDebug(currentBounds),
-    newWindowBounds: rectDebug(browserWindow.getBounds())
-  });
   clearTimeout(pending.timeout);
   pendingAlignments.delete(payload.windowId);
   closeEmptyWindows(pending.closeWindowIds);
@@ -1064,7 +859,6 @@ function alignPendingWindow(payload: RegisterStripBoundsPayload): void {
 
 async function createCaptureOverlays(): Promise<boolean> {
   if (process.env.NODE_ENV === "test") {
-    debugLog("overlay.capture.disabled-in-test");
     return false;
   }
   const lifecycleId = ++dragLifecycleId;
@@ -1072,13 +866,6 @@ async function createCaptureOverlays(): Promise<boolean> {
   const session = registry.dragSession;
   const tab = session ? registry.tabs[session.tabId] : null;
   const displays = screen.getAllDisplays();
-  debugLog("overlay.capture.create.start", {
-    lifecycleId,
-    existingCount: captureOverlays.size,
-    displayCount: displays.length,
-    tabId: session?.tabId ?? null,
-    title: tab?.title ?? null
-  });
   if (captureOverlays.size > 0) {
     for (const display of displays) {
       const overlay = captureOverlays.get(display.id);
@@ -1095,12 +882,6 @@ async function createCaptureOverlays(): Promise<boolean> {
         overlay.hide();
         overlayWindowsVisible = false;
       }
-      debugLog("overlay.capture.reuse.show", {
-        lifecycleId,
-        displayId: display.id,
-        visible: Boolean(session?.floating),
-        bounds: rectDebug(display.bounds)
-      });
     }
     return true;
   }
@@ -1125,11 +906,6 @@ async function createCaptureOverlays(): Promise<boolean> {
     overlay.setIgnoreMouseEvents(true);
     captureOverlays.set(display.id, overlay);
     created.push(overlay);
-    debugLog("overlay.capture.create.window", {
-      lifecycleId,
-      displayId: display.id,
-      bounds: rectDebug(display.bounds)
-    });
     void overlay.loadURL(captureOverlayDataUrl(overlayDragPayload(display.bounds, session, tab)));
   }
   await Promise.all(
@@ -1140,17 +916,11 @@ async function createCaptureOverlays(): Promise<boolean> {
         })
     )
   );
-  debugLog("overlay.capture.create.loaded", { lifecycleId, createdCount: created.length });
   for (const overlay of created) {
     if (overlay.isDestroyed()) {
       continue;
     }
     if (!registry.dragSession || lifecycleId !== dragLifecycleId) {
-      debugLog("overlay.capture.create.stale-hide", {
-        lifecycleId,
-        currentLifecycleId: dragLifecycleId,
-        hasDragSession: Boolean(registry.dragSession)
-      });
       overlay.webContents.send("drag:end");
       overlay.setIgnoreMouseEvents(true);
       overlay.hide();
@@ -1164,11 +934,6 @@ async function createCaptureOverlays(): Promise<boolean> {
       overlay.hide();
       overlayWindowsVisible = false;
     }
-    debugLog("overlay.capture.create.show", {
-      lifecycleId,
-      overlayId: overlay.id,
-      visible: registry.dragSession.floating
-    });
   }
   return true;
 }
@@ -1211,10 +976,6 @@ function hideCaptureOverlays(): void {
   dragLifecycleId += 1;
   overlayPointerCapturing = false;
   overlayWindowsVisible = false;
-  debugLog("overlay.capture.hide", {
-    lifecycleId: dragLifecycleId,
-    overlayCount: captureOverlays.size
-  });
   for (const overlay of captureOverlays.values()) {
     if (!overlay.isDestroyed()) {
       overlay.webContents.send("drag:end");
@@ -1228,10 +989,6 @@ function destroyCaptureOverlays(): void {
   dragLifecycleId += 1;
   overlayPointerCapturing = false;
   overlayWindowsVisible = false;
-  debugLog("overlay.capture.destroy", {
-    lifecycleId: dragLifecycleId,
-    overlayCount: captureOverlays.size
-  });
   for (const overlay of captureOverlays.values()) {
     if (!overlay.isDestroyed()) {
       overlay.close();
@@ -1292,24 +1049,19 @@ ipcRenderer.on("drag:start", (_event, payload) => {
   setTitle(drag.title);
   renderGhost(lastPoint);
   setVisible(Boolean(drag.visible));
-  ipcRenderer.send("debug:log", { source: "overlay", event: "overlay.drag.start", drag });
 });
 ipcRenderer.on("drag:end", () => {
   captureActive = false;
   setVisible(false);
-  ipcRenderer.send("debug:log", { source: "overlay", event: "overlay.drag.end", lastPoint });
 });
 ipcRenderer.on("drag:capture", (_event, payload) => {
   captureActive = Boolean(payload.capture);
   setVisible(Boolean(payload.visible));
-  ipcRenderer.send("debug:log", { source: "overlay", event: "overlay.drag.capture", lastPoint, payload });
 });
 renderGhost(lastPoint);
-let moveCount = 0;
 window.addEventListener("pointermove", event => {
   lastPoint = point(event);
   renderGhost(lastPoint);
-  moveCount += 1;
   if (captureActive) {
     scheduleUpdate();
   }
@@ -1347,6 +1099,8 @@ function escapeHtml(value: string): string {
 }
 
 app.whenReady().then(() => {
+  const workspaceStore = new WorkspaceStateStore(workspaceDatabasePath());
+  registry = new TabRegistry(workspaceStore);
   Menu.setApplicationMenu(null);
   ipcMain.handle("unit:bootstrap", (event) => payloadFor(BrowserWindow.fromWebContents(event.sender)?.id ?? 0));
   ipcMain.handle("tabs:bootstrap", (event) => payloadFor(BrowserWindow.fromWebContents(event.sender)?.id ?? 0));
@@ -1359,10 +1113,8 @@ app.whenReady().then(() => {
       await createCaptureOverlays();
       syncDragOverlayState("begin-drag");
       broadcastState();
-      debugLog("drag.begin.result", { captureOwned: false, visualOverlay: true, tabId: payload.tabId });
       return { captureOwned: false };
     }
-    debugLog("drag.begin.result", { captureOwned: false, tabId: payload.tabId });
     return { captureOwned: false };
   });
   ipcMain.handle("tabs:updateDrag", (_event, payload: UpdateTabDragPayload) => {
@@ -1385,10 +1137,6 @@ app.whenReady().then(() => {
   ipcMain.on("tabs:finishDragFast", (_event, payload: FinishTabDragPayload) => {
     finishDragAt(payload);
   });
-  ipcMain.on("debug:log", (_event, payload: Record<string, unknown>) => {
-    const event = typeof payload.event === "string" ? payload.event : "renderer.debug";
-    debugLog(event, payload);
-  });
   ipcMain.handle("tabs:cancelDrag", () => {
     registry.cancelDrag();
     closeDragWindows();
@@ -1404,6 +1152,28 @@ app.whenReady().then(() => {
     for (const windowId of result.closeWindowIds) {
       windows.get(windowId)?.close();
     }
+    broadcastState();
+  });
+  ipcMain.handle("workspaces:createWorkspace", (_event, payload: CreateWorkspacePayload) => {
+    const workspace = registry.createWorkspace(payload.windowId, payload.title);
+    broadcastState();
+    return workspace;
+  });
+  ipcMain.handle("workspaces:openWorkspaceTab", (_event, payload: OpenWorkspaceTabPayload) => {
+    registry.openWorkspaceTab(payload.windowId, payload.workspaceId);
+    broadcastState();
+  });
+  ipcMain.handle("workspaces:renameWorkspace", (_event, payload: RenameWorkspacePayload) => {
+    registry.renameWorkspace(payload.workspaceId, payload.title);
+    broadcastState();
+  });
+  ipcMain.handle("applets:createApplet", (_event, payload: CreateAppletPayload) => {
+    const applet = registry.createApplet(payload);
+    broadcastState();
+    return applet;
+  });
+  ipcMain.handle("applets:closeAppletInstance", (_event, payload: CloseAppletInstancePayload) => {
+    registry.closeAppletInstance(payload);
     broadcastState();
   });
   ipcMain.handle("tabs:registerStripBounds", (_event, payload: RegisterStripBoundsPayload) => {

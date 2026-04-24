@@ -9,13 +9,30 @@ export interface AppletSession {
 export interface AppletInstance {
   id: string;
   sessionId: string;
-  area: string;
+}
+
+export type WorkspaceLayoutNode = WorkspaceLayoutSplit | WorkspaceLayoutLeaf;
+
+export interface WorkspaceLayoutSplit {
+  id: string;
+  type: "split";
+  direction: "row" | "column";
+  ratio: number;
+  first: WorkspaceLayoutNode;
+  second: WorkspaceLayoutNode;
+}
+
+export interface WorkspaceLayoutLeaf {
+  id: string;
+  type: "leaf";
+  appletInstanceId: string;
 }
 
 export interface Workspace {
   id: string;
   title: string;
   applets: AppletInstance[];
+  layout: WorkspaceLayoutNode | null;
 }
 
 export interface WorkspaceTab {
@@ -123,6 +140,33 @@ export interface CloseTabPayload {
   tabId: string;
 }
 
+export interface CreateWorkspacePayload {
+  windowId: number;
+  title: string;
+}
+
+export interface OpenWorkspaceTabPayload {
+  windowId: number;
+  workspaceId: string;
+}
+
+export interface RenameWorkspacePayload {
+  workspaceId: string;
+  title: string;
+}
+
+export interface CreateAppletPayload {
+  workspaceId: string;
+  kind: AppletKind;
+  targetLeafId?: string;
+  splitDirection?: "row" | "column";
+}
+
+export interface CloseAppletInstancePayload {
+  workspaceId: string;
+  appletInstanceId: string;
+}
+
 export interface UnitApi {
   bootstrap: () => Promise<BootstrapPayload>;
   onStateChanged: (callback: (payload: BootstrapPayload) => void) => () => void;
@@ -139,6 +183,14 @@ export interface UnitApi {
     closeTab: (payload: CloseTabPayload) => Promise<void>;
     registerStripBounds: (payload: RegisterStripBoundsPayload) => Promise<void>;
     windowClosing: (windowId: number) => Promise<void>;
-    debugLog: (event: string, payload?: Record<string, unknown>) => void;
+  };
+  workspaces: {
+    createWorkspace: (payload: CreateWorkspacePayload) => Promise<Workspace>;
+    openWorkspaceTab: (payload: OpenWorkspaceTabPayload) => Promise<void>;
+    renameWorkspace: (payload: RenameWorkspacePayload) => Promise<void>;
+  };
+  applets: {
+    createApplet: (payload: CreateAppletPayload) => Promise<AppletInstance>;
+    closeAppletInstance: (payload: CloseAppletInstancePayload) => Promise<void>;
   };
 }

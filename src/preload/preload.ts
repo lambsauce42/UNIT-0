@@ -4,8 +4,13 @@ import type {
   BeginTabDragPayload,
   BootstrapPayload,
   CloseTabPayload,
+  CloseAppletInstancePayload,
+  CreateAppletPayload,
+  CreateWorkspacePayload,
   FinishTabDragPayload,
+  OpenWorkspaceTabPayload,
   RegisterStripBoundsPayload,
+  RenameWorkspacePayload,
   UnitApi,
   UpdateTabDragPayload
 } from "../shared/types.js";
@@ -34,9 +39,16 @@ const api: UnitApi = {
     closeTab: (payload: CloseTabPayload) => ipcRenderer.invoke("tabs:closeTab", payload),
     registerStripBounds: (payload: RegisterStripBoundsPayload) =>
       ipcRenderer.invoke("tabs:registerStripBounds", payload),
-    windowClosing: (windowId: number) => ipcRenderer.invoke("tabs:windowClosing", windowId),
-    debugLog: (event: string, payload: Record<string, unknown> = {}) =>
-      ipcRenderer.send("debug:log", { source: "renderer", event, ...payload })
+    windowClosing: (windowId: number) => ipcRenderer.invoke("tabs:windowClosing", windowId)
+  },
+  workspaces: {
+    createWorkspace: (payload: CreateWorkspacePayload) => ipcRenderer.invoke("workspaces:createWorkspace", payload),
+    openWorkspaceTab: (payload: OpenWorkspaceTabPayload) => ipcRenderer.invoke("workspaces:openWorkspaceTab", payload),
+    renameWorkspace: (payload: RenameWorkspacePayload) => ipcRenderer.invoke("workspaces:renameWorkspace", payload)
+  },
+  applets: {
+    createApplet: (payload: CreateAppletPayload) => ipcRenderer.invoke("applets:createApplet", payload),
+    closeAppletInstance: (payload: CloseAppletInstancePayload) => ipcRenderer.invoke("applets:closeAppletInstance", payload)
   }
 };
 
