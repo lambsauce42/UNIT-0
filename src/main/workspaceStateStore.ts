@@ -34,6 +34,14 @@ export type AppletMutationResult = {
   deletedSessionId?: string;
 };
 
+export type MoveAppletOptions = {
+  workspaceId: string;
+  appletInstanceId: string;
+  targetLeafId?: string;
+  splitDirection: "row" | "column";
+  placement: "first" | "second";
+};
+
 const DEFAULT_APPLET_SESSIONS: Record<string, AppletSession> = {
   "session-terminal": { id: "session-terminal", kind: "terminal", title: "Terminal" },
   "session-file-viewer": { id: "session-file-viewer", kind: "fileViewer", title: "File Viewer" },
@@ -407,6 +415,28 @@ export class WorkspaceStateStore {
     return { workspace: nextWorkspace, appletSessions, deletedSessionId };
   }
 
+  moveAppletInstance(options: MoveAppletOptions): Workspace {
+    const model = this.load();
+    const workspace = model.workspaces[options.workspaceId];
+    if (!workspace) {
+      throw new Error(`Workspace ${options.workspaceId} does not exist`);
+    }
+    if (!workspace.applets.some((instance) => instance.id === options.appletInstanceId)) {
+      throw new Error(`Applet instance ${options.appletInstanceId} does not exist in workspace ${options.workspaceId}`);
+    }
+    const nextLayout = moveAppletLeaf(workspace.layout, options);
+    const nextWorkspace = { ...workspace, layout: nextLayout };
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.saveWorkspaceLayoutInTransaction(workspace.id, nextLayout);
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+    return nextWorkspace;
+  }
+
   close(): void {
     this.db.close();
   }
@@ -739,6 +769,73 @@ function removeAppletLeafFromNode(
   return { node, removed: false };
 }
 
+function moveAppletLeaf(layout: WorkspaceLayoutNode | null, options: MoveAppletOptions): WorkspaceLayoutNode {
+  if (!layout) {
+    throw new Error(`Applet instance ${options.appletInstanceId} is not mounted in the workspace layout`);
+  }
+  const sourceLeaf = findAppletLeaf(layout, options.appletInstanceId);
+  if (!sourceLeaf) {
+    throw new Error(`Applet instance ${options.appletInstanceId} is not mounted in the workspace layout`);
+  }
+  if (options.targetLeafId && sourceLeaf.id === options.targetLeafId) {
+    return layout;
+  }
+  const removed = removeAppletLeafFromNode(layout, options.appletInstanceId);
+  if (!removed.removed || !removed.node) {
+    return layout;
+  }
+  const movedLeaf: WorkspaceLayoutNode = { ...sourceLeaf };
+  if (!options.targetLeafId) {
+    return splitWithPlacement(
+      `split-root-${options.appletInstanceId}-${randomUUID()}`,
+      options.splitDirection,
+      0.5,
+      movedLeaf,
+      removed.node,
+      options.placement
+    );
+  }
+  const inserted = replaceLayoutLeaf(removed.node, options.targetLeafId, (targetLeaf) =>
+    splitWithPlacement(
+      `split-${targetLeaf.id}-${options.appletInstanceId}-${randomUUID()}`,
+      options.splitDirection,
+      0.5,
+      movedLeaf,
+      targetLeaf,
+      options.placement
+    )
+  );
+  if (!inserted.replaced) {
+    throw new Error(`Layout leaf ${options.targetLeafId} does not exist`);
+  }
+  return inserted.node;
+}
+
+function splitWithPlacement(
+  id: string,
+  direction: "row" | "column",
+  ratio: number,
+  movedLeaf: WorkspaceLayoutNode,
+  targetNode: WorkspaceLayoutNode,
+  placement: "first" | "second"
+): WorkspaceLayoutNode {
+  return {
+    id,
+    type: "split",
+    direction,
+    ratio,
+    first: placement === "first" ? movedLeaf : targetNode,
+    second: placement === "first" ? targetNode : movedLeaf
+  };
+}
+
+function findAppletLeaf(node: WorkspaceLayoutNode, appletInstanceId: string): WorkspaceLayoutLeaf | null {
+  if (node.type === "leaf") {
+    return node.appletInstanceId === appletInstanceId ? node : null;
+  }
+  return findAppletLeaf(node.first, appletInstanceId) ?? findAppletLeaf(node.second, appletInstanceId);
+}
+
 function layoutFromAppletIds(workspaceId: string, appletIds: string[]): WorkspaceLayoutNode | null {
   if (appletIds.length === 0) {
     return null;
@@ -782,20 +879,13 @@ function leaf(area: string, byArea: Map<string, string>): WorkspaceLayoutNode | 
 function parseWorkspaceLayout(layoutJson: string, workspace: Workspace): WorkspaceLayoutNode | null {
   const parsed = JSON.parse(layoutJson) as unknown;
   if (parsed === null) {
+    if (workspace.applets.length > 0) {
+      throw new Error(`Workspace ${workspace.id} layout does not mount applet instance(s): ${workspace.applets.map((instance) => instance.id).join(", ")}`);
+    }
     return null;
   }
   const layout = assertWorkspaceLayoutNode(parsed, workspace.id);
-  const appletIds = new Set(workspace.applets.map((instance) => instance.id));
-  const mountedIds = collectLayoutAppletIds(layout);
-  for (const appletId of mountedIds) {
-    if (!appletIds.has(appletId)) {
-      throw new Error(`Workspace ${workspace.id} layout references missing applet instance ${appletId}`);
-    }
-  }
-  if (mountedIds.size !== appletIds.size) {
-    const missing = [...appletIds].filter((appletId) => !mountedIds.has(appletId));
-    throw new Error(`Workspace ${workspace.id} layout does not mount applet instance(s): ${missing.join(", ")}`);
-  }
+  validateWorkspaceLayoutForWorkspace(layout, workspace);
   return layout;
 }
 
@@ -837,4 +927,39 @@ function collectLayoutAppletIds(layout: WorkspaceLayoutNode): Set<string> {
     return new Set([layout.appletInstanceId]);
   }
   return new Set([...collectLayoutAppletIds(layout.first), ...collectLayoutAppletIds(layout.second)]);
+}
+
+function validateWorkspaceLayoutForWorkspace(layout: WorkspaceLayoutNode, workspace: Workspace): void {
+  const mountedAppletIds = new Set(workspace.applets.map((instance) => instance.id));
+  const nodeIds = new Set<string>();
+  const leafAppletIds = new Set<string>();
+  const visit = (node: WorkspaceLayoutNode) => {
+    if (!node.id || nodeIds.has(node.id)) {
+      throw new Error(`Workspace ${workspace.id} layout contains duplicate node id ${node.id}`);
+    }
+    nodeIds.add(node.id);
+    if (node.type === "leaf") {
+      if (!mountedAppletIds.has(node.appletInstanceId)) {
+        throw new Error(`Workspace ${workspace.id} layout references missing applet instance ${node.appletInstanceId}`);
+      }
+      if (leafAppletIds.has(node.appletInstanceId)) {
+        throw new Error(`Workspace ${workspace.id} layout mounts applet instance ${node.appletInstanceId} more than once`);
+      }
+      leafAppletIds.add(node.appletInstanceId);
+      return;
+    }
+    if (node.direction !== "row" && node.direction !== "column") {
+      throw new Error(`Workspace ${workspace.id} layout split ${node.id} has an invalid direction`);
+    }
+    if (!Number.isFinite(node.ratio) || node.ratio <= 0 || node.ratio >= 1) {
+      throw new Error(`Workspace ${workspace.id} layout split ${node.id} has an invalid ratio`);
+    }
+    visit(node.first);
+    visit(node.second);
+  };
+  visit(layout);
+  if (leafAppletIds.size !== mountedAppletIds.size) {
+    const missing = [...mountedAppletIds].filter((appletId) => !leafAppletIds.has(appletId));
+    throw new Error(`Workspace ${workspace.id} layout does not mount applet instance(s): ${missing.join(", ")}`);
+  }
 }

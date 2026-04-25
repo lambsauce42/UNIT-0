@@ -8,6 +8,7 @@ import type {
   CreateAppletPayload,
   CreateWorkspacePayload,
   FinishTabDragPayload,
+  MoveAppletInstancePayload,
   OpenWorkspaceTabPayload,
   RegisterStripBoundsPayload,
   RenameWorkspacePayload,
@@ -48,7 +49,8 @@ const api: UnitApi = {
   },
   applets: {
     createApplet: (payload: CreateAppletPayload) => ipcRenderer.invoke("applets:createApplet", payload),
-    closeAppletInstance: (payload: CloseAppletInstancePayload) => ipcRenderer.invoke("applets:closeAppletInstance", payload)
+    closeAppletInstance: (payload: CloseAppletInstancePayload) => ipcRenderer.invoke("applets:closeAppletInstance", payload),
+    moveAppletInstance: (payload: MoveAppletInstancePayload) => ipcRenderer.invoke("applets:moveAppletInstance", payload)
   }
 };
 

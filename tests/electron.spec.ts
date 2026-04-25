@@ -295,6 +295,11 @@ test("spawns a terminal in an empty workspace and persists it across restart", a
   await expect(page.getByTestId("workspace-empty")).toBeVisible();
   await page.getByRole("button", { name: "New terminal" }).last().click();
   await expect(page.getByTestId("applet-terminal")).toHaveCount(1);
+  const surfaceBox = await page.getByTestId("workspace-surface").boundingBox();
+  const leafBox = await page.locator("[data-testid^='layout-leaf-']").boundingBox();
+  expect(surfaceBox).not.toBeNull();
+  expect(leafBox).not.toBeNull();
+  expect(leafBox!.height).toBeGreaterThan(surfaceBox!.height - 24);
   const stateBeforeRestart = await appState(page);
   expect(stateBeforeRestart.workspaces[workspace.id].applets).toHaveLength(1);
   const instanceId = stateBeforeRestart.workspaces[workspace.id].applets[0].id;
@@ -307,6 +312,123 @@ test("spawns a terminal in an empty workspace and persists it across restart", a
   await expect(page.getByTestId(`workspace-tab-${workspace.id}`)).toBeVisible();
   await expect(page.getByTestId(`layout-leaf-${instanceId}`)).toBeVisible();
   await expect(page.getByTestId("applet-terminal")).toHaveCount(1);
+
+  await app.close();
+});
+
+test("applet picker spawns a selected applet kind", async () => {
+  const app = await launchApp();
+  const page = await firstWindow(app);
+  await page.getByTestId("workspace-tab-atlas").click();
+  const beforeBrowserCount = await page.getByTestId("applet-browser").count();
+
+  await page.locator('[data-applet-instance-id="atlas-terminal"]').getByLabel("Terminal add applet").click();
+  await page.getByRole("menuitem", { name: "Browser" }).click();
+
+  await expect(page.getByTestId("applet-browser")).toHaveCount(beforeBrowserCount + 1);
+  const state = await appState(page);
+  const browserInstances = state.workspaces.atlas.applets.filter(
+    (instance) => state.appletSessions[instance.sessionId]?.kind === "browser"
+  );
+  expect(browserInstances.length).toBeGreaterThanOrEqual(2);
+
+  await app.close();
+});
+
+test("drags an applet to a root edge with preview and persists placement", async () => {
+  const dataDir = makeDataDir();
+  let app = await launchApp(dataDir);
+  let page = await firstWindow(app);
+  await page.getByTestId("workspace-tab-atlas").click();
+  const title = page.locator('[data-applet-instance-id="atlas-chat"] .applet-title');
+  const titleBox = await title.boundingBox();
+  const surfaceBox = await page.getByTestId("workspace-surface").boundingBox();
+  expect(titleBox).not.toBeNull();
+  expect(surfaceBox).not.toBeNull();
+
+  await page.mouse.move(titleBox!.x + 42, titleBox!.y + titleBox!.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(surfaceBox!.x + 28, surfaceBox!.y + surfaceBox!.height / 2, { steps: 10 });
+  await expect(page.getByTestId("applet-drag-ghost")).toBeVisible();
+  await expect(page.getByTestId("applet-drop-indicator")).toBeVisible();
+  await page.mouse.up();
+
+  await expect(async () => {
+    const state = await appState(page);
+    const layout = state.workspaces.atlas.layout;
+    expect(layout?.type).toBe("split");
+    if (layout?.type === "split") {
+      expect(layout.direction).toBe("row");
+      expect(layout.first.type).toBe("leaf");
+      if (layout.first.type === "leaf") {
+        expect(layout.first.appletInstanceId).toBe("atlas-chat");
+      }
+    }
+  }).toPass();
+  await app.close();
+
+  app = await launchApp(dataDir);
+  page = await firstWindow(app);
+  await page.getByTestId("workspace-tab-atlas").click();
+  const stateAfterRestart = await appState(page);
+  const layout = stateAfterRestart.workspaces.atlas.layout;
+  expect(layout?.type).toBe("split");
+  if (layout?.type === "split") {
+    expect(layout.first.type).toBe("leaf");
+    if (layout.first.type === "leaf") {
+      expect(layout.first.appletInstanceId).toBe("atlas-chat");
+    }
+  }
+
+  await app.close();
+});
+
+test("drags an applet into another applet split target", async () => {
+  const dataDir = makeDataDir();
+  const app = await launchApp(dataDir);
+  const page = await firstWindow(app);
+  await page.getByTestId("workspace-tab-atlas").click();
+  const chatTitle = page.locator('[data-applet-instance-id="atlas-chat"] .applet-title');
+  const chatTitleBox = await chatTitle.boundingBox();
+  const browserBox = await page.getByTestId("layout-leaf-atlas-browser").boundingBox();
+  expect(chatTitleBox).not.toBeNull();
+  expect(browserBox).not.toBeNull();
+
+  await page.mouse.move(chatTitleBox!.x + 42, chatTitleBox!.y + chatTitleBox!.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(browserBox!.x + browserBox!.width - 18, browserBox!.y + browserBox!.height / 2, { steps: 10 });
+  await expect(page.getByTestId("applet-drop-indicator")).toBeVisible();
+  await page.mouse.up();
+
+  await expect(async () => {
+    const movedIntoBrowserSplit = await page.evaluate(() =>
+      window.unitApi.tabs.bootstrap().then((payload) => {
+        const layout = payload.state.workspaces.atlas.layout;
+        const includes = (node: typeof layout, instanceId: string): boolean => {
+          if (!node) {
+            return false;
+          }
+          if (node.type === "leaf") {
+            return node.appletInstanceId === instanceId;
+          }
+          return includes(node.first, instanceId) || includes(node.second, instanceId);
+        };
+        const hasBrowserChatSplit = (node: typeof layout): boolean => {
+          if (!node || node.type === "leaf") {
+            return false;
+          }
+          return (
+            (includes(node.first, "atlas-browser") && includes(node.second, "atlas-chat")) ||
+            (includes(node.first, "atlas-chat") && includes(node.second, "atlas-browser")) ||
+            hasBrowserChatSplit(node.first) ||
+            hasBrowserChatSplit(node.second)
+          );
+        };
+        return hasBrowserChatSplit(layout);
+      })
+    );
+    expect(movedIntoBrowserSplit).toBe(true);
+  }).toPass();
 
   await app.close();
 });

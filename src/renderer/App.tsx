@@ -16,7 +16,7 @@ import {
   Trash2,
   X
 } from "lucide-react";
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type {
   AppletKind,
   AppletSession,
@@ -28,7 +28,8 @@ import type {
   WorkspaceLayoutNode,
   WorkspaceTab
 } from "../shared/types";
-import { closeHitRectForTab, closeRectForTab, insertionIndexForX, titleRectForTab } from "./tabGeometry";
+import { WORKSPACE_TAB_SIZE } from "../shared/tabMetrics";
+import { closeHitRectForTab } from "./tabGeometry";
 
 type PendingDrag = {
   tabId: string;
@@ -55,6 +56,32 @@ const iconByKind: Record<AppletKind, typeof SquareTerminal> = {
   browser: Globe,
   chat: Bot,
   sandbox: Monitor
+};
+
+const appletCatalog: Array<{ kind: AppletKind; label: string }> = [
+  { kind: "terminal", label: "Terminal" },
+  { kind: "fileViewer", label: "File Viewer" },
+  { kind: "browser", label: "Browser" },
+  { kind: "chat", label: "Chat" },
+  { kind: "sandbox", label: "Sandbox" }
+];
+
+type AppletDropTarget = {
+  targetLeafId?: string;
+  splitDirection: "row" | "column";
+  placement: "first" | "second";
+  rect: { left: number; top: number; width: number; height: number };
+};
+
+type AppletDragState = {
+  instanceId: string;
+  title: string;
+  kind: AppletKind;
+  pointerX: number;
+  pointerY: number;
+  offsetX: number;
+  offsetY: number;
+  target: AppletDropTarget | null;
 };
 
 export function App() {
@@ -169,7 +196,7 @@ function WorkspaceTabStrip({ host, state, windowId }: { host: TabHostState; stat
   const tabLayout = useMemo(() => {
     let left = 0;
     return orderedTabs.map((tab) => {
-      const width = tab.pinned ? 206 : Math.min(224, Math.max(166, 118 + tab.title.length * 8));
+      const width = WORKSPACE_TAB_SIZE.width;
       const item = { tab, left, width };
       left += width;
       return item;
@@ -682,6 +709,9 @@ function WorkspaceManagerSurface({ state }: { state: UnitState }) {
 }
 
 function WorkspaceSurface({ state, workspace }: { state: UnitState; workspace: Workspace }) {
+  const surfaceRef = useRef<HTMLElement | null>(null);
+  const [appletDrag, setAppletDrag] = useState<AppletDragState | null>(null);
+  const appletDragRef = useRef<AppletDragState | null>(null);
   const appletsById = useMemo(
     () =>
       new Map(
@@ -695,10 +725,133 @@ function WorkspaceSurface({ state, workspace }: { state: UnitState; workspace: W
       ),
     [state.appletSessions, workspace.applets]
   );
+  const appletByInstanceId = useMemo(
+    () =>
+      new Map(
+        workspace.applets.map((instance) => {
+          const session = state.appletSessions[instance.sessionId];
+          return [instance.id, session ? { instance, session } : null];
+        })
+    ),
+    [state.appletSessions, workspace.applets]
+  );
+  const dropTargetFor = useCallback(
+    (clientX: number, clientY: number, draggedInstanceId: string): AppletDropTarget | null => {
+      const surface = surfaceRef.current;
+      if (!surface) {
+        return null;
+      }
+      const surfaceRect = surface.getBoundingClientRect();
+      if (
+        clientX < surfaceRect.left ||
+        clientX > surfaceRect.right ||
+        clientY < surfaceRect.top ||
+        clientY > surfaceRect.bottom
+      ) {
+        return null;
+      }
+      const rootZone = Math.min(84, surfaceRect.width * 0.18, surfaceRect.height * 0.18);
+      const rootEdges = [
+        { edge: "left" as const, distance: clientX - surfaceRect.left },
+        { edge: "right" as const, distance: surfaceRect.right - clientX },
+        { edge: "top" as const, distance: clientY - surfaceRect.top },
+        { edge: "bottom" as const, distance: surfaceRect.bottom - clientY }
+      ].filter((edge) => edge.distance <= rootZone);
+      if (rootEdges.length > 0) {
+        const edge = rootEdges.sort((left, right) => left.distance - right.distance)[0].edge;
+        return {
+          splitDirection: edge === "left" || edge === "right" ? "row" : "column",
+          placement: edge === "left" || edge === "top" ? "first" : "second",
+          rect: relativeRect(surfaceRect, surfaceRect, edge)
+        };
+      }
+      const leafElement = document.elementFromPoint(clientX, clientY)?.closest(".layout-leaf");
+      if (!(leafElement instanceof HTMLElement)) {
+        return null;
+      }
+      const targetLeafId = leafElement.dataset.layoutLeafId;
+      if (!targetLeafId || leafElement.dataset.appletInstanceId === draggedInstanceId) {
+        return null;
+      }
+      const leafRect = leafElement.getBoundingClientRect();
+      const distances = [
+        { edge: "left" as const, value: clientX - leafRect.left },
+        { edge: "right" as const, value: leafRect.right - clientX },
+        { edge: "top" as const, value: clientY - leafRect.top },
+        { edge: "bottom" as const, value: leafRect.bottom - clientY }
+      ].sort((left, right) => left.value - right.value);
+      const edge = distances[0].edge;
+      return {
+        targetLeafId,
+        splitDirection: edge === "left" || edge === "right" ? "row" : "column",
+        placement: edge === "left" || edge === "top" ? "first" : "second",
+        rect: relativeRect(leafRect, surfaceRect, edge)
+      };
+    },
+    []
+  );
+  const beginAppletDrag = useCallback(
+    (drag: Omit<AppletDragState, "target">) => {
+      const nextDrag = {
+        ...drag,
+        target: dropTargetFor(drag.pointerX, drag.pointerY, drag.instanceId)
+      };
+      appletDragRef.current = nextDrag;
+      setAppletDrag(nextDrag);
+    },
+    [dropTargetFor]
+  );
+  const updateAppletDrag = useCallback(
+    (clientX: number, clientY: number) => {
+      const drag = appletDragRef.current;
+      if (!drag) {
+        return;
+      }
+      const nextDrag = {
+        ...drag,
+        pointerX: clientX,
+        pointerY: clientY,
+        target: dropTargetFor(clientX, clientY, drag.instanceId)
+      };
+      appletDragRef.current = nextDrag;
+      setAppletDrag(nextDrag);
+    },
+    [dropTargetFor]
+  );
+  const finishAppletDrag = useCallback(() => {
+    const drag = appletDragRef.current;
+    appletDragRef.current = null;
+    setAppletDrag(null);
+    if (drag?.target) {
+      void window.unitApi.applets.moveAppletInstance({
+        workspaceId: workspace.id,
+        appletInstanceId: drag.instanceId,
+        targetLeafId: drag.target.targetLeafId,
+        splitDirection: drag.target.splitDirection,
+        placement: drag.target.placement
+      });
+    }
+  }, [workspace.id]);
+  const cancelAppletDrag = useCallback(() => {
+    appletDragRef.current = null;
+    setAppletDrag(null);
+  }, []);
+  const draggedApplet = appletDrag ? appletByInstanceId.get(appletDrag.instanceId) : null;
+  const DragIcon = draggedApplet?.session ? iconByKind[draggedApplet.session.kind] : SquareTerminal;
   return (
-    <section className="workspace-surface" data-testid="workspace-surface">
+    <section className="workspace-surface" data-testid="workspace-surface" ref={surfaceRef}>
       {workspace.layout ? (
-        <WorkspaceLayout node={workspace.layout} appletsById={appletsById} workspaceId={workspace.id} root />
+        <WorkspaceLayout
+          node={workspace.layout}
+          appletsById={appletsById}
+          workspaceId={workspace.id}
+          root
+          depth={0}
+          onBeginAppletDrag={beginAppletDrag}
+          onUpdateAppletDrag={updateAppletDrag}
+          onFinishAppletDrag={finishAppletDrag}
+          onCancelAppletDrag={cancelAppletDrag}
+        />
       ) : (
         <div className="workspace-empty" data-testid="workspace-empty">
           <button
@@ -713,6 +866,30 @@ function WorkspaceSurface({ state, workspace }: { state: UnitState; workspace: W
           </button>
         </div>
       )}
+      {appletDrag?.target ? (
+        <div
+          className="applet-drop-indicator"
+          data-testid="applet-drop-indicator"
+          style={{
+            left: appletDrag.target.rect.left,
+            top: appletDrag.target.rect.top,
+            width: appletDrag.target.rect.width,
+            height: appletDrag.target.rect.height
+          }}
+        />
+      ) : null}
+      {appletDrag ? (
+        <div
+          className="applet-drag-ghost"
+          data-testid="applet-drag-ghost"
+          style={{
+            transform: `translate3d(${appletDrag.pointerX - appletDrag.offsetX}px, ${appletDrag.pointerY - appletDrag.offsetY}px, 0)`
+          }}
+        >
+          <DragIcon size={15} />
+          <span>{appletDrag.title}</span>
+        </div>
+      ) : null}
     </section>
   );
 }
@@ -721,24 +898,120 @@ function WorkspaceLayout({
   node,
   appletsById,
   workspaceId,
-  root = false
+  root = false,
+  depth,
+  onBeginAppletDrag,
+  onUpdateAppletDrag,
+  onFinishAppletDrag,
+  onCancelAppletDrag
 }: {
   node: WorkspaceLayoutNode;
   appletsById: Map<string, { instance: Workspace["applets"][number]; session: AppletSession | undefined }>;
   workspaceId: string;
   root?: boolean;
+  depth: number;
+  onBeginAppletDrag: (drag: Omit<AppletDragState, "target">) => void;
+  onUpdateAppletDrag: (clientX: number, clientY: number) => void;
+  onFinishAppletDrag: () => void;
+  onCancelAppletDrag: () => void;
 }) {
-  if (node.type === "leaf") {
-    const applet = appletsById.get(node.appletInstanceId);
-    if (!applet?.session) {
-      throw new Error(`Layout leaf references missing applet instance ${node.appletInstanceId}`);
-    }
+  if (node.type === "split") {
     return (
-      <div className="layout-leaf" data-testid={`layout-leaf-${node.appletInstanceId}`}>
-        <AppletFrame session={applet.session} instanceId={applet.instance.id} leafId={node.id} workspaceId={workspaceId} />
-      </div>
+      <WorkspaceLayoutSplit
+        node={node}
+        appletsById={appletsById}
+        workspaceId={workspaceId}
+        root={root}
+        depth={depth}
+        onBeginAppletDrag={onBeginAppletDrag}
+        onUpdateAppletDrag={onUpdateAppletDrag}
+        onFinishAppletDrag={onFinishAppletDrag}
+        onCancelAppletDrag={onCancelAppletDrag}
+      />
     );
   }
+  return (
+      <WorkspaceLayoutLeaf
+        node={node}
+        appletsById={appletsById}
+      workspaceId={workspaceId}
+      root={root}
+      depth={depth}
+      onBeginAppletDrag={onBeginAppletDrag}
+      onUpdateAppletDrag={onUpdateAppletDrag}
+      onFinishAppletDrag={onFinishAppletDrag}
+      onCancelAppletDrag={onCancelAppletDrag}
+    />
+  );
+}
+
+function WorkspaceLayoutLeaf({
+  node,
+  appletsById,
+  workspaceId,
+  root,
+  depth,
+  onBeginAppletDrag,
+  onUpdateAppletDrag,
+  onFinishAppletDrag,
+  onCancelAppletDrag
+}: {
+  node: Extract<WorkspaceLayoutNode, { type: "leaf" }>;
+  appletsById: Map<string, { instance: Workspace["applets"][number]; session: AppletSession | undefined }>;
+  workspaceId: string;
+  root: boolean;
+  depth: number;
+  onBeginAppletDrag: (drag: Omit<AppletDragState, "target">) => void;
+  onUpdateAppletDrag: (clientX: number, clientY: number) => void;
+  onFinishAppletDrag: () => void;
+  onCancelAppletDrag: () => void;
+}) {
+  const applet = appletsById.get(node.appletInstanceId);
+  if (!applet?.session) {
+    throw new Error(`Layout leaf references missing applet instance ${node.appletInstanceId}`);
+  }
+  return (
+    <div
+      className={`layout-leaf ${root ? "layout-root" : ""}`}
+      data-testid={`layout-leaf-${node.appletInstanceId}`}
+      data-layout-leaf-id={node.id}
+      data-applet-instance-id={node.appletInstanceId}
+    >
+      <AppletFrame
+        session={applet.session}
+        instanceId={applet.instance.id}
+        leafId={node.id}
+        workspaceId={workspaceId}
+        onBeginAppletDrag={onBeginAppletDrag}
+        onUpdateAppletDrag={onUpdateAppletDrag}
+        onFinishAppletDrag={onFinishAppletDrag}
+        onCancelAppletDrag={onCancelAppletDrag}
+      />
+    </div>
+  );
+}
+
+function WorkspaceLayoutSplit({
+  node,
+  appletsById,
+  workspaceId,
+  root,
+  depth,
+  onBeginAppletDrag,
+  onUpdateAppletDrag,
+  onFinishAppletDrag,
+  onCancelAppletDrag
+}: {
+  node: Extract<WorkspaceLayoutNode, { type: "split" }>;
+  appletsById: Map<string, { instance: Workspace["applets"][number]; session: AppletSession | undefined }>;
+  workspaceId: string;
+  root: boolean;
+  depth: number;
+  onBeginAppletDrag: (drag: Omit<AppletDragState, "target">) => void;
+  onUpdateAppletDrag: (clientX: number, clientY: number) => void;
+  onFinishAppletDrag: () => void;
+  onCancelAppletDrag: () => void;
+}) {
   const firstBasis = `${node.ratio * 100}%`;
   const secondBasis = `${(1 - node.ratio) * 100}%`;
   return (
@@ -748,10 +1021,29 @@ function WorkspaceLayout({
       data-layout-direction={node.direction}
     >
       <div className="layout-branch" style={{ flex: `${node.ratio} 1 ${firstBasis}` }}>
-        <WorkspaceLayout node={node.first} appletsById={appletsById} workspaceId={workspaceId} />
+        <WorkspaceLayout
+          node={node.first}
+          appletsById={appletsById}
+          workspaceId={workspaceId}
+          depth={depth + 1}
+          onBeginAppletDrag={onBeginAppletDrag}
+          onUpdateAppletDrag={onUpdateAppletDrag}
+          onFinishAppletDrag={onFinishAppletDrag}
+          onCancelAppletDrag={onCancelAppletDrag}
+        />
       </div>
+      <div className={`layout-gutter gutter-${node.direction}`} aria-hidden="true" />
       <div className="layout-branch" style={{ flex: `${1 - node.ratio} 1 ${secondBasis}` }}>
-        <WorkspaceLayout node={node.second} appletsById={appletsById} workspaceId={workspaceId} />
+        <WorkspaceLayout
+          node={node.second}
+          appletsById={appletsById}
+          workspaceId={workspaceId}
+          depth={depth + 1}
+          onBeginAppletDrag={onBeginAppletDrag}
+          onUpdateAppletDrag={onUpdateAppletDrag}
+          onFinishAppletDrag={onFinishAppletDrag}
+          onCancelAppletDrag={onCancelAppletDrag}
+        />
       </div>
     </div>
   );
@@ -761,43 +1053,188 @@ function AppletFrame({
   session,
   instanceId,
   leafId,
-  workspaceId
+  workspaceId,
+  onBeginAppletDrag,
+  onUpdateAppletDrag,
+  onFinishAppletDrag,
+  onCancelAppletDrag
 }: {
   session: AppletSession;
   instanceId: string;
   leafId: string;
   workspaceId: string;
+  onBeginAppletDrag: (drag: Omit<AppletDragState, "target">) => void;
+  onUpdateAppletDrag: (clientX: number, clientY: number) => void;
+  onFinishAppletDrag: () => void;
+  onCancelAppletDrag: () => void;
 }) {
   const Icon = iconByKind[session.kind];
-  const createTerminal = (splitDirection: "row" | "column") => {
+  const [menuOpen, setMenuOpen] = useState(false);
+  const dragRef = useRef<{
+    pointerId: number;
+    startX: number;
+    startY: number;
+    offsetX: number;
+    offsetY: number;
+    dragging: boolean;
+  } | null>(null);
+  const createApplet = (kind: AppletKind, splitDirection: "row" | "column") => {
     void window.unitApi.applets.createApplet({
       workspaceId,
-      kind: "terminal",
+      kind,
       targetLeafId: leafId,
       splitDirection
     });
   };
+  useEffect(() => {
+    if (!menuOpen) {
+      return;
+    }
+    const closeMenu = (event: PointerEvent) => {
+      if (event.target instanceof Element && event.target.closest(`[data-applet-instance-id="${instanceId}"]`)) {
+        return;
+      }
+      setMenuOpen(false);
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setMenuOpen(false);
+      }
+    };
+    document.addEventListener("pointerdown", closeMenu);
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("pointerdown", closeMenu);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [instanceId, menuOpen]);
+  useEffect(() => {
+    const onPointerMove = (event: PointerEvent) => {
+      const drag = dragRef.current;
+      if (!drag || event.pointerId !== drag.pointerId) {
+        return;
+      }
+      const crossedThreshold = Math.abs(event.clientX - drag.startX) > 8 || Math.abs(event.clientY - drag.startY) > 8;
+      if (!drag.dragging && crossedThreshold) {
+        drag.dragging = true;
+        onBeginAppletDrag({
+          instanceId,
+          title: session.title,
+          kind: session.kind,
+          pointerX: event.clientX,
+          pointerY: event.clientY,
+          offsetX: drag.offsetX,
+          offsetY: drag.offsetY
+        });
+      }
+      if (drag.dragging) {
+        onUpdateAppletDrag(event.clientX, event.clientY);
+      }
+    };
+    const onPointerUp = (event: PointerEvent) => {
+      const drag = dragRef.current;
+      if (!drag || event.pointerId !== drag.pointerId) {
+        return;
+      }
+      dragRef.current = null;
+      if (drag.dragging) {
+        onFinishAppletDrag();
+      }
+    };
+    const onPointerCancel = (event: PointerEvent) => {
+      const drag = dragRef.current;
+      if (!drag || event.pointerId !== drag.pointerId) {
+        return;
+      }
+      dragRef.current = null;
+      onCancelAppletDrag();
+    };
+    document.addEventListener("pointermove", onPointerMove);
+    document.addEventListener("pointerup", onPointerUp);
+    document.addEventListener("pointercancel", onPointerCancel);
+    return () => {
+      document.removeEventListener("pointermove", onPointerMove);
+      document.removeEventListener("pointerup", onPointerUp);
+      document.removeEventListener("pointercancel", onPointerCancel);
+    };
+  }, [
+    instanceId,
+    onBeginAppletDrag,
+    onCancelAppletDrag,
+    onFinishAppletDrag,
+    onUpdateAppletDrag,
+    session.kind,
+    session.title
+  ]);
   return (
     <section className="applet-frame" data-testid={`applet-${session.kind}`} data-applet-instance-id={instanceId}>
-      <header className="applet-header">
+      <header
+        className="applet-header"
+        onPointerDown={(event) => {
+            if (event.button !== 0) {
+              return;
+            }
+            if (event.target instanceof Element && event.target.closest(".applet-actions")) {
+              return;
+            }
+            const rect = event.currentTarget.closest(".applet-frame")?.getBoundingClientRect();
+            const headerRect = event.currentTarget.getBoundingClientRect();
+            if (event.clientX > headerRect.right - 8) {
+              return;
+            }
+            dragRef.current = {
+              pointerId: event.pointerId,
+              startX: event.clientX,
+              startY: event.clientY,
+              offsetX: rect ? event.clientX - rect.left : 12,
+              offsetY: rect ? event.clientY - rect.top : 12,
+              dragging: false
+            };
+          }}
+      >
         <div className="applet-title">
           <Icon size={15} />
           <span>{session.title}</span>
         </div>
         <div className="applet-actions">
-          <button
-            className="icon-button"
-            type="button"
-            aria-label={`${session.title} add terminal`}
-            onClick={() => createTerminal("row")}
-          >
-            <Plus size={16} />
-          </button>
+          <div className="applet-picker">
+            <button
+              className="icon-button"
+              type="button"
+              aria-haspopup="menu"
+              aria-expanded={menuOpen}
+              aria-label={`${session.title} add applet`}
+              onClick={() => setMenuOpen((open) => !open)}
+            >
+              <Plus size={16} />
+            </button>
+            {menuOpen ? (
+              <div className="applet-picker-menu" role="menu">
+                {appletCatalog.map((item) => {
+                  const ItemIcon = iconByKind[item.kind];
+                  return (
+                    <button
+                      key={item.kind}
+                      role="menuitem"
+                      type="button"
+                      onClick={() => {
+                        createApplet(item.kind, "row");
+                        setMenuOpen(false);
+                      }}
+                    >
+                      <ItemIcon size={14} />
+                      <span>{item.label}</span>
+                    </button>
+                  );
+                })}
+              </div>
+            ) : null}
+          </div>
           <button
             className="icon-button"
             type="button"
             aria-label={`${session.title} split right`}
-            onClick={() => createTerminal("row")}
+            onClick={() => createApplet("terminal", "row")}
           >
             <PanelRight size={16} />
           </button>
@@ -805,7 +1242,7 @@ function AppletFrame({
             className="icon-button"
             type="button"
             aria-label={`${session.title} split down`}
-            onClick={() => createTerminal("column")}
+            onClick={() => createApplet("terminal", "column")}
           >
             <PanelTop size={16} />
           </button>
@@ -931,9 +1368,27 @@ function toClientRect(rect: DOMRect): RectLike {
   };
 }
 
-export const __tabGeometryForTests = {
-  closeHitRectForTab,
-  closeRectForTab,
-  insertionIndexForX,
-  titleRectForTab
-};
+function relativeRect(
+  target: DOMRect,
+  container: DOMRect,
+  edge: "left" | "right" | "top" | "bottom"
+): { left: number; top: number; width: number; height: number } {
+  const base = {
+    left: target.left - container.left,
+    top: target.top - container.top,
+    width: target.width,
+    height: target.height
+  };
+  if (edge === "left") {
+    return { ...base, width: Math.max(72, target.width * 0.36) };
+  }
+  if (edge === "right") {
+    const width = Math.max(72, target.width * 0.36);
+    return { ...base, left: target.right - container.left - width, width };
+  }
+  if (edge === "top") {
+    return { ...base, height: Math.max(72, target.height * 0.36) };
+  }
+  const height = Math.max(72, target.height * 0.36);
+  return { ...base, top: target.bottom - container.top - height, height };
+}

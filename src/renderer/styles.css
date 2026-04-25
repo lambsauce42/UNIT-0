@@ -91,7 +91,7 @@ button {
   top: 0;
   left: 0;
   display: inline-grid;
-  grid-template-columns: 16px minmax(60px, auto) 16px;
+  grid-template-columns: 16px minmax(0, 1fr) 16px;
   align-items: center;
   gap: 8px;
   height: 46px;
@@ -121,10 +121,6 @@ button {
   color: var(--text-primary);
 }
 
-.workspace-tab.pinned {
-  width: 206px;
-}
-
 .workspace-tab.dragging {
   border: 1px solid var(--accent-strong);
   background: rgba(26, 35, 48, 0.98);
@@ -133,9 +129,9 @@ button {
 
 .workspace-tab.active::after {
   position: absolute;
-  right: 14px;
+  right: 0;
   bottom: 0;
-  left: 14px;
+  left: 0;
   height: 2px;
   background: var(--accent);
   content: "";
@@ -275,8 +271,12 @@ button {
 }
 
 .workspace-surface {
+  position: relative;
+  display: grid;
+  height: 100%;
   min-height: 0;
   padding: 10px;
+  overflow: hidden;
 }
 
 .workspace-manager {
@@ -348,9 +348,9 @@ button {
 }
 
 .workspace-layout {
+  position: relative;
   display: flex;
   height: 100%;
-  gap: 8px;
 }
 
 .layout-root {
@@ -376,6 +376,22 @@ button {
   flex: 1 1 auto;
 }
 
+.layout-leaf.layout-root {
+  height: 100%;
+}
+
+.layout-gutter {
+  flex: 0 0 8px;
+  align-self: stretch;
+  background: transparent;
+  pointer-events: none;
+}
+
+.gutter-column {
+  flex-basis: 8px;
+  width: 100%;
+}
+
 .applet-frame {
   display: grid;
   min-width: 0;
@@ -394,6 +410,12 @@ button {
   min-width: 0;
   border-bottom: 1px solid var(--border-subtle);
   background: var(--bg-panel-strong);
+  cursor: grab;
+  user-select: none;
+}
+
+.applet-header:active {
+  cursor: grabbing;
 }
 
 .applet-title {
@@ -415,6 +437,85 @@ button {
 .applet-body {
   min-height: 0;
   overflow: hidden;
+}
+
+.applet-picker {
+  position: relative;
+}
+
+.applet-picker .icon-button {
+  grid-template-columns: 1fr;
+}
+
+.applet-picker-menu {
+  position: absolute;
+  z-index: 30;
+  top: 34px;
+  right: 0;
+  display: grid;
+  min-width: 158px;
+  padding: 4px;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  background: var(--bg-panel);
+  box-shadow: 0 16px 36px var(--shadow-strong);
+}
+
+.applet-picker-menu button {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  min-height: 30px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-primary);
+  text-align: left;
+}
+
+.applet-picker-menu button:hover {
+  background: var(--bg-hover);
+}
+
+.applet-drop-indicator {
+  position: absolute;
+  z-index: 14;
+  border: 1px solid var(--accent-strong);
+  border-radius: 6px;
+  background: rgba(91, 140, 255, 0.18);
+  box-shadow:
+    inset 0 0 0 1px rgba(122, 162, 255, 0.4),
+    0 16px 38px rgba(0, 0, 0, 0.28);
+  pointer-events: none;
+}
+
+.applet-drag-ghost {
+  position: fixed;
+  z-index: 80;
+  left: 0;
+  top: 0;
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  width: 260px;
+  height: 40px;
+  padding: 0 12px;
+  border: 1px solid var(--accent-strong);
+  border-radius: 6px;
+  background: rgba(26, 35, 48, 0.94);
+  color: var(--text-primary);
+  box-shadow: 0 18px 42px var(--shadow-strong);
+  font-weight: 600;
+  pointer-events: none;
+}
+
+.applet-drag-ghost span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .terminal-surface {
@@ -607,10 +708,4 @@ button {
   color: #78e08f;
   font: 13px "Cascadia Mono", Consolas, monospace;
   box-shadow: 0 18px 42px var(--shadow-strong);
-}
-
-@media (max-width: 1120px) {
-  .layout-root.layout-row {
-    flex-direction: column;
-  }
 }

@@ -9,6 +9,7 @@ import type {
   CreateAppletPayload,
   CreateWorkspacePayload,
   FinishTabDragPayload,
+  MoveAppletInstancePayload,
   OpenWorkspaceTabPayload,
   RectLike,
   RegisterStripBoundsPayload,
@@ -23,6 +24,7 @@ import type {
   AppletInstance,
   WorkspaceTab
 } from "../shared/types.js";
+import { WORKSPACE_TAB_SIZE } from "../shared/tabMetrics.js";
 import { WorkspaceStateStore } from "./workspaceStateStore.js";
 
 const preloadPath = path.join(__dirname, "../preload/preload.js");
@@ -35,7 +37,10 @@ let overlayPointerCapturing = false;
 let overlayWindowsVisible = false;
 
 const DROP_SLOP = { left: 8, top: 4, right: 8, bottom: 40 };
-const TAB_PREVIEW_SIZE = { width: 220, height: 46 };
+
+if (process.env.NODE_ENV === "test" && process.env.UNIT0_DATA_DIR) {
+  app.setPath("userData", path.join(process.env.UNIT0_DATA_DIR, "electron-user-data"));
+}
 const TEST_WINDOW_MODE = process.env.UNIT0_E2E_WINDOW_MODE;
 const HIDE_TEST_WINDOWS = process.env.NODE_ENV === "test" && TEST_WINDOW_MODE !== "visible";
 
@@ -334,6 +339,14 @@ class TabRegistry {
     }
   }
 
+  moveAppletInstance(payload: MoveAppletInstancePayload): void {
+    const workspace = this.workspaces[payload.workspaceId];
+    if (!workspace || this.dragSession) {
+      throw new Error(`Cannot move applet instance ${payload.appletInstanceId}`);
+    }
+    this.workspaces[payload.workspaceId] = this.store.moveAppletInstance(payload);
+  }
+
   windowClosed(windowId: number): void {
     this.stripBounds.delete(windowId);
     const session = this.dragSession;
@@ -492,8 +505,8 @@ class TabRegistry {
       ? {
           left: screenX - session.hotSpot.x,
           top: screenY - session.hotSpot.y,
-          right: screenX - session.hotSpot.x + TAB_PREVIEW_SIZE.width,
-          bottom: screenY - session.hotSpot.y + TAB_PREVIEW_SIZE.height
+          right: screenX - session.hotSpot.x + WORKSPACE_TAB_SIZE.width,
+          bottom: screenY - session.hotSpot.y + WORKSPACE_TAB_SIZE.height
         }
       : null;
     for (const strip of this.stripBounds.values()) {
@@ -1019,8 +1032,8 @@ function captureOverlayDataUrl(options: ReturnType<typeof overlayDragPayload>): 
   const safeTitle = escapeHtml(options.title);
   return `data:text/html;charset=utf-8,${encodeURIComponent(`<!doctype html><html><head><style>
 html,body{width:100%;height:100%;margin:0;background:transparent;overflow:hidden;font-family:Segoe UI,Arial,sans-serif}
-.tab{position:fixed;left:0;top:0;display:${options.visible ? "grid" : "none"};grid-template-columns:16px minmax(0,1fr) 16px;align-items:center;gap:8px;width:${TAB_PREVIEW_SIZE.width}px;height:${TAB_PREVIEW_SIZE.height}px;padding:0 10px 0 14px;border:1px solid #9ab7ff;border-radius:6px;background:rgba(255,255,255,.97);color:#121821;font-weight:600;box-shadow:0 12px 30px rgba(38,67,118,.22);will-change:transform;pointer-events:none}
-.dot{width:12px;height:12px;border:1px solid #6f7a8c;border-radius:3px}.title{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.x{opacity:.55}
+.tab{position:fixed;left:0;top:0;display:${options.visible ? "grid" : "none"};grid-template-columns:16px minmax(0,1fr) 16px;align-items:center;gap:8px;width:${WORKSPACE_TAB_SIZE.width}px;height:${WORKSPACE_TAB_SIZE.height}px;padding:0 10px 0 14px;border:1px solid #7aa2ff;border-radius:6px;background:rgba(26,35,48,.88);color:#e6edf6;font-weight:600;box-shadow:0 14px 32px rgba(0,0,0,.42);opacity:.92;will-change:transform;pointer-events:none}
+.dot{width:12px;height:12px;border:1px solid #b7c2d1;border-radius:3px}.title{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.x{opacity:.55;color:#b7c2d1}
 </style></head><body><div class="tab" id="ghost"><span class="dot"></span><span class="title">${safeTitle}</span><span class="x">x</span></div><script>
 const { ipcRenderer } = require("electron");
 let drag = ${JSON.stringify(options)};
@@ -1174,6 +1187,10 @@ app.whenReady().then(() => {
   });
   ipcMain.handle("applets:closeAppletInstance", (_event, payload: CloseAppletInstancePayload) => {
     registry.closeAppletInstance(payload);
+    broadcastState();
+  });
+  ipcMain.handle("applets:moveAppletInstance", (_event, payload: MoveAppletInstancePayload) => {
+    registry.moveAppletInstance(payload);
     broadcastState();
   });
   ipcMain.handle("tabs:registerStripBounds", (_event, payload: RegisterStripBoundsPayload) => {

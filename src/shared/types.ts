@@ -167,6 +167,14 @@ export interface CloseAppletInstancePayload {
   appletInstanceId: string;
 }
 
+export interface MoveAppletInstancePayload {
+  workspaceId: string;
+  appletInstanceId: string;
+  targetLeafId?: string;
+  splitDirection: "row" | "column";
+  placement: "first" | "second";
+}
+
 export interface UnitApi {
   bootstrap: () => Promise<BootstrapPayload>;
   onStateChanged: (callback: (payload: BootstrapPayload) => void) => () => void;
@@ -192,5 +200,6 @@ export interface UnitApi {
   applets: {
     createApplet: (payload: CreateAppletPayload) => Promise<AppletInstance>;
     closeAppletInstance: (payload: CloseAppletInstancePayload) => Promise<void>;
+    moveAppletInstance: (payload: MoveAppletInstancePayload) => Promise<void>;
   };
 }
