@@ -19,6 +19,7 @@ import type {
   TabHostSnapshot,
   TabHostState,
   UnitState,
+  UpdateLayoutRatiosPayload,
   UpdateTabDragPayload,
   Workspace,
   AppletInstance,
@@ -309,6 +310,14 @@ class TabRegistry {
         tab.title = renamed.title;
       }
     }
+  }
+
+  updateLayoutRatios(payload: UpdateLayoutRatiosPayload): void {
+    const workspace = this.workspaces[payload.workspaceId];
+    if (!workspace || this.dragSession) {
+      throw new Error(`Cannot update layout ratios for workspace ${payload.workspaceId}`);
+    }
+    this.workspaces[payload.workspaceId] = this.store.updateLayoutRatios(payload);
   }
 
   createApplet(payload: CreateAppletPayload): AppletInstance {
@@ -1178,6 +1187,10 @@ app.whenReady().then(() => {
   });
   ipcMain.handle("workspaces:renameWorkspace", (_event, payload: RenameWorkspacePayload) => {
     registry.renameWorkspace(payload.workspaceId, payload.title);
+    broadcastState();
+  });
+  ipcMain.handle("workspaces:updateLayoutRatios", (_event, payload: UpdateLayoutRatiosPayload) => {
+    registry.updateLayoutRatios(payload);
     broadcastState();
   });
   ipcMain.handle("applets:createApplet", (_event, payload: CreateAppletPayload) => {

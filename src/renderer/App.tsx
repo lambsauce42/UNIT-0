@@ -16,7 +16,7 @@ import {
   Trash2,
   X
 } from "lucide-react";
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import type {
   AppletKind,
   AppletSession,
@@ -28,6 +28,17 @@ import type {
   WorkspaceLayoutNode,
   WorkspaceTab
 } from "../shared/types";
+import {
+  TILE_GUTTER_SIZE,
+  applyRatioOverrides,
+  completedEdgeGroups,
+  computeCanonicalLayout,
+  projectResize,
+  resizeTargetAt,
+  type CanonicalLayoutGeometry,
+  type EdgeGroup,
+  type ResizeTarget
+} from "../shared/layoutGeometry";
 import { WORKSPACE_TAB_SIZE } from "../shared/tabMetrics";
 import { closeHitRectForTab } from "./tabGeometry";
 
@@ -83,6 +94,19 @@ type AppletDragState = {
   offsetY: number;
   target: AppletDropTarget | null;
 };
+
+type LayoutSize = { width: number; height: number };
+
+type ResizeDragState = {
+  pointerId: number;
+  startX: number;
+  startY: number;
+  target: ResizeTarget;
+  geometry: CanonicalLayoutGeometry;
+  layout: WorkspaceLayoutNode;
+};
+
+const WORKSPACE_SURFACE_PADDING = 10;
 
 export function App() {
   const [payload, setPayload] = useState<BootstrapPayload | null>(null);
@@ -712,6 +736,13 @@ function WorkspaceSurface({ state, workspace }: { state: UnitState; workspace: W
   const surfaceRef = useRef<HTMLElement | null>(null);
   const [appletDrag, setAppletDrag] = useState<AppletDragState | null>(null);
   const appletDragRef = useRef<AppletDragState | null>(null);
+  const resizeDragRef = useRef<ResizeDragState | null>(null);
+  const resizePublishRafRef = useRef<number | null>(null);
+  const pendingResizeRatiosRef = useRef<Record<string, number> | null>(null);
+  const [layoutSize, setLayoutSize] = useState<LayoutSize>({ width: 0, height: 0 });
+  const [ratioOverrides, setRatioOverrides] = useState<Record<string, number>>({});
+  const [hoverResizeTarget, setHoverResizeTarget] = useState<ResizeTarget | null>(null);
+  const [resizeDrag, setResizeDrag] = useState<ResizeDragState | null>(null);
   const appletsById = useMemo(
     () =>
       new Map(
@@ -735,6 +766,152 @@ function WorkspaceSurface({ state, workspace }: { state: UnitState; workspace: W
     ),
     [state.appletSessions, workspace.applets]
   );
+  const ratioOverrideKey = JSON.stringify(ratioOverrides);
+  const effectiveLayout = useMemo(
+    () => (workspace.layout ? applyRatioOverrides(workspace.layout, ratioOverrides) : null),
+    [workspace.layout, ratioOverrideKey]
+  );
+  const layoutGeometry = useMemo(
+    () =>
+      effectiveLayout && layoutSize.width > 0 && layoutSize.height > 0
+        ? computeCanonicalLayout(effectiveLayout, layoutSize)
+        : null,
+    [effectiveLayout, layoutSize.height, layoutSize.width]
+  );
+  const completedGroups = useMemo(
+    () => (layoutGeometry ? completedEdgeGroups(layoutGeometry.primitiveEdges, layoutGeometry.leaves) : []),
+    [layoutGeometry]
+  );
+  useLayoutEffect(() => {
+    const surface = surfaceRef.current;
+    if (!surface) {
+      return;
+    }
+    const measure = () => {
+      setLayoutSize({
+        width: Math.max(0, Math.round(surface.clientWidth - WORKSPACE_SURFACE_PADDING * 2)),
+        height: Math.max(0, Math.round(surface.clientHeight - WORKSPACE_SURFACE_PADDING * 2))
+      });
+    };
+    measure();
+    const resizeObserver = new ResizeObserver(measure);
+    resizeObserver.observe(surface);
+    window.addEventListener("resize", measure);
+    return () => {
+      resizeObserver.disconnect();
+      window.removeEventListener("resize", measure);
+    };
+  }, []);
+  useEffect(() => {
+    if (!resizeDragRef.current) {
+      setRatioOverrides({});
+    }
+  }, [workspace.id, workspace.layout]);
+  const localTilingPoint = useCallback((clientX: number, clientY: number): { x: number; y: number } | null => {
+    const surface = surfaceRef.current;
+    if (!surface) {
+      return null;
+    }
+    const rect = surface.getBoundingClientRect();
+    return {
+      x: Math.round(clientX - rect.left - WORKSPACE_SURFACE_PADDING),
+      y: Math.round(clientY - rect.top - WORKSPACE_SURFACE_PADDING)
+    };
+  }, []);
+  const publishResizeRatios = useCallback(
+    (ratios: Record<string, number>) => {
+      pendingResizeRatiosRef.current = ratios;
+      if (resizePublishRafRef.current !== null) {
+        return;
+      }
+      resizePublishRafRef.current = window.requestAnimationFrame(() => {
+        resizePublishRafRef.current = null;
+        const nextRatios = pendingResizeRatiosRef.current;
+        pendingResizeRatiosRef.current = null;
+        if (nextRatios && Object.keys(nextRatios).length > 0) {
+          void window.unitApi.workspaces.updateLayoutRatios({ workspaceId: workspace.id, ratios: nextRatios });
+        }
+      });
+    },
+    [workspace.id]
+  );
+  const flushResizeRatios = useCallback(() => {
+    if (resizePublishRafRef.current !== null) {
+      window.cancelAnimationFrame(resizePublishRafRef.current);
+      resizePublishRafRef.current = null;
+    }
+    const nextRatios = pendingResizeRatiosRef.current;
+    pendingResizeRatiosRef.current = null;
+    if (nextRatios && Object.keys(nextRatios).length > 0) {
+      void window.unitApi.workspaces.updateLayoutRatios({ workspaceId: workspace.id, ratios: nextRatios });
+    }
+  }, [workspace.id]);
+  const beginResizeDrag = useCallback(
+    (event: ReactPointerEvent<HTMLElement>, target: ResizeTarget) => {
+      if (!layoutGeometry || !effectiveLayout || event.button !== 0) {
+        return;
+      }
+      const point = localTilingPoint(event.clientX, event.clientY);
+      if (!point) {
+        return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+      event.currentTarget.setPointerCapture(event.pointerId);
+      const nextDrag = {
+        pointerId: event.pointerId,
+        startX: point.x,
+        startY: point.y,
+        target,
+        geometry: layoutGeometry,
+        layout: effectiveLayout
+      };
+      resizeDragRef.current = nextDrag;
+      setResizeDrag(nextDrag);
+      setHoverResizeTarget(target);
+    },
+    [effectiveLayout, layoutGeometry, localTilingPoint]
+  );
+  useEffect(() => {
+    const onPointerMove = (event: PointerEvent) => {
+      const drag = resizeDragRef.current;
+      if (!drag || event.pointerId !== drag.pointerId) {
+        return;
+      }
+      const point = localTilingPoint(event.clientX, event.clientY);
+      if (!point) {
+        return;
+      }
+      const projected = projectResize(drag.geometry, drag.target, {
+        x: point.x - drag.startX,
+        y: point.y - drag.startY
+      });
+      const nextRatios = compensatedResizeRatios(drag, projected.ratios, projected.dx, projected.dy, layoutSize);
+      setRatioOverrides((current) => ({ ...current, ...nextRatios }));
+      publishResizeRatios(nextRatios);
+    };
+    const finishDrag = (event: PointerEvent) => {
+      const drag = resizeDragRef.current;
+      if (!drag || event.pointerId !== drag.pointerId) {
+        return;
+      }
+      resizeDragRef.current = null;
+      setResizeDrag(null);
+      flushResizeRatios();
+    };
+    document.addEventListener("pointermove", onPointerMove);
+    document.addEventListener("pointerup", finishDrag);
+    document.addEventListener("pointercancel", finishDrag);
+    return () => {
+      document.removeEventListener("pointermove", onPointerMove);
+      document.removeEventListener("pointerup", finishDrag);
+      document.removeEventListener("pointercancel", finishDrag);
+      if (resizePublishRafRef.current !== null) {
+        window.cancelAnimationFrame(resizePublishRafRef.current);
+        resizePublishRafRef.current = null;
+      }
+    };
+  }, [flushResizeRatios, layoutSize, localTilingPoint, publishResizeRatios]);
   const dropTargetFor = useCallback(
     (clientX: number, clientY: number, draggedInstanceId: string): AppletDropTarget | null => {
       const surface = surfaceRef.current;
@@ -838,19 +1015,34 @@ function WorkspaceSurface({ state, workspace }: { state: UnitState; workspace: W
   }, []);
   const draggedApplet = appletDrag ? appletByInstanceId.get(appletDrag.instanceId) : null;
   const DragIcon = draggedApplet?.session ? iconByKind[draggedApplet.session.kind] : SquareTerminal;
+  const activeResizeTarget = resizeDrag?.target ?? hoverResizeTarget;
+  const activeResizeGroups = resizeGroupsForTarget(activeResizeTarget, completedGroups);
   return (
     <section className="workspace-surface" data-testid="workspace-surface" ref={surfaceRef}>
-      {workspace.layout ? (
+      {effectiveLayout && layoutGeometry ? (
         <WorkspaceLayout
-          node={workspace.layout}
+          geometry={layoutGeometry}
           appletsById={appletsById}
           workspaceId={workspace.id}
-          root
-          depth={0}
           onBeginAppletDrag={beginAppletDrag}
           onUpdateAppletDrag={updateAppletDrag}
           onFinishAppletDrag={finishAppletDrag}
           onCancelAppletDrag={cancelAppletDrag}
+          onHoverResizeTarget={(clientX, clientY) => {
+            if (resizeDragRef.current) {
+              return;
+            }
+            const point = localTilingPoint(clientX, clientY);
+            setHoverResizeTarget(point ? resizeTargetAt(layoutGeometry, point) : null);
+          }}
+          onLeaveResizeTarget={() => {
+            if (!resizeDragRef.current) {
+              setHoverResizeTarget(null);
+            }
+          }}
+          completedGroups={completedGroups}
+          activeGroups={activeResizeGroups}
+          onBeginResizeDrag={beginResizeDrag}
         />
       ) : (
         <div className="workspace-empty" data-testid="workspace-empty">
@@ -895,158 +1087,287 @@ function WorkspaceSurface({ state, workspace }: { state: UnitState; workspace: W
 }
 
 function WorkspaceLayout({
-  node,
+  geometry,
   appletsById,
   workspaceId,
-  root = false,
-  depth,
   onBeginAppletDrag,
   onUpdateAppletDrag,
   onFinishAppletDrag,
-  onCancelAppletDrag
+  onCancelAppletDrag,
+  onHoverResizeTarget,
+  onLeaveResizeTarget,
+  completedGroups,
+  activeGroups,
+  onBeginResizeDrag
 }: {
-  node: WorkspaceLayoutNode;
+  geometry: CanonicalLayoutGeometry;
   appletsById: Map<string, { instance: Workspace["applets"][number]; session: AppletSession | undefined }>;
   workspaceId: string;
-  root?: boolean;
-  depth: number;
   onBeginAppletDrag: (drag: Omit<AppletDragState, "target">) => void;
   onUpdateAppletDrag: (clientX: number, clientY: number) => void;
   onFinishAppletDrag: () => void;
   onCancelAppletDrag: () => void;
+  onHoverResizeTarget: (clientX: number, clientY: number) => void;
+  onLeaveResizeTarget: () => void;
+  completedGroups: EdgeGroup[];
+  activeGroups: EdgeGroup[];
+  onBeginResizeDrag: (event: ReactPointerEvent<HTMLElement>, target: ResizeTarget) => void;
 }) {
-  if (node.type === "split") {
-    return (
-      <WorkspaceLayoutSplit
-        node={node}
-        appletsById={appletsById}
-        workspaceId={workspaceId}
-        root={root}
-        depth={depth}
-        onBeginAppletDrag={onBeginAppletDrag}
-        onUpdateAppletDrag={onUpdateAppletDrag}
-        onFinishAppletDrag={onFinishAppletDrag}
-        onCancelAppletDrag={onCancelAppletDrag}
-      />
-    );
-  }
-  return (
-      <WorkspaceLayoutLeaf
-        node={node}
-        appletsById={appletsById}
-      workspaceId={workspaceId}
-      root={root}
-      depth={depth}
-      onBeginAppletDrag={onBeginAppletDrag}
-      onUpdateAppletDrag={onUpdateAppletDrag}
-      onFinishAppletDrag={onFinishAppletDrag}
-      onCancelAppletDrag={onCancelAppletDrag}
-    />
-  );
-}
-
-function WorkspaceLayoutLeaf({
-  node,
-  appletsById,
-  workspaceId,
-  root,
-  depth,
-  onBeginAppletDrag,
-  onUpdateAppletDrag,
-  onFinishAppletDrag,
-  onCancelAppletDrag
-}: {
-  node: Extract<WorkspaceLayoutNode, { type: "leaf" }>;
-  appletsById: Map<string, { instance: Workspace["applets"][number]; session: AppletSession | undefined }>;
-  workspaceId: string;
-  root: boolean;
-  depth: number;
-  onBeginAppletDrag: (drag: Omit<AppletDragState, "target">) => void;
-  onUpdateAppletDrag: (clientX: number, clientY: number) => void;
-  onFinishAppletDrag: () => void;
-  onCancelAppletDrag: () => void;
-}) {
-  const applet = appletsById.get(node.appletInstanceId);
-  if (!applet?.session) {
-    throw new Error(`Layout leaf references missing applet instance ${node.appletInstanceId}`);
-  }
   return (
     <div
-      className={`layout-leaf ${root ? "layout-root" : ""}`}
-      data-testid={`layout-leaf-${node.appletInstanceId}`}
-      data-layout-leaf-id={node.id}
-      data-applet-instance-id={node.appletInstanceId}
+      className="workspace-layout layout-root"
+      data-testid="workspace-layout"
+      style={{
+        width: geometry.rect.right - geometry.rect.left,
+        height: geometry.rect.bottom - geometry.rect.top
+      }}
+      onPointerMove={(event) => onHoverResizeTarget(event.clientX, event.clientY)}
+      onPointerLeave={onLeaveResizeTarget}
     >
-      <AppletFrame
-        session={applet.session}
-        instanceId={applet.instance.id}
-        leafId={node.id}
-        workspaceId={workspaceId}
-        onBeginAppletDrag={onBeginAppletDrag}
-        onUpdateAppletDrag={onUpdateAppletDrag}
-        onFinishAppletDrag={onFinishAppletDrag}
-        onCancelAppletDrag={onCancelAppletDrag}
+      {geometry.leaves.map((leaf) => {
+        const applet = appletsById.get(leaf.appletInstanceId);
+        if (!applet?.session) {
+          throw new Error(`Layout leaf references missing applet instance ${leaf.appletInstanceId}`);
+        }
+        return (
+          <div
+            className="layout-leaf"
+            data-testid={`layout-leaf-${leaf.appletInstanceId}`}
+            data-layout-leaf-id={leaf.id}
+            data-applet-instance-id={leaf.appletInstanceId}
+            key={leaf.id}
+            style={rectStyle(leaf.rect)}
+          >
+            <AppletFrame
+              session={applet.session}
+              instanceId={applet.instance.id}
+              leafId={leaf.id}
+              workspaceId={workspaceId}
+              onBeginAppletDrag={onBeginAppletDrag}
+              onUpdateAppletDrag={onUpdateAppletDrag}
+              onFinishAppletDrag={onFinishAppletDrag}
+              onCancelAppletDrag={onCancelAppletDrag}
+            />
+          </div>
+        );
+      })}
+      <SplitterOverlay
+        completedGroups={completedGroups}
+        activeGroups={activeGroups}
+        onBeginResizeDrag={onBeginResizeDrag}
       />
     </div>
   );
 }
 
-function WorkspaceLayoutSplit({
-  node,
-  appletsById,
-  workspaceId,
-  root,
-  depth,
-  onBeginAppletDrag,
-  onUpdateAppletDrag,
-  onFinishAppletDrag,
-  onCancelAppletDrag
+function compensatedResizeRatios(
+  drag: ResizeDragState,
+  ratios: Record<string, number>,
+  dx: number,
+  dy: number,
+  layoutSize: LayoutSize
+): Record<string, number> {
+  const nextRatios = { ...ratios };
+  const previewLayout = applyRatioOverrides(drag.layout, nextRatios);
+  const previewGeometry = computeCanonicalLayout(previewLayout, layoutSize);
+  if (drag.target.vertical && dx !== 0) {
+    addBranchCompensation(drag.geometry, previewGeometry, drag.target.vertical, nextRatios);
+  }
+  if (drag.target.horizontal && dy !== 0) {
+    addBranchCompensation(drag.geometry, previewGeometry, drag.target.horizontal, nextRatios);
+  }
+  return nextRatios;
+}
+
+function addBranchCompensation(
+  startGeometry: CanonicalLayoutGeometry,
+  previewGeometry: CanonicalLayoutGeometry,
+  group: EdgeGroup,
+  ratios: Record<string, number>
+): void {
+  const direction = group.axis === "vertical" ? "row" : "column";
+  const touchedLeafIds = new Set(group.edges.flatMap((edge) => [edge.beforeLeafId, edge.afterLeafId]));
+  const startSplits = new Map(startGeometry.splits.map((split) => [split.id, split]));
+  for (const previewSplit of previewGeometry.splits) {
+    if (previewSplit.direction !== direction || previewSplit.availableSize <= 0) {
+      continue;
+    }
+    const startSplit = startSplits.get(previewSplit.id);
+    if (!startSplit) {
+      continue;
+    }
+    const firstTouches = previewSplit.firstLeafIds.some((leafId) => touchedLeafIds.has(leafId));
+    const secondTouches = previewSplit.secondLeafIds.some((leafId) => touchedLeafIds.has(leafId));
+    if (firstTouches === secondTouches) {
+      continue;
+    }
+    const firstSize = firstTouches ? previewSplit.availableSize - startSplit.secondSize : startSplit.firstSize;
+    if (firstSize <= 0 || firstSize >= previewSplit.availableSize) {
+      continue;
+    }
+    ratios[previewSplit.id] = firstSize / previewSplit.availableSize;
+  }
+}
+
+function SplitterOverlay({
+  completedGroups,
+  activeGroups,
+  onBeginResizeDrag
 }: {
-  node: Extract<WorkspaceLayoutNode, { type: "split" }>;
-  appletsById: Map<string, { instance: Workspace["applets"][number]; session: AppletSession | undefined }>;
-  workspaceId: string;
-  root: boolean;
-  depth: number;
-  onBeginAppletDrag: (drag: Omit<AppletDragState, "target">) => void;
-  onUpdateAppletDrag: (clientX: number, clientY: number) => void;
-  onFinishAppletDrag: () => void;
-  onCancelAppletDrag: () => void;
+  completedGroups: EdgeGroup[];
+  activeGroups: EdgeGroup[];
+  onBeginResizeDrag: (event: ReactPointerEvent<HTMLElement>, target: ResizeTarget) => void;
 }) {
-  const firstBasis = `${node.ratio * 100}%`;
-  const secondBasis = `${(1 - node.ratio) * 100}%`;
+  const activeKeys = new Set(activeGroups.map(edgeGroupKey));
+  const verticalGroups = completedGroups.filter((group) => group.axis === "vertical");
+  const horizontalGroups = completedGroups.filter((group) => group.axis === "horizontal");
+  const junctions = junctionTargets(verticalGroups, horizontalGroups);
   return (
-    <div
-      className={`workspace-layout layout-split layout-${node.direction} ${root ? "layout-root" : ""}`}
-      data-testid={root ? "workspace-layout" : undefined}
-      data-layout-direction={node.direction}
-    >
-      <div className="layout-branch" style={{ flex: `${node.ratio} 1 ${firstBasis}` }}>
-        <WorkspaceLayout
-          node={node.first}
-          appletsById={appletsById}
-          workspaceId={workspaceId}
-          depth={depth + 1}
-          onBeginAppletDrag={onBeginAppletDrag}
-          onUpdateAppletDrag={onUpdateAppletDrag}
-          onFinishAppletDrag={onFinishAppletDrag}
-          onCancelAppletDrag={onCancelAppletDrag}
+    <div className="splitter-layer" aria-hidden="true">
+      {activeGroups.map((group) => (
+        <div
+          className={`splitter-highlight splitter-highlight-${group.axis}`}
+          data-testid={`layout-splitter-highlight-${group.axis}`}
+          key={`highlight-${edgeGroupKey(group)}`}
+          style={groupStyle(group)}
         />
-      </div>
-      <div className={`layout-gutter gutter-${node.direction}`} aria-hidden="true" />
-      <div className="layout-branch" style={{ flex: `${1 - node.ratio} 1 ${secondBasis}` }}>
-        <WorkspaceLayout
-          node={node.second}
-          appletsById={appletsById}
-          workspaceId={workspaceId}
-          depth={depth + 1}
-          onBeginAppletDrag={onBeginAppletDrag}
-          onUpdateAppletDrag={onUpdateAppletDrag}
-          onFinishAppletDrag={onFinishAppletDrag}
-          onCancelAppletDrag={onCancelAppletDrag}
+      ))}
+      {completedGroups.map((group) => (
+        <div
+          className={`splitter-handle splitter-handle-${group.axis} ${activeKeys.has(edgeGroupKey(group)) ? "active" : ""}`}
+          data-testid={`layout-splitter-${group.axis}`}
+          key={`handle-${edgeGroupKey(group)}`}
+          onPointerDown={(event) =>
+            onBeginResizeDrag(event, {
+              type: "edge",
+              vertical: group.axis === "vertical" ? group : null,
+              horizontal: group.axis === "horizontal" ? group : null
+            })
+          }
+          role="separator"
+          style={groupStyle(group)}
         />
-      </div>
+      ))}
+      {junctions.map(({ vertical, horizontal }) => (
+        <div
+          className="splitter-junction"
+          data-testid="layout-splitter-junction"
+          key={`junction-${edgeGroupKey(vertical)}-${edgeGroupKey(horizontal)}`}
+          onPointerDown={(event) => onBeginResizeDrag(event, { type: "junction", vertical, horizontal })}
+          role="separator"
+          style={{
+            left: vertical.center - (TILE_GUTTER_SIZE * 3) / 2,
+            top: horizontal.center - (TILE_GUTTER_SIZE * 3) / 2,
+            width: TILE_GUTTER_SIZE * 3,
+            height: TILE_GUTTER_SIZE * 3
+          }}
+        />
+      ))}
     </div>
   );
+}
+
+function junctionTargets(verticalGroups: EdgeGroup[], horizontalGroups: EdgeGroup[]) {
+  const targets = new Map<string, { vertical: EdgeGroup; horizontal: EdgeGroup }>();
+  const radius = (TILE_GUTTER_SIZE * 3) / 2;
+  for (const vertical of verticalGroups) {
+    for (const horizontal of horizontalGroups) {
+      if (
+        horizontal.start > vertical.center + radius ||
+        horizontal.end < vertical.center - radius ||
+        vertical.start > horizontal.center + radius ||
+        vertical.end < horizontal.center - radius
+      ) {
+        continue;
+      }
+      const incidentVertical = verticalGroups.filter(
+        (group) =>
+          group.center === vertical.center &&
+          group.start <= horizontal.center + radius &&
+          group.end >= horizontal.center - radius
+      );
+      const incidentHorizontal = horizontalGroups.filter(
+        (group) =>
+          group.center === horizontal.center &&
+          group.start <= vertical.center + radius &&
+          group.end >= vertical.center - radius
+      );
+      targets.set(`${vertical.center}:${horizontal.center}`, {
+        vertical: combineDisplayGroups(incidentVertical),
+        horizontal: combineDisplayGroups(incidentHorizontal)
+      });
+    }
+  }
+  return [...targets.values()];
+}
+
+function resizeGroupsForTarget(target: ResizeTarget | null, liveGroups: EdgeGroup[]): EdgeGroup[] {
+  if (!target) {
+    return [];
+  }
+  return [target.vertical, target.horizontal]
+    .filter((group): group is EdgeGroup => group !== null)
+    .map((group) => liveGroupForSnapshot(group, liveGroups) ?? group);
+}
+
+function liveGroupForSnapshot(snapshot: EdgeGroup, liveGroups: EdgeGroup[]): EdgeGroup | null {
+  const snapshotEdges = new Set(snapshot.edges.map(edgeSignature));
+  const matches = liveGroups.filter(
+    (group) => group.axis === snapshot.axis && group.edges.some((edge) => snapshotEdges.has(edgeSignature(edge)))
+  );
+  if (matches.length === 0) {
+    return null;
+  }
+  return combineDisplayGroups(matches);
+}
+
+function edgeSignature(edge: EdgeGroup["edges"][number]): string {
+  return `${edge.splitId}:${edge.beforeLeafId}:${edge.afterLeafId}`;
+}
+
+function combineDisplayGroups(groups: EdgeGroup[]): EdgeGroup {
+  const [first] = groups;
+  const edges = groups.flatMap((group) => group.edges);
+  const start = Math.min(...groups.map((group) => group.start));
+  const end = Math.max(...groups.map((group) => group.end));
+  return {
+    id: `${first.axis}:${first.center}:${start}:${end}`,
+    axis: first.axis,
+    center: first.center,
+    start,
+    end,
+    edges
+  };
+}
+
+function edgeGroupKey(group: EdgeGroup): string {
+  return `${group.axis}:${group.center}:${group.start}:${group.end}`;
+}
+
+function groupStyle(group: EdgeGroup): { left: number; top: number; width: number; height: number } {
+  if (group.axis === "vertical") {
+    return {
+      left: group.center - TILE_GUTTER_SIZE / 2,
+      top: group.start,
+      width: TILE_GUTTER_SIZE,
+      height: group.end - group.start
+    };
+  }
+  return {
+    left: group.start,
+    top: group.center - TILE_GUTTER_SIZE / 2,
+    width: group.end - group.start,
+    height: TILE_GUTTER_SIZE
+  };
+}
+
+function rectStyle(rect: { left: number; top: number; right: number; bottom: number }) {
+  return {
+    left: rect.left,
+    top: rect.top,
+    width: rect.right - rect.left,
+    height: rect.bottom - rect.top
+  };
 }
 
 function AppletFrame({

@@ -53,6 +53,29 @@ async function appState(page: Page) {
   return page.evaluate(() => window.unitApi.tabs.bootstrap().then((payload) => payload.state));
 }
 
+async function layoutRatio(page: Page, workspaceId: string, splitId: string): Promise<number | null> {
+  return page.evaluate(
+    ({ workspaceId: targetWorkspaceId, splitId: targetSplitId }) =>
+      window.unitApi.tabs.bootstrap().then((payload) => {
+        const visit = (node: unknown): number | null => {
+          if (!node || typeof node !== "object") {
+            return null;
+          }
+          const layoutNode = node as NonNullable<(typeof payload.state.workspaces)[string]["layout"]>;
+          if (layoutNode.type === "leaf") {
+            return null;
+          }
+          if (layoutNode.id === targetSplitId) {
+            return layoutNode.ratio;
+          }
+          return visit(layoutNode.first) ?? visit(layoutNode.second);
+        };
+        return visit(payload.state.workspaces[targetWorkspaceId]?.layout ?? null);
+      }),
+    { workspaceId, splitId }
+  );
+}
+
 async function closeTabByTestId(page: Page, testId: string): Promise<void> {
   const tab = page.getByTestId(testId);
   const box = await tab.boundingBox();
@@ -492,6 +515,110 @@ test("splits a pane down with stacked geometry", async () => {
   expect(spawnedBox).not.toBeNull();
   expect(spawnedBox!.y).toBeGreaterThan(browserBox!.y + browserBox!.height / 2);
   expect(Math.abs(spawnedBox!.x - browserBox!.x)).toBeLessThanOrEqual(4);
+
+  await app.close();
+});
+
+test("highlights the completed splitter group on hover", async () => {
+  const app = await launchApp();
+  const page = await firstWindow(app);
+  await page.getByTestId("workspace-tab-atlas").click();
+  const splitter = page.locator('[data-testid="layout-splitter-vertical"]').first();
+  const box = await splitter.boundingBox();
+  expect(box).not.toBeNull();
+
+  await page.mouse.move(box!.x + box!.width / 2, box!.y + box!.height / 2);
+  await expect(page.locator('[data-testid="layout-splitter-highlight-vertical"]').first()).toBeVisible();
+
+  await app.close();
+});
+
+test("drags a splitter edge and persists the updated ratio", async () => {
+  const dataDir = makeDataDir();
+  let app = await launchApp(dataDir);
+  let page = await firstWindow(app);
+  await page.getByTestId("workspace-tab-atlas").click();
+  const beforeRatio = await layoutRatio(page, "atlas", "atlas-layout-root");
+  const beforeBox = await page.getByTestId("layout-leaf-atlas-terminal").boundingBox();
+  const splitter = page.locator('[data-testid="layout-splitter-vertical"]').first();
+  const splitterBox = await splitter.boundingBox();
+  expect(beforeRatio).not.toBeNull();
+  expect(beforeBox).not.toBeNull();
+  expect(splitterBox).not.toBeNull();
+
+  await page.mouse.move(splitterBox!.x + splitterBox!.width / 2, splitterBox!.y + splitterBox!.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(splitterBox!.x + splitterBox!.width / 2 + 48, splitterBox!.y + splitterBox!.height / 2, { steps: 8 });
+  await page.mouse.up();
+
+  await expect(async () => {
+    const afterRatio = await layoutRatio(page, "atlas", "atlas-layout-root");
+    expect(afterRatio).not.toBeNull();
+    expect(afterRatio!).toBeGreaterThan(beforeRatio!);
+  }).toPass();
+  const afterBox = await page.getByTestId("layout-leaf-atlas-terminal").boundingBox();
+  expect(afterBox).not.toBeNull();
+  expect(afterBox!.width).toBeGreaterThan(beforeBox!.width);
+  await app.close();
+
+  app = await launchApp(dataDir);
+  page = await firstWindow(app);
+  await page.getByTestId("workspace-tab-atlas").click();
+  const restartedRatio = await layoutRatio(page, "atlas", "atlas-layout-root");
+  expect(restartedRatio).not.toBeNull();
+  expect(restartedRatio!).toBeGreaterThan(beforeRatio!);
+
+  await app.close();
+});
+
+test("drags a splitter junction on both axes", async () => {
+  const app = await launchApp();
+  const page = await firstWindow(app);
+  await page.getByTestId("workspace-tab-atlas").click();
+  const beforeRoot = await layoutRatio(page, "atlas", "atlas-layout-root");
+  const beforeLeft = await layoutRatio(page, "atlas", "atlas-layout-left");
+  const junction = page.locator('[data-testid="layout-splitter-junction"]').first();
+  const junctionBox = await junction.boundingBox();
+  expect(beforeRoot).not.toBeNull();
+  expect(beforeLeft).not.toBeNull();
+  expect(junctionBox).not.toBeNull();
+
+  await page.mouse.move(junctionBox!.x + junctionBox!.width / 2, junctionBox!.y + junctionBox!.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(junctionBox!.x + junctionBox!.width / 2 + 36, junctionBox!.y + junctionBox!.height / 2 + 36, { steps: 8 });
+  await page.mouse.up();
+
+  await expect(async () => {
+    const afterRoot = await layoutRatio(page, "atlas", "atlas-layout-root");
+    const afterLeft = await layoutRatio(page, "atlas", "atlas-layout-left");
+    expect(afterRoot).not.toBeNull();
+    expect(afterLeft).not.toBeNull();
+    expect(afterRoot!).toBeGreaterThan(beforeRoot!);
+    expect(afterLeft!).toBeGreaterThan(beforeLeft!);
+  }).toPass();
+
+  await app.close();
+});
+
+test("clamps splitter resize at the minimum applet size", async () => {
+  const app = await launchApp();
+  const page = await firstWindow(app);
+  await page.getByTestId("workspace-tab-atlas").click();
+  const splitter = page.locator('[data-testid="layout-splitter-vertical"]').first();
+  const splitterBox = await splitter.boundingBox();
+  expect(splitterBox).not.toBeNull();
+
+  await page.mouse.move(splitterBox!.x + splitterBox!.width / 2, splitterBox!.y + splitterBox!.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(splitterBox!.x - 1000, splitterBox!.y + splitterBox!.height / 2, { steps: 12 });
+  await page.mouse.up();
+
+  const terminalBox = await page.getByTestId("layout-leaf-atlas-terminal").boundingBox();
+  const fileBox = await page.getByTestId("layout-leaf-atlas-file-viewer").boundingBox();
+  expect(terminalBox).not.toBeNull();
+  expect(fileBox).not.toBeNull();
+  expect(terminalBox!.width).toBeGreaterThanOrEqual(199);
+  expect(fileBox!.width).toBeGreaterThanOrEqual(199);
 
   await app.close();
 });

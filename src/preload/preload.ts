@@ -13,6 +13,7 @@ import type {
   RegisterStripBoundsPayload,
   RenameWorkspacePayload,
   UnitApi,
+  UpdateLayoutRatiosPayload,
   UpdateTabDragPayload
 } from "../shared/types.js";
 
@@ -45,7 +46,9 @@ const api: UnitApi = {
   workspaces: {
     createWorkspace: (payload: CreateWorkspacePayload) => ipcRenderer.invoke("workspaces:createWorkspace", payload),
     openWorkspaceTab: (payload: OpenWorkspaceTabPayload) => ipcRenderer.invoke("workspaces:openWorkspaceTab", payload),
-    renameWorkspace: (payload: RenameWorkspacePayload) => ipcRenderer.invoke("workspaces:renameWorkspace", payload)
+    renameWorkspace: (payload: RenameWorkspacePayload) => ipcRenderer.invoke("workspaces:renameWorkspace", payload),
+    updateLayoutRatios: (payload: UpdateLayoutRatiosPayload) =>
+      ipcRenderer.invoke("workspaces:updateLayoutRatios", payload)
   },
   applets: {
     createApplet: (payload: CreateAppletPayload) => ipcRenderer.invoke("applets:createApplet", payload),

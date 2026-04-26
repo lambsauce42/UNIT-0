@@ -42,6 +42,11 @@ export type MoveAppletOptions = {
   placement: "first" | "second";
 };
 
+export type UpdateLayoutRatiosOptions = {
+  workspaceId: string;
+  ratios: Record<string, number>;
+};
+
 const DEFAULT_APPLET_SESSIONS: Record<string, AppletSession> = {
   "session-terminal": { id: "session-terminal", kind: "terminal", title: "Terminal" },
   "session-file-viewer": { id: "session-file-viewer", kind: "fileViewer", title: "File Viewer" },
@@ -437,6 +442,29 @@ export class WorkspaceStateStore {
     return nextWorkspace;
   }
 
+  updateLayoutRatios(options: UpdateLayoutRatiosOptions): Workspace {
+    const model = this.load();
+    const workspace = model.workspaces[options.workspaceId];
+    if (!workspace) {
+      throw new Error(`Workspace ${options.workspaceId} does not exist`);
+    }
+    if (!workspace.layout) {
+      throw new Error(`Workspace ${options.workspaceId} does not have a layout`);
+    }
+    const nextLayout = updateLayoutRatios(workspace.layout, options.ratios);
+    validateWorkspaceLayoutForWorkspace(nextLayout, workspace);
+    const nextWorkspace = { ...workspace, layout: nextLayout };
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.saveWorkspaceLayoutInTransaction(workspace.id, nextLayout);
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+    return nextWorkspace;
+  }
+
   close(): void {
     this.db.close();
   }
@@ -811,6 +839,37 @@ function moveAppletLeaf(layout: WorkspaceLayoutNode | null, options: MoveAppletO
   return inserted.node;
 }
 
+function updateLayoutRatios(layout: WorkspaceLayoutNode, ratios: Record<string, number>): WorkspaceLayoutNode {
+  const remaining = new Set(Object.keys(ratios));
+  if (remaining.size === 0) {
+    return layout;
+  }
+  const visit = (node: WorkspaceLayoutNode): WorkspaceLayoutNode => {
+    if (node.type === "leaf") {
+      return node;
+    }
+    const nextRatio = ratios[node.id];
+    const hasRatio = Object.prototype.hasOwnProperty.call(ratios, node.id);
+    if (hasRatio) {
+      remaining.delete(node.id);
+      if (!Number.isFinite(nextRatio) || nextRatio <= 0 || nextRatio >= 1) {
+        throw new Error(`Workspace layout split ${node.id} has an invalid ratio update`);
+      }
+    }
+    return {
+      ...node,
+      ratio: hasRatio ? nextRatio : node.ratio,
+      first: visit(node.first),
+      second: visit(node.second)
+    };
+  };
+  const nextLayout = visit(layout);
+  if (remaining.size > 0) {
+    throw new Error(`Workspace layout ratio update references missing split(s): ${[...remaining].join(", ")}`);
+  }
+  return nextLayout;
+}
+
 function splitWithPlacement(
   id: string,
   direction: "row" | "column",
@@ -884,9 +943,48 @@ function parseWorkspaceLayout(layoutJson: string, workspace: Workspace): Workspa
     }
     return null;
   }
+  const graphLayout = layoutFromRemovedGraphFormat(parsed, workspace);
+  if (graphLayout) {
+    validateWorkspaceLayoutForWorkspace(graphLayout, workspace);
+    return graphLayout;
+  }
   const layout = assertWorkspaceLayoutNode(parsed, workspace.id);
   validateWorkspaceLayoutForWorkspace(layout, workspace);
   return layout;
+}
+
+function layoutFromRemovedGraphFormat(value: unknown, workspace: Workspace): WorkspaceLayoutNode | null {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+  const graph = value as { type?: unknown; panes?: unknown };
+  if (graph.type !== "graph" || !Array.isArray(graph.panes)) {
+    return null;
+  }
+  const mountedAppletIds = workspace.applets.map((instance) => instance.id);
+  const mountedAppletSet = new Set(mountedAppletIds);
+  const orderedGraphAppletIds = graph.panes
+    .map((pane): { appletInstanceId: string; centerX: number; centerY: number } | null => {
+      if (!pane || typeof pane !== "object") {
+        return null;
+      }
+      const item = pane as { appletInstanceId?: unknown; rect?: unknown };
+      if (typeof item.appletInstanceId !== "string" || !mountedAppletSet.has(item.appletInstanceId)) {
+        return null;
+      }
+      const rect = item.rect && typeof item.rect === "object" ? item.rect as Record<string, unknown> : {};
+      const x = typeof rect.x === "number" ? rect.x : 0;
+      const y = typeof rect.y === "number" ? rect.y : 0;
+      const width = typeof rect.width === "number" ? rect.width : 0;
+      const height = typeof rect.height === "number" ? rect.height : 0;
+      return { appletInstanceId: item.appletInstanceId, centerX: x + width / 2, centerY: y + height / 2 };
+    })
+    .filter((item): item is { appletInstanceId: string; centerX: number; centerY: number } => item !== null)
+    .sort((left, right) => left.centerY - right.centerY || left.centerX - right.centerX || left.appletInstanceId.localeCompare(right.appletInstanceId))
+    .map((item) => item.appletInstanceId);
+  const uniqueGraphAppletIds = [...new Set(orderedGraphAppletIds)];
+  const missingAppletIds = mountedAppletIds.filter((appletId) => !uniqueGraphAppletIds.includes(appletId));
+  return layoutFromAppletIds(workspace.id, [...uniqueGraphAppletIds, ...missingAppletIds]);
 }
 
 function assertWorkspaceLayoutNode(value: unknown, workspaceId: string): WorkspaceLayoutNode {
