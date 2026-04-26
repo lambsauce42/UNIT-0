@@ -12,6 +12,10 @@ import type {
   BrowserSessionPayload,
   BrowserWindowVisibilityPayload,
   BootstrapPayload,
+  ChatAddLocalModelPayload,
+  ChatSelectModelPayload,
+  ChatSelectThreadPayload,
+  ChatSubmitPayload,
   ChangeAppletInstanceKindPayload,
   CloseAppletInstancePayload,
   CloseWorkspacePayload,
@@ -49,6 +53,9 @@ import { WORKSPACE_TAB_SIZE } from "../shared/tabMetrics.js";
 import { WorkspaceStateStore } from "./workspaceStateStore.js";
 import { TerminalManager } from "./terminalManager.js";
 import { BrowserViewManager } from "./browserViewManager.js";
+import { ChatStore } from "./chatStore.js";
+import { ChatService } from "./chatService.js";
+import { LocalLlamaRuntime } from "./localLlamaRuntime.js";
 
 const preloadPath = path.join(__dirname, "../preload/preload.js");
 const rendererEntry = path.join(__dirname, "../renderer/index.html");
@@ -772,6 +779,7 @@ class TabRegistry {
 let registry: TabRegistry;
 let terminalManager: TerminalManager;
 let browserViewManager: BrowserViewManager;
+let chatService: ChatService;
 const defaultFileViewerRoot = path.resolve(process.cwd());
 
 function workspaceDatabasePath(): string {
@@ -846,6 +854,15 @@ function broadcastState(): void {
   for (const [windowId, browserWindow] of windows) {
     if (!browserWindow.isDestroyed()) {
       browserWindow.webContents.send("unit:state-changed", payloadFor(windowId));
+    }
+  }
+}
+
+function broadcastChatState(): void {
+  const state = chatService.state();
+  for (const browserWindow of windows.values()) {
+    if (!browserWindow.isDestroyed()) {
+      browserWindow.webContents.send("chat:state-changed", state);
     }
   }
 }
@@ -950,6 +967,18 @@ async function selectFileViewerDirectory(payload: SelectDirectoryPayload) {
     properties: ["openDirectory"]
   });
   return { rootPath: result.canceled ? null : result.filePaths[0] };
+}
+
+async function selectLocalModelPath(parentWindow: BrowserWindow | null): Promise<string | null> {
+  const options: Electron.OpenDialogOptions = {
+    title: "Select GGUF model",
+    properties: ["openFile"],
+    filters: [{ name: "GGUF models", extensions: ["gguf"] }]
+  };
+  const result = parentWindow && !parentWindow.isDestroyed()
+    ? await dialog.showOpenDialog(parentWindow, options)
+    : await dialog.showOpenDialog(options);
+  return result.canceled ? null : result.filePaths[0] ?? null;
 }
 
 async function resolveFileViewerRoot(rootPath: string): Promise<string> {
@@ -1376,8 +1405,10 @@ function escapeHtml(value: string): string {
 }
 
 app.whenReady().then(() => {
-  const workspaceStore = new WorkspaceStateStore(workspaceDatabasePath());
+  const databasePath = workspaceDatabasePath();
+  const workspaceStore = new WorkspaceStateStore(databasePath);
   registry = new TabRegistry(workspaceStore);
+  chatService = new ChatService(new ChatStore(databasePath), new LocalLlamaRuntime(), broadcastChatState);
   terminalManager = new TerminalManager((payload) => {
     for (const browserWindow of windows.values()) {
       if (!browserWindow.isDestroyed()) {
@@ -1541,6 +1572,7 @@ app.whenReady().then(() => {
         windows.get(detachedId)?.close();
       }
       terminalManager.disposeAll();
+      chatService.close();
       destroyCaptureOverlays();
     }
   });
@@ -1555,6 +1587,19 @@ app.whenReady().then(() => {
   ipcMain.handle("fileSystem:readFile", (_event, payload: ReadFilePayload) => readFileViewerFile(payload));
   ipcMain.handle("fileSystem:writeFile", (_event, payload: WriteFilePayload) => writeFileViewerFile(payload));
   ipcMain.handle("fileSystem:selectDirectory", (_event, payload: SelectDirectoryPayload) => selectFileViewerDirectory(payload));
+  ipcMain.handle("chat:bootstrap", () => chatService.state());
+  ipcMain.handle("chat:createThread", () => chatService.createThread());
+  ipcMain.handle("chat:selectThread", (_event, payload: ChatSelectThreadPayload) => chatService.selectThread(payload.threadId));
+  ipcMain.handle("chat:submit", (_event, payload: ChatSubmitPayload) => chatService.submit(payload));
+  ipcMain.handle("chat:cancel", () => chatService.cancel());
+  ipcMain.handle("chat:addLocalModel", async (event, payload?: ChatAddLocalModelPayload) => {
+    const selectedPath = payload?.path?.trim() || await selectLocalModelPath(BrowserWindow.fromWebContents(event.sender));
+    if (!selectedPath) {
+      return chatService.state();
+    }
+    return chatService.addLocalModel(selectedPath);
+  });
+  ipcMain.handle("chat:selectModel", (_event, payload: ChatSelectModelPayload) => chatService.selectModel(payload.modelId));
   ipcMain.handle("browser:mount", (_event, payload: BrowserMountPayload) => browserViewManager.mount(payload));
   ipcMain.handle("browser:updateBounds", (_event, payload: BrowserBoundsPayload) => {
     browserViewManager.updateBounds(payload);
@@ -1575,6 +1620,7 @@ app.whenReady().then(() => {
 
 app.on("window-all-closed", () => {
   terminalManager?.disposeAll();
+  chatService?.close();
   browserViewManager?.disposeAll();
   destroyCaptureOverlays();
   if (process.platform !== "darwin") {

@@ -21,6 +21,82 @@ export interface BrowserSessionState {
   url?: string;
 }
 
+export type ChatMessageRole = "user" | "assistant";
+export type ChatMessageStatus = "complete" | "streaming" | "interrupted" | "error";
+
+export interface ChatProject {
+  id: string;
+  title: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ChatThread {
+  id: string;
+  projectId: string;
+  title: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ChatMessage {
+  id: string;
+  threadId: string;
+  role: ChatMessageRole;
+  content: string;
+  status: ChatMessageStatus;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ChatModel {
+  id: string;
+  label: string;
+  path: string;
+  createdAt: string;
+}
+
+export interface ChatRuntimeSettings {
+  nCtx: number;
+  nGpuLayers: number;
+  temperature: number;
+  repeatPenalty: number;
+  maxTokens: number;
+}
+
+export type ChatGenerationState =
+  | { status: "idle"; error?: string }
+  | { status: "running"; threadId: string; assistantMessageId: string }
+  | { status: "error"; error: string };
+
+export interface ChatState {
+  projects: ChatProject[];
+  threads: ChatThread[];
+  messages: ChatMessage[];
+  models: ChatModel[];
+  selectedProjectId: string;
+  selectedThreadId: string;
+  selectedModelId: string;
+  runtimeSettings: ChatRuntimeSettings;
+  generation: ChatGenerationState;
+}
+
+export interface ChatSubmitPayload {
+  text: string;
+}
+
+export interface ChatSelectThreadPayload {
+  threadId: string;
+}
+
+export interface ChatSelectModelPayload {
+  modelId: string;
+}
+
+export interface ChatAddLocalModelPayload {
+  path?: string;
+}
+
 export interface AppletInstance {
   id: string;
   sessionId: string;
@@ -429,6 +505,16 @@ export interface UnitApi {
     readFile: (payload: ReadFilePayload) => Promise<ReadFileResult>;
     writeFile: (payload: WriteFilePayload) => Promise<WriteFileResult>;
     selectDirectory: (payload: SelectDirectoryPayload) => Promise<SelectDirectoryResult>;
+  };
+  chat: {
+    bootstrap: () => Promise<ChatState>;
+    createThread: () => Promise<ChatState>;
+    selectThread: (payload: ChatSelectThreadPayload) => Promise<ChatState>;
+    submit: (payload: ChatSubmitPayload) => Promise<ChatState>;
+    cancel: () => Promise<ChatState>;
+    addLocalModel: (payload?: ChatAddLocalModelPayload) => Promise<ChatState>;
+    selectModel: (payload: ChatSelectModelPayload) => Promise<ChatState>;
+    onStateChanged: (callback: (payload: ChatState) => void) => () => void;
   };
   browser: {
     mount: (payload: BrowserMountPayload) => Promise<BrowserStatusPayload>;

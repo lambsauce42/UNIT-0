@@ -131,6 +131,49 @@ test("renders the initial applet surfaces", async () => {
   await app.close();
 });
 
+test("renders global chat state and persists local model selection", async () => {
+  const dataDir = makeDataDir();
+  const modelPath = path.join(dataDir, "local-test-model.gguf");
+  fs.writeFileSync(modelPath, "not a real model");
+  let app = await launchApp(dataDir);
+  let page = await firstWindow(app);
+  await page.getByTestId("workspace-tab-atlas").click();
+
+  await expect(page.getByTestId("chat-surface")).toBeVisible();
+  await expect(page.getByTestId("chat-status")).toContainText("Add a local GGUF model");
+  const firstState = await page.evaluate(() => window.unitApi.chat.bootstrap());
+  expect(firstState.projects).toHaveLength(1);
+  expect(firstState.threads).toHaveLength(1);
+
+  const modelState = await page.evaluate((pathToModel) => window.unitApi.chat.addLocalModel({ path: pathToModel }), modelPath);
+  expect(modelState.models).toHaveLength(1);
+  expect(modelState.selectedModelId).toBe(modelState.models[0].id);
+  await expect(page.getByLabel("Local chat model")).toHaveValue(modelState.models[0].id);
+  await app.close();
+
+  app = await launchApp(dataDir);
+  page = await firstWindow(app);
+  await page.getByTestId("workspace-tab-atlas").click();
+  await expect(page.getByLabel("Local chat model")).toHaveValue(modelState.models[0].id);
+  await app.close();
+});
+
+test("chat creates and selects threads through the applet API", async () => {
+  const app = await launchApp();
+  const page = await firstWindow(app);
+  await page.getByTestId("workspace-tab-atlas").click();
+
+  const created = await page.evaluate(() => window.unitApi.chat.createThread());
+  expect(created.threads).toHaveLength(2);
+  const newThread = created.threads.at(-1)!;
+  await expect(page.getByTestId(`chat-thread-${newThread.id}`)).toBeVisible();
+  await page.evaluate((threadId) => window.unitApi.chat.selectThread({ threadId }), created.threads[0].id);
+  const selected = await page.evaluate(() => window.unitApi.chat.bootstrap());
+  expect(selected.selectedThreadId).toBe(created.threads[0].id);
+
+  await app.close();
+});
+
 test("renders workspace applets from the persisted layout tree", async () => {
   const dataDir = makeDataDir();
   let app = await launchApp(dataDir);

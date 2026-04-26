@@ -26,7 +26,9 @@ import {
   Server,
   Settings,
   Save,
+  Send,
   SquareTerminal,
+  Square,
   Trash2,
   X
 } from "lucide-react";
@@ -59,6 +61,8 @@ import type {
   ApplyWorkspaceTemplatePayload,
   BootstrapPayload,
   BrowserStatusPayload,
+  ChatMessage,
+  ChatState,
   FileTreeEntry,
   ReadFileResult,
   RectLike,
@@ -3555,6 +3559,347 @@ function replaceFileTreeChildren(nodes: FileTreeEntry[], directoryId: string, ch
   });
 }
 
+function ChatSurface() {
+  const [chatState, setChatState] = useState<ChatState | null>(null);
+  const [draft, setDraft] = useState("");
+  const [localError, setLocalError] = useState<string | null>(null);
+  const [expandedProjectIds, setExpandedProjectIds] = useState<Set<string>>(() => new Set());
+  const composerRef = useRef<HTMLTextAreaElement | null>(null);
+
+  useEffect(() => {
+    let mounted = true;
+    void window.unitApi.chat.bootstrap().then((state) => {
+      if (mounted) {
+        setChatState(state);
+        setExpandedProjectIds(new Set(state.projects.map((project) => project.id)));
+      }
+    }).catch((error: unknown) => setLocalError(errorMessage(error)));
+    const removeListener = window.unitApi.chat.onStateChanged((state) => {
+      setChatState(state);
+      setExpandedProjectIds((current) => {
+        const next = new Set(current);
+        for (const project of state.projects) {
+          if (!next.has(project.id)) {
+            next.add(project.id);
+          }
+        }
+        return next;
+      });
+    });
+    return () => {
+      mounted = false;
+      removeListener();
+    };
+  }, []);
+
+  const selectedThread = chatState?.threads.find((thread) => thread.id === chatState.selectedThreadId) ?? null;
+  const selectedMessages = chatState
+    ? chatState.messages.filter((message) => message.threadId === chatState.selectedThreadId)
+    : [];
+  const selectedModel = chatState?.models.find((model) => model.id === chatState.selectedModelId) ?? null;
+  const running = chatState?.generation.status === "running";
+  const blockedReason = !selectedModel ? "Add a local GGUF model before sending." : "";
+  const statusMessage = localError ?? (chatState?.generation.status === "error" ? chatState.generation.error : blockedReason);
+  const activeProject = chatState?.projects.find((project) => project.id === chatState.selectedProjectId) ?? null;
+  const messagePreviewByThreadId = useMemo(() => {
+    const previews = new Map<string, ChatMessage>();
+    if (!chatState) {
+      return previews;
+    }
+    for (const message of chatState.messages) {
+      previews.set(message.threadId, message);
+    }
+    return previews;
+  }, [chatState]);
+
+  const runChatAction = useCallback(async (action: () => Promise<ChatState>) => {
+    setLocalError(null);
+    try {
+      setChatState(await action());
+    } catch (error: unknown) {
+      setLocalError(errorMessage(error));
+    }
+  }, []);
+
+  const submitDraft = useCallback(async () => {
+    const text = draft.trim();
+    if (!text || running || blockedReason) {
+      return;
+    }
+    setDraft("");
+    await runChatAction(() => window.unitApi.chat.submit({ text }));
+  }, [blockedReason, draft, runChatAction, running]);
+
+  useLayoutEffect(() => {
+    const composer = composerRef.current;
+    if (!composer) {
+      return;
+    }
+    composer.style.height = "44px";
+    composer.style.height = `${Math.min(176, Math.max(44, composer.scrollHeight))}px`;
+  }, [draft]);
+
+  if (!chatState) {
+    return <div className="chat-surface chat-loading" data-testid="chat-surface" />;
+  }
+
+  return (
+    <div className="chat-surface" data-testid="chat-surface">
+      <aside className="chat-list" aria-label="Chat projects and threads">
+        <button
+          className="chat-new-thread-button"
+          type="button"
+          aria-label="New chat thread"
+          onClick={() => void runChatAction(() => window.unitApi.chat.createThread())}
+        >
+          <Plus size={15} />
+          <span>New thread</span>
+        </button>
+        <div className="chat-list-section-title">
+          <span>Threads</span>
+          <button className="chat-card-action" type="button" aria-label="Project settings">
+            <Settings size={14} />
+          </button>
+        </div>
+        <div className="chat-project-scroll">
+          {chatState.projects.map((project) => {
+            const projectThreads = chatState.threads.filter((thread) => thread.projectId === project.id);
+            const expanded = expandedProjectIds.has(project.id);
+            const active = project.id === chatState.selectedProjectId;
+            return (
+              <section className="chat-project-section" key={project.id}>
+                <button
+                  className={["chat-project-card", active ? "active" : ""].join(" ")}
+                  type="button"
+                  onClick={() => setExpandedProjectIds((current) => {
+                    const next = new Set(current);
+                    if (next.has(project.id)) {
+                      next.delete(project.id);
+                    } else {
+                      next.add(project.id);
+                    }
+                    return next;
+                  })}
+                >
+                  <ChevronRight className={expanded ? "expanded" : ""} size={15} />
+                  <span className="chat-project-title">{project.title}</span>
+                  <span className="chat-project-actions">
+                    <span
+                      className="chat-project-action"
+                      role="button"
+                      tabIndex={0}
+                      aria-label={`New thread in ${project.title}`}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        void runChatAction(() => window.unitApi.chat.createThread());
+                      }}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter" || event.key === " ") {
+                          event.preventDefault();
+                          event.stopPropagation();
+                          void runChatAction(() => window.unitApi.chat.createThread());
+                        }
+                      }}
+                    >
+                      <Plus size={13} />
+                    </span>
+                    <span className="chat-project-action placeholder" aria-hidden="true">
+                      <Settings size={13} />
+                    </span>
+                    <span className="chat-project-action placeholder destructive" aria-hidden="true">
+                      <X size={13} />
+                    </span>
+                  </span>
+                </button>
+                {expanded ? (
+                  <div className="chat-thread-list">
+                    {projectThreads.map((thread) => (
+                      <button
+                        className={thread.id === chatState.selectedThreadId ? "active" : ""}
+                        data-testid={`chat-thread-${thread.id}`}
+                        key={thread.id}
+                        type="button"
+                        onClick={() => void runChatAction(() => window.unitApi.chat.selectThread({ threadId: thread.id }))}
+                      >
+                        <span className="chat-thread-title">{thread.title}</span>
+                        <span className="chat-thread-time">
+                          {formatChatTimestamp(messagePreviewByThreadId.get(thread.id)?.updatedAt ?? thread.updatedAt)}
+                        </span>
+                      </button>
+                    ))}
+                  </div>
+                ) : null}
+              </section>
+            );
+          })}
+        </div>
+        <button className="chat-settings-button" type="button">
+          <Settings size={15} />
+          <span>Settings</span>
+        </button>
+      </aside>
+      <section className="chat-main">
+        <header className="chat-toolbar">
+          <div className="chat-title">
+            <strong>{activeProject?.title ?? "Project"}</strong>
+          </div>
+          <div className="chat-action-strip">
+            <button className="chat-action-button" type="button">Chat</button>
+            <button className="chat-action-manager" type="button" aria-label="Chat actions">
+              <Settings size={15} />
+            </button>
+          </div>
+        </header>
+        <div className="chat-thread" data-testid="chat-message-list">
+          <div className="chat-content-column">
+            {selectedMessages.length === 0 ? (
+              <div className="chat-empty">Start a thread with a local GGUF model.</div>
+            ) : (
+              selectedMessages.map((message) => <ChatMessageBubble key={message.id} message={message} />)
+            )}
+          </div>
+        </div>
+        <div className="chat-composer-section">
+          <form
+            className="chat-composer"
+            onSubmit={(event) => {
+              event.preventDefault();
+              void submitDraft();
+            }}
+          >
+            <div className="chat-composer-input-wrap">
+              <textarea
+                ref={composerRef}
+                aria-label="Chat message"
+                disabled={running || Boolean(statusMessage)}
+                placeholder="Ask anything..."
+                value={draft}
+                onChange={(event) => setDraft(event.currentTarget.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" && !event.shiftKey) {
+                    event.preventDefault();
+                    void submitDraft();
+                  }
+                }}
+              />
+              {statusMessage ? (
+                <div className="chat-status" data-testid="chat-status">
+                  {statusMessage}
+                </div>
+              ) : null}
+            </div>
+            <div className="chat-composer-control-row">
+              <button
+                className="chat-ghost-button"
+                type="button"
+                aria-label="Add local model"
+                onClick={() => void runChatAction(() => window.unitApi.chat.addLocalModel())}
+              >
+                <Plus size={18} />
+              </button>
+              <button className="chat-ghost-button" type="button" aria-label="Model settings">
+                <Settings size={17} />
+              </button>
+              <label className="chat-model-menu">
+                <Bot size={15} />
+                <span>{selectedModel?.label ?? "No model"}</span>
+                <ChevronRight className="chat-model-caret" size={12} />
+                <select
+                  aria-label="Local chat model"
+                  value={chatState.selectedModelId}
+                  onChange={(event) => void runChatAction(() => window.unitApi.chat.selectModel({ modelId: event.currentTarget.value }))}
+                >
+                  <option value="" disabled>
+                    No model
+                  </option>
+                  {chatState.models.map((model) => (
+                    <option key={model.id} value={model.id}>
+                      {model.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <button className="chat-text-button" type="button">Medium</button>
+              <div className="chat-composer-spacer" />
+              {running ? (
+                <button
+                  className="chat-send-button halting"
+                  type="button"
+                  aria-label="Cancel chat response"
+                  onClick={() => void runChatAction(() => window.unitApi.chat.cancel())}
+                >
+                  <Square size={15} />
+                </button>
+              ) : (
+                <button
+                  className="chat-send-button"
+                  type="submit"
+                  aria-label="Send chat message"
+                  disabled={!draft.trim() || Boolean(blockedReason)}
+                >
+                  <Send size={15} />
+                </button>
+              )}
+            </div>
+          </form>
+          <div className="chat-composer-footer">
+            <div className="chat-footer-slot">Full access</div>
+            <div className="chat-context-cluster">
+              <span>32K</span>
+              <GitBranch size={13} />
+              <span>0</span>
+            </div>
+            <div className="chat-footer-slot right">main</div>
+          </div>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function ChatMessageBubble({ message }: { message: ChatMessage }) {
+  const displayContent = message.content || (message.status === "streaming" ? "..." : "");
+  return (
+    <article className={["chat-message", message.role, message.status].join(" ")} data-testid={`chat-message-${message.role}`}>
+      {message.role === "assistant" ? <div className="chat-message-label">Assistant</div> : null}
+      <div className="chat-message-body">{renderMarkdownBlocks(displayContent)}</div>
+      {message.status === "interrupted" ? <small>Interrupted</small> : message.status === "error" ? <small>Error</small> : null}
+    </article>
+  );
+}
+
+function formatChatTimestamp(value: string) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return "";
+  }
+  return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+function renderMarkdownBlocks(markdown: string) {
+  const blocks: JSX.Element[] = [];
+  const segments = markdown.split(/```/g);
+  for (let index = 0; index < segments.length; index += 1) {
+    const segment = segments[index];
+    if (index % 2 === 1) {
+      const [firstLine, ...rest] = segment.split(/\r?\n/);
+      const language = firstLine.trim();
+      const code = rest.length > 0 ? rest.join("\n") : segment;
+      blocks.push(
+        <pre className="chat-code-block" key={`code-${index}`}>
+          <code data-language={language}>{code}</code>
+        </pre>
+      );
+      continue;
+    }
+    const paragraphs = segment.split(/\n{2,}/).map((paragraph) => paragraph.trim()).filter(Boolean);
+    for (const paragraph of paragraphs) {
+      blocks.push(<p key={`text-${index}-${blocks.length}`}>{paragraph}</p>);
+    }
+  }
+  return blocks.length > 0 ? blocks : null;
+}
+
 function BrowserSurface({ session, windowId }: { session: AppletSession; windowId: number }) {
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const initialUrl = session.state.browser?.url ?? DEFAULT_BROWSER_URL;
@@ -3749,21 +4094,7 @@ function renderAppletBody(session: AppletSession, windowId: number) {
     return <BrowserSurface session={session} windowId={windowId} />;
   }
   if (kind === "chat") {
-    return (
-      <div className="chat-surface">
-        <aside className="chat-list">
-          <span className="active">Refactor auth flow</span>
-          <span>API integration</span>
-          <span>Database schema</span>
-          <span>Error troubleshooting</span>
-        </aside>
-        <div className="chat-thread">
-          <p className="user-message">I want to refactor the authentication flow.</p>
-          <p className="assistant-message">Update schema, rotate refresh tokens, adjust API endpoints, and cover the client store.</p>
-          <div className="composer">Message Assistant...</div>
-        </div>
-      </div>
-    );
+    return <ChatSurface />;
   }
   return (
     <div className="sandbox-surface">

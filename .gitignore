@@ -22,6 +22,7 @@ logs/
 # Dependencies
 node_modules/
 vendor/
+runtime/
 
 # Build outputs
 dist/

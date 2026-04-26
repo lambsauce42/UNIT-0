@@ -10,6 +10,11 @@ import type {
   BrowserWindowVisibilityPayload,
   BeginTabDragPayload,
   BootstrapPayload,
+  ChatAddLocalModelPayload,
+  ChatSelectModelPayload,
+  ChatSelectThreadPayload,
+  ChatState,
+  ChatSubmitPayload,
   ChangeAppletInstanceKindPayload,
   CloseWorkspacePayload,
   CloseTabPayload,
@@ -96,6 +101,20 @@ const api: UnitApi = {
     readFile: (payload: ReadFilePayload) => ipcRenderer.invoke("fileSystem:readFile", payload),
     writeFile: (payload: WriteFilePayload) => ipcRenderer.invoke("fileSystem:writeFile", payload),
     selectDirectory: (payload: SelectDirectoryPayload) => ipcRenderer.invoke("fileSystem:selectDirectory", payload)
+  },
+  chat: {
+    bootstrap: () => ipcRenderer.invoke("chat:bootstrap"),
+    createThread: () => ipcRenderer.invoke("chat:createThread"),
+    selectThread: (payload: ChatSelectThreadPayload) => ipcRenderer.invoke("chat:selectThread", payload),
+    submit: (payload: ChatSubmitPayload) => ipcRenderer.invoke("chat:submit", payload),
+    cancel: () => ipcRenderer.invoke("chat:cancel"),
+    addLocalModel: (payload?: ChatAddLocalModelPayload) => ipcRenderer.invoke("chat:addLocalModel", payload),
+    selectModel: (payload: ChatSelectModelPayload) => ipcRenderer.invoke("chat:selectModel", payload),
+    onStateChanged: (callback: (payload: ChatState) => void) => {
+      const handler = (_event: Electron.IpcRendererEvent, payload: ChatState) => callback(payload);
+      ipcRenderer.on("chat:state-changed", handler);
+      return () => ipcRenderer.off("chat:state-changed", handler);
+    }
   },
   browser: {
     mount: (payload: BrowserMountPayload) => ipcRenderer.invoke("browser:mount", payload),
