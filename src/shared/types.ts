@@ -5,6 +5,20 @@ export interface AppletSession {
   id: string;
   kind: AppletKind;
   title: string;
+  state: AppletSessionState;
+}
+
+export interface AppletSessionState {
+  fileViewer?: FileViewerSessionState;
+  browser?: BrowserSessionState;
+}
+
+export interface FileViewerSessionState {
+  rootPath?: string;
+}
+
+export interface BrowserSessionState {
+  url?: string;
 }
 
 export interface AppletInstance {
@@ -157,6 +171,10 @@ export interface RenameWorkspacePayload {
   title: string;
 }
 
+export interface CloseWorkspacePayload {
+  workspaceId: string;
+}
+
 export interface UpdateLayoutRatiosPayload {
   workspaceId: string;
   ratios: Record<string, number>;
@@ -244,6 +262,11 @@ export interface MoveAppletInstancePayload {
   placement: "first" | "second";
 }
 
+export interface UpdateAppletSessionStatePayload {
+  sessionId: string;
+  state: AppletSessionState;
+}
+
 export interface TerminalStartPayload {
   sessionId: string;
   kind: TerminalAppletKind;
@@ -272,6 +295,96 @@ export interface TerminalDataPayload {
   data: string;
 }
 
+export interface FileTreeEntry {
+  id: string;
+  name: string;
+  kind: "directory" | "file";
+  children?: FileTreeEntry[];
+  loaded?: boolean;
+}
+
+export interface ListDirectoryPayload {
+  rootPath: string;
+  directoryId: string;
+}
+
+export interface ListDirectoryResult {
+  rootId: string;
+  rootName: string;
+  rootPath: string;
+  directoryId: string;
+  entries: FileTreeEntry[];
+}
+
+export interface ReadFilePayload {
+  rootPath: string;
+  fileId: string;
+}
+
+export interface ReadFileResult {
+  id: string;
+  name: string;
+  content: string;
+}
+
+export interface WriteFilePayload {
+  rootPath: string;
+  fileId: string;
+  content: string;
+}
+
+export interface WriteFileResult {
+  id: string;
+  name: string;
+  content: string;
+}
+
+export interface SelectDirectoryPayload {
+  currentPath?: string;
+}
+
+export interface SelectDirectoryResult {
+  rootPath: string | null;
+}
+
+export interface BrowserMountPayload {
+  windowId: number;
+  sessionId: string;
+  bounds: RectLike;
+  url: string;
+}
+
+export interface BrowserBoundsPayload {
+  windowId: number;
+  sessionId: string;
+  bounds: RectLike;
+}
+
+export interface BrowserSessionPayload {
+  windowId: number;
+  sessionId: string;
+}
+
+export interface BrowserNavigatePayload extends BrowserSessionPayload {
+  url: string;
+}
+
+export interface BrowserWindowVisibilityPayload {
+  windowId: number;
+  visible: boolean;
+}
+
+export interface BrowserStatusPayload {
+  windowId: number;
+  sessionId: string;
+  url: string;
+  title: string;
+  canGoBack: boolean;
+  canGoForward: boolean;
+  loading: boolean;
+  error?: string;
+}
+
 export interface UnitApi {
   bootstrap: () => Promise<BootstrapPayload>;
   onStateChanged: (callback: (payload: BootstrapPayload) => void) => () => void;
@@ -293,6 +406,7 @@ export interface UnitApi {
     createWorkspace: (payload: CreateWorkspacePayload) => Promise<Workspace>;
     openWorkspaceTab: (payload: OpenWorkspaceTabPayload) => Promise<void>;
     renameWorkspace: (payload: RenameWorkspacePayload) => Promise<void>;
+    closeWorkspace: (payload: CloseWorkspacePayload) => Promise<void>;
     updateLayoutRatios: (payload: UpdateLayoutRatiosPayload) => Promise<void>;
     replaceLayout: (payload: ReplaceWorkspaceLayoutPayload) => Promise<void>;
     applyTemplate: (payload: ApplyWorkspaceTemplatePayload) => Promise<Workspace>;
@@ -302,11 +416,30 @@ export interface UnitApi {
     closeAppletInstance: (payload: CloseAppletInstancePayload) => Promise<void>;
     changeAppletInstanceKind: (payload: ChangeAppletInstanceKindPayload) => Promise<void>;
     moveAppletInstance: (payload: MoveAppletInstancePayload) => Promise<void>;
+    updateAppletSessionState: (payload: UpdateAppletSessionStatePayload) => Promise<void>;
   };
   terminal: {
     start: (payload: TerminalStartPayload) => Promise<TerminalStartResult>;
     input: (payload: TerminalInputPayload) => void;
     resize: (payload: TerminalResizePayload) => Promise<void>;
     onData: (callback: (payload: TerminalDataPayload) => void) => () => void;
+  };
+  fileSystem: {
+    listDirectory: (payload: ListDirectoryPayload) => Promise<ListDirectoryResult>;
+    readFile: (payload: ReadFilePayload) => Promise<ReadFileResult>;
+    writeFile: (payload: WriteFilePayload) => Promise<WriteFileResult>;
+    selectDirectory: (payload: SelectDirectoryPayload) => Promise<SelectDirectoryResult>;
+  };
+  browser: {
+    mount: (payload: BrowserMountPayload) => Promise<BrowserStatusPayload>;
+    updateBounds: (payload: BrowserBoundsPayload) => Promise<void>;
+    detach: (payload: BrowserSessionPayload) => Promise<void>;
+    navigate: (payload: BrowserNavigatePayload) => Promise<BrowserStatusPayload>;
+    goBack: (payload: BrowserSessionPayload) => Promise<BrowserStatusPayload>;
+    goForward: (payload: BrowserSessionPayload) => Promise<BrowserStatusPayload>;
+    reload: (payload: BrowserSessionPayload) => Promise<BrowserStatusPayload>;
+    stop: (payload: BrowserSessionPayload) => Promise<BrowserStatusPayload>;
+    setWindowViewsVisible: (payload: BrowserWindowVisibilityPayload) => Promise<void>;
+    onStatus: (callback: (payload: BrowserStatusPayload) => void) => () => void;
   };
 }

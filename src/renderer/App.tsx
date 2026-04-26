@@ -1,8 +1,12 @@
 import {
   Activity,
+  ArrowLeft,
+  ArrowRight,
   Bot,
+  ChevronRight,
   Code2,
   Database,
+  File,
   FolderOpen,
   Globe,
   GitBranch,
@@ -21,13 +25,21 @@ import {
   Search,
   Server,
   Settings,
+  Save,
   SquareTerminal,
   Trash2,
   X
 } from "lucide-react";
+import CodeMirror from "@uiw/react-codemirror";
+import { LanguageDescription } from "@codemirror/language";
+import { languages } from "@codemirror/language-data";
+import { type Extension } from "@codemirror/state";
+import { oneDark } from "@codemirror/theme-one-dark";
+import { EditorView, keymap } from "@codemirror/view";
 import { FitAddon } from "@xterm/addon-fit";
 import { Terminal as XTerm } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
+import { Tree, type NodeRendererProps } from "react-arborist";
 import {
   useCallback,
   useEffect,
@@ -39,11 +51,16 @@ import {
   type PointerEvent as ReactPointerEvent,
   type SVGProps
 } from "react";
+import { THIRD_PARTY_LICENSES } from "./thirdPartyLicenses";
+import { DEFAULT_BROWSER_URL, normalizeBrowserNavigationUrl } from "../shared/browserUrls";
 import type {
   AppletKind,
   AppletSession,
   ApplyWorkspaceTemplatePayload,
   BootstrapPayload,
+  BrowserStatusPayload,
+  FileTreeEntry,
+  ReadFileResult,
   RectLike,
   TabHostState,
   TemplateCellAssignment,
@@ -163,6 +180,7 @@ function TabCloseIcon(props: SVGProps<SVGSVGElement>) {
 export function App() {
   const [payload, setPayload] = useState<BootstrapPayload | null>(null);
   const [templateDrawerOpen, setTemplateDrawerOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const openTemplateDrawer = useCallback(() => setTemplateDrawerOpen(true), []);
 
   useEffect(() => {
@@ -189,6 +207,18 @@ export function App() {
     window.addEventListener("beforeunload", onBeforeUnload);
     return () => window.removeEventListener("beforeunload", onBeforeUnload);
   }, [payload]);
+
+  const browserViewsVisible = Boolean(payload && !settingsOpen && !templateDrawerOpen && !payload.state.dragSession);
+
+  useEffect(() => {
+    if (!payload) {
+      return;
+    }
+    void window.unitApi.browser.setWindowViewsVisible({
+      windowId: payload.windowId,
+      visible: browserViewsVisible
+    });
+  }, [browserViewsVisible, payload?.windowId]);
 
   if (!payload) {
     return <div className="boot-screen" />;
@@ -220,7 +250,7 @@ export function App() {
             <LayoutTemplate size={16} />
             <span>Templates</span>
           </button>
-          <button className="icon-button" type="button" aria-label="Settings">
+          <button className="icon-button" type="button" aria-label="Settings" onClick={() => setSettingsOpen(true)}>
             <Settings size={18} />
           </button>
         </div>
@@ -239,7 +269,47 @@ export function App() {
           onClose={() => setTemplateDrawerOpen(false)}
         />
       ) : null}
+      {settingsOpen ? <SettingsDialog onClose={() => setSettingsOpen(false)} /> : null}
     </main>
+  );
+}
+
+function SettingsDialog({ onClose }: { onClose: () => void }) {
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        onClose();
+      }
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, [onClose]);
+
+  return (
+    <div className="settings-backdrop" role="presentation" onPointerDown={onClose}>
+      <section className="settings-dialog" role="dialog" aria-modal="true" aria-labelledby="settings-title" onPointerDown={(event) => event.stopPropagation()}>
+        <header className="settings-header">
+          <h2 id="settings-title">Settings</h2>
+          <button className="icon-button" type="button" aria-label="Close settings" onClick={onClose}>
+            <X size={17} />
+          </button>
+        </header>
+        <div className="settings-body">
+          <nav className="settings-tabs" aria-label="Settings sections">
+            <button className="active" type="button" aria-current="page">
+              About
+            </button>
+          </nav>
+          <section className="settings-panel" aria-label="About">
+            <div className="about-product">
+              <strong>UNIT-0</strong>
+              <span>Version 0.1.0</span>
+            </div>
+            <pre className="license-notices">{THIRD_PARTY_LICENSES}</pre>
+          </section>
+        </div>
+      </section>
+    </div>
   );
 }
 
@@ -768,10 +838,10 @@ function WorkspaceNameDialog({
         />
         <div className="dialog-actions">
           <button onClick={onCancel} type="button">
-            Cancel
+            <span>Cancel</span>
           </button>
           <button disabled={!trimmedTitle} type="submit">
-            {mode === "create" ? "Create" : "Rename"}
+            <span>{mode === "create" ? "Create" : "Rename"}</span>
           </button>
         </div>
       </form>
@@ -875,6 +945,7 @@ function WorkspaceManagerSurface({ state, onOpenTemplates }: { state: UnitState;
               <span>Mounted</span>
               <span>Runtime</span>
               <span>Status</span>
+              <span aria-hidden="true" />
             </div>
             {workspaces.map((workspace, index) => {
               const open = Object.values(state.hosts).some((host) =>
@@ -885,43 +956,55 @@ function WorkspaceManagerSurface({ state, onOpenTemplates }: { state: UnitState;
                 .map((applet) => state.appletSessions[applet.sessionId]?.kind)
                 .filter((kind): kind is AppletKind => Boolean(kind));
               return (
-                <button
-                  className="manager-workspace-row"
-                  data-testid={`workspace-manager-row-${workspace.id}`}
-                  key={workspace.id}
-                  onClick={() => {
-                    if (primaryHost) {
-                      void window.unitApi.workspaces.openWorkspaceTab({
-                        windowId: primaryHost.windowId,
-                        workspaceId: workspace.id
-                      });
-                    }
-                  }}
-                  type="button"
-                >
-                  <span className="manager-workspace-main">
-                    <FolderOpen size={17} />
-                    <span>
-                      <strong>{workspace.title}</strong>
-                      <small>{index === 0 ? "C:\\Users\\Max\\Desktop\\Code\\Unit-0" : "No project root linked"}</small>
+                <div className="manager-workspace-row" key={workspace.id}>
+                  <button
+                    className="manager-workspace-open"
+                    data-testid={`workspace-manager-row-${workspace.id}`}
+                    onClick={() => {
+                      if (primaryHost) {
+                        void window.unitApi.workspaces.openWorkspaceTab({
+                          windowId: primaryHost.windowId,
+                          workspaceId: workspace.id
+                        });
+                      }
+                    }}
+                    type="button"
+                  >
+                    <span className="manager-workspace-main">
+                      <FolderOpen size={17} />
+                      <span>
+                        <strong>{workspace.title}</strong>
+                        <small>{index === 0 ? "C:\\Users\\Max\\Desktop\\Code\\Unit-0" : "No project root linked"}</small>
+                      </span>
                     </span>
-                  </span>
-                  <span className="manager-kind-stack">
-                    {primaryKinds.map((kind, kindIndex) => {
-                      const Icon = iconByKind[kind];
-                      return <Icon key={`${workspace.id}-${kind}-${kindIndex}`} size={15} />;
-                    })}
-                    <small>{workspace.applets.length}</small>
-                  </span>
-                  <span className={`manager-runtime ${open ? "online" : ""}`}>
-                    <Activity size={14} />
-                    {open ? "Live" : "Idle"}
-                  </span>
-                  <span className="manager-status">
-                    <GitBranch size={14} />
-                    {index === 0 ? "main" : "clean"}
-                  </span>
-                </button>
+                    <span className="manager-kind-stack">
+                      {primaryKinds.map((kind, kindIndex) => {
+                        const Icon = iconByKind[kind];
+                        return <Icon key={`${workspace.id}-${kind}-${kindIndex}`} size={15} />;
+                      })}
+                      <small>{workspace.applets.length}</small>
+                    </span>
+                    <span className={`manager-runtime ${open ? "online" : ""}`}>
+                      <Activity size={14} />
+                      {open ? "Live" : "Idle"}
+                    </span>
+                    <span className="manager-status">
+                      <GitBranch size={14} />
+                      {index === 0 ? "main" : "clean"}
+                    </span>
+                  </button>
+                  <button
+                    className="manager-workspace-close"
+                    type="button"
+                    aria-label={`Close ${workspace.title}`}
+                    data-testid={`workspace-manager-close-${workspace.id}`}
+                    onClick={() => {
+                      void window.unitApi.workspaces.closeWorkspace({ workspaceId: workspace.id });
+                    }}
+                  >
+                    <X size={15} />
+                  </button>
+                </div>
               );
             })}
           </div>
@@ -1248,7 +1331,7 @@ function TemplateDrawer({
         <footer className="template-drawer-footer">
           {applyError ? <span className="template-error">{applyError}</span> : <span />}
           <button className="manager-action-button" type="button" onClick={onClose}>
-            Cancel
+            <span>Cancel</span>
           </button>
           <button
             className="manager-action-button primary"
@@ -1257,7 +1340,9 @@ function TemplateDrawer({
             type="button"
             onClick={applyTemplate}
           >
-            Apply template: {assignmentStats.reused} reused, {assignmentStats.created} created, {assignmentStats.shelved} shelved
+            <span>
+              Apply template: {assignmentStats.reused} reused, {assignmentStats.created} created, {assignmentStats.shelved} shelved
+            </span>
           </button>
         </footer>
       </section>
@@ -2940,7 +3025,7 @@ function AppletFrame({
           </button>
         </div>
       </header>
-      <div className="applet-body">{renderAppletBody(session)}</div>
+      <div className="applet-body">{renderAppletBody(session, windowId)}</div>
     </section>
   );
 }
@@ -3082,52 +3167,586 @@ function proposedTerminalDimensions(container: HTMLElement, fit: FitAddon, termi
   return { cols: Math.max(2, dimensions.cols), rows: Math.max(1, dimensions.rows) };
 }
 
-function renderAppletBody(session: AppletSession) {
+type FileViewerStatus =
+  | { state: "idle" }
+  | { state: "loading"; label: string }
+  | { state: "error"; message: string };
+
+type FileViewerDiscardRequest =
+  | { kind: "file"; fileId: string }
+  | { kind: "root"; rootPath: string };
+
+const FILE_TREE_ROOT_ID = "__workspace_root__";
+
+function FileViewerSurface({ session }: { session: AppletSession }) {
+  const treeHostRef = useRef<HTMLDivElement | null>(null);
+  const treeMotionTimerRef = useRef<number | null>(null);
+  const selectedFileRef = useRef<ReadFileResult | null>(null);
+  const editorContentRef = useRef("");
+  const dirtyRef = useRef(false);
+  const configuredRootPathRef = useRef("");
+  const [treeHeight, setTreeHeight] = useState(0);
+  const [treeMotionActive, setTreeMotionActive] = useState(false);
+  const [treeData, setTreeData] = useState<FileTreeEntry[]>([]);
+  const [rootPath, setRootPath] = useState("");
+  const [selectedFile, setSelectedFile] = useState<ReadFileResult | null>(null);
+  const [editorContent, setEditorContent] = useState("");
+  const [editorLanguageExtensions, setEditorLanguageExtensions] = useState<Extension[]>([]);
+  const [dirty, setDirty] = useState(false);
+  const [discardRequest, setDiscardRequest] = useState<FileViewerDiscardRequest | null>(null);
+  const [status, setStatus] = useState<FileViewerStatus>({ state: "loading", label: "Loading files" });
+  const configuredRootPath = session.state.fileViewer?.rootPath ?? "";
+
+  useEffect(() => {
+    selectedFileRef.current = selectedFile;
+  }, [selectedFile]);
+
+  useEffect(() => {
+    editorContentRef.current = editorContent;
+  }, [editorContent]);
+
+  useEffect(() => {
+    dirtyRef.current = dirty;
+  }, [dirty]);
+
+  useEffect(() => {
+    configuredRootPathRef.current = configuredRootPath;
+  }, [configuredRootPath]);
+
+  const loadDirectory = useCallback(async (directoryId: string) => {
+    setStatus({ state: "loading", label: directoryId ? `Loading ${directoryId}` : "Loading files" });
+    const result = await window.unitApi.fileSystem.listDirectory({ rootPath: configuredRootPath, directoryId });
+    const rootNode: FileTreeEntry = {
+      id: result.rootId,
+      name: result.rootName,
+      kind: "directory",
+      children: result.entries,
+      loaded: true
+    };
+    setRootPath(result.rootPath);
+    setTreeData((current) => {
+      if (directoryId === "") {
+        return [rootNode];
+      }
+      return replaceFileTreeChildren(current, directoryId, result.entries);
+    });
+    setStatus({ state: "idle" });
+  }, [configuredRootPath]);
+
+  useEffect(() => {
+    setTreeData([]);
+    setSelectedFile(null);
+    setEditorContent("");
+    setDirty(false);
+    void loadDirectory("").catch((error: unknown) => setStatus({ state: "error", message: errorMessage(error) }));
+  }, [loadDirectory]);
+
+  useEffect(() => {
+    const element = treeHostRef.current;
+    if (!element) {
+      return;
+    }
+    const resizeObserver = new ResizeObserver(() => {
+      setTreeHeight(Math.max(160, Math.floor(element.getBoundingClientRect().height)));
+    });
+    resizeObserver.observe(element);
+    setTreeHeight(Math.max(160, Math.floor(element.getBoundingClientRect().height)));
+    return () => resizeObserver.disconnect();
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (treeMotionTimerRef.current !== null) {
+        window.clearTimeout(treeMotionTimerRef.current);
+      }
+    };
+  }, []);
+
+  const animateTreeMotion = useCallback(() => {
+    if (treeMotionTimerRef.current !== null) {
+      window.clearTimeout(treeMotionTimerRef.current);
+    }
+    setTreeMotionActive(true);
+    treeMotionTimerRef.current = window.setTimeout(() => {
+      treeMotionTimerRef.current = null;
+      setTreeMotionActive(false);
+    }, 180);
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!selectedFile) {
+      setEditorContent("");
+      setEditorLanguageExtensions([]);
+      setDirty(false);
+      return;
+    }
+    setEditorContent(selectedFile.content);
+    editorContentRef.current = selectedFile.content;
+    setDirty(false);
+    dirtyRef.current = false;
+    setStatus({ state: "idle" });
+    const languageDescription = LanguageDescription.matchFilename(languages, selectedFile.name);
+    if (!languageDescription) {
+      setEditorLanguageExtensions([]);
+      return;
+    }
+    void languageDescription
+      .load()
+      .then((languageSupport) => {
+        if (!cancelled) {
+          setEditorLanguageExtensions([languageSupport]);
+        }
+      })
+      .catch((error: unknown) => {
+        if (!cancelled) {
+          setStatus({ state: "error", message: errorMessage(error) });
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedFile]);
+
+  const saveSelectedFile = useCallback(async () => {
+    const file = selectedFileRef.current;
+    if (!file || !dirtyRef.current) {
+      return;
+    }
+    setStatus({ state: "loading", label: `Saving ${file.name}` });
+    const savedFile = await window.unitApi.fileSystem.writeFile({
+      rootPath: configuredRootPathRef.current,
+      fileId: file.id,
+      content: editorContentRef.current
+    });
+    setSelectedFile(savedFile);
+    setEditorContent(savedFile.content);
+    editorContentRef.current = savedFile.content;
+    setDirty(false);
+    dirtyRef.current = false;
+    setStatus({ state: "idle" });
+  }, []);
+
+  const editorExtensions = useMemo(
+    () => [
+      oneDark,
+      EditorView.lineWrapping,
+      keymap.of([
+        {
+          key: "Mod-s",
+          run: () => {
+            void saveSelectedFile().catch((error: unknown) => setStatus({ state: "error", message: errorMessage(error) }));
+            return true;
+          }
+        }
+      ]),
+      ...editorLanguageExtensions
+    ],
+    [editorLanguageExtensions, saveSelectedFile]
+  );
+
+  const readFileIntoEditor = useCallback(async (fileId: string) => {
+    setStatus({ state: "loading", label: `Reading ${fileId}` });
+    const file = await window.unitApi.fileSystem.readFile({ rootPath: configuredRootPath, fileId });
+    setSelectedFile(file);
+    setStatus({ state: "idle" });
+  }, [configuredRootPath]);
+
+  const openFile = useCallback(async (fileId: string) => {
+    if (selectedFile?.id === fileId) {
+      return;
+    }
+    if (dirtyRef.current) {
+      setDiscardRequest({ kind: "file", fileId });
+      return;
+    }
+    await readFileIntoEditor(fileId);
+  }, [readFileIntoEditor, selectedFile?.id]);
+
+  const applyRootDirectory = useCallback(async (nextRootPath: string) => {
+    await window.unitApi.applets.updateAppletSessionState({
+      sessionId: session.id,
+      state: {
+        ...session.state,
+        fileViewer: { rootPath: nextRootPath }
+      }
+    });
+  }, [session.id, session.state]);
+
+  const selectRootDirectory = useCallback(async () => {
+    const result = await window.unitApi.fileSystem.selectDirectory({ currentPath: rootPath || configuredRootPath });
+    if (!result.rootPath) {
+      return;
+    }
+    if (dirtyRef.current) {
+      setDiscardRequest({ kind: "root", rootPath: result.rootPath });
+      return;
+    }
+    await applyRootDirectory(result.rootPath);
+  }, [applyRootDirectory, configuredRootPath, rootPath]);
+
+  const confirmDiscardRequest = useCallback(async () => {
+    const request = discardRequest;
+    if (!request) {
+      return;
+    }
+    setDiscardRequest(null);
+    setDirty(false);
+    dirtyRef.current = false;
+    if (request.kind === "file") {
+      await readFileIntoEditor(request.fileId);
+      return;
+    }
+    await applyRootDirectory(request.rootPath);
+  }, [applyRootDirectory, discardRequest, readFileIntoEditor]);
+
+  const openTreeNode = useCallback(
+    (entry: FileTreeEntry, isOpen: boolean, toggle: () => void) => {
+      if (entry.kind === "directory") {
+        void isOpen;
+        animateTreeMotion();
+        toggle();
+        if (!entry.loaded) {
+          const directoryId = entry.id === FILE_TREE_ROOT_ID ? "" : entry.id;
+          void loadDirectory(directoryId).catch((error: unknown) => setStatus({ state: "error", message: errorMessage(error) }));
+        }
+        return;
+      }
+      void openFile(entry.id).catch((error: unknown) => setStatus({ state: "error", message: errorMessage(error) }));
+    },
+    [animateTreeMotion, loadDirectory, openFile]
+  );
+
+  return (
+    <div className="file-viewer">
+      <aside className="file-tree-panel">
+        <div className="file-tree-root">
+          <span title={rootPath}>{rootPath || "Workspace"}</span>
+          <button className="icon-button" type="button" aria-label="Change file root" onClick={selectRootDirectory}>
+            <Settings size={14} />
+          </button>
+        </div>
+        <div className={["file-tree-host", treeMotionActive ? "animating-tree" : ""].filter(Boolean).join(" ")} ref={treeHostRef}>
+          {treeHeight > 0 ? (
+            <Tree<FileTreeEntry>
+              data={treeData}
+              disableDrag
+              disableDrop
+              disableEdit
+              height={treeHeight}
+              indent={16}
+              initialOpenState={{ [FILE_TREE_ROOT_ID]: true }}
+              openByDefault={false}
+              overscanCount={8}
+              rowClassName="file-tree-row-shell"
+              rowHeight={28}
+              selection={selectedFile?.id}
+              width="100%"
+            >
+              {(props) => <FileTreeNode {...props} onOpen={openTreeNode} />}
+            </Tree>
+          ) : null}
+        </div>
+      </aside>
+      <section className="file-code-panel">
+        <header className="file-code-header">
+          <span>{selectedFile?.name ?? "No file selected"}</span>
+          <div className="file-code-actions">
+            {dirty ? <small>Unsaved</small> : status.state === "loading" ? <small>{status.label}</small> : null}
+            <button
+              className="icon-button"
+              type="button"
+              aria-label="Save file"
+              disabled={!selectedFile || !dirty}
+              onClick={() => void saveSelectedFile().catch((error: unknown) => setStatus({ state: "error", message: errorMessage(error) }))}
+            >
+              <Save size={14} />
+            </button>
+          </div>
+        </header>
+        {status.state === "error" ? <div className="file-viewer-message">{status.message}</div> : null}
+        {selectedFile ? (
+          <CodeMirror
+            basicSetup
+            className="code-editor"
+            editable
+            extensions={editorExtensions}
+            height="100%"
+            key={selectedFile.id}
+            readOnly={false}
+            value={editorContent}
+            onChange={(value) => {
+              setEditorContent(value);
+              editorContentRef.current = value;
+              dirtyRef.current = value !== selectedFile.content;
+              setDirty(value !== selectedFile.content);
+            }}
+          />
+        ) : status.state !== "error" ? (
+          <div className="file-viewer-message">Select a file</div>
+        ) : null}
+      </section>
+      {discardRequest ? (
+        <div className="discard-backdrop" role="presentation" onPointerDown={() => setDiscardRequest(null)}>
+          <section
+            className="discard-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="discard-title"
+            onPointerDown={(event) => event.stopPropagation()}
+          >
+            <h2 id="discard-title">Discard unsaved changes?</h2>
+            <p>The current file has edits that have not been saved.</p>
+            <div className="discard-actions">
+              <button type="button" onClick={() => setDiscardRequest(null)}>
+                Cancel
+              </button>
+              <button
+                className="danger"
+                type="button"
+                onClick={() => void confirmDiscardRequest().catch((error: unknown) => setStatus({ state: "error", message: errorMessage(error) }))}
+              >
+                Discard
+              </button>
+            </div>
+          </section>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function FileTreeNode({
+  node,
+  style,
+  onOpen
+}: NodeRendererProps<FileTreeEntry> & {
+  onOpen: (entry: FileTreeEntry, isOpen: boolean, toggle: () => void) => void;
+}) {
+  const Icon = node.data.kind === "directory" ? FolderOpen : File;
+  return (
+    <button
+      className={["file-tree-row", node.isSelected ? "selected" : ""].filter(Boolean).join(" ")}
+      style={style}
+      type="button"
+      title={node.data.name}
+      onClick={() => onOpen(node.data, node.isOpen, () => node.toggle())}
+    >
+      {node.data.kind === "directory" ? (
+        <ChevronRight className={node.isOpen ? "open" : ""} size={14} />
+      ) : (
+        <span className="file-tree-caret-placeholder" aria-hidden="true" />
+      )}
+      <Icon size={14} />
+      <span>{node.data.name}</span>
+    </button>
+  );
+}
+
+function replaceFileTreeChildren(nodes: FileTreeEntry[], directoryId: string, children: FileTreeEntry[]): FileTreeEntry[] {
+  return nodes.map((node) => {
+    if (node.id === directoryId) {
+      return { ...node, children, loaded: true };
+    }
+    if (!node.children) {
+      return node;
+    }
+    return { ...node, children: replaceFileTreeChildren(node.children, directoryId, children) };
+  });
+}
+
+function BrowserSurface({ session, windowId }: { session: AppletSession; windowId: number }) {
+  const viewportRef = useRef<HTMLDivElement | null>(null);
+  const initialUrl = session.state.browser?.url ?? DEFAULT_BROWSER_URL;
+  const initialUrlRef = useRef(initialUrl);
+  const [addressValue, setAddressValue] = useState(initialUrl);
+  const [status, setStatus] = useState<BrowserStatusPayload | null>(null);
+  const [navigationError, setNavigationError] = useState<string | null>(null);
+
+  useEffect(() => {
+    const nextUrl = session.state.browser?.url;
+    if (nextUrl) {
+      setAddressValue(nextUrl);
+    }
+  }, [session.state.browser?.url]);
+
+  useEffect(() => {
+    const removeStatusListener = window.unitApi.browser.onStatus((payload) => {
+      if (payload.windowId !== windowId || payload.sessionId !== session.id) {
+        return;
+      }
+      setStatus(payload);
+      if (payload.url) {
+        setAddressValue(payload.url);
+      }
+      setNavigationError(payload.error ?? null);
+    });
+    return removeStatusListener;
+  }, [session.id, windowId]);
+
+  useLayoutEffect(() => {
+    const viewport = viewportRef.current;
+    if (!viewport) {
+      return;
+    }
+    let frame: number | null = null;
+    let disposed = false;
+    const publishBounds = () => {
+      frame = null;
+      if (disposed) {
+        return;
+      }
+      const rect = viewport.getBoundingClientRect();
+      const bounds = toClientRect(rect);
+      void window.unitApi.browser.mount({
+        windowId,
+        sessionId: session.id,
+        bounds,
+        url: initialUrlRef.current
+      }).then((nextStatus) => {
+        if (disposed) {
+          return;
+        }
+        setStatus(nextStatus);
+        if (nextStatus.url) {
+          setAddressValue(nextStatus.url);
+        }
+      }).catch((error: unknown) => {
+        if (!disposed) {
+          setNavigationError(errorMessage(error));
+        }
+      });
+    };
+    const scheduleBounds = () => {
+      if (frame !== null) {
+        return;
+      }
+      frame = window.requestAnimationFrame(publishBounds);
+    };
+    const resizeObserver = new ResizeObserver(scheduleBounds);
+    resizeObserver.observe(viewport);
+    window.addEventListener("resize", scheduleBounds);
+    scheduleBounds();
+    return () => {
+      disposed = true;
+      resizeObserver.disconnect();
+      window.removeEventListener("resize", scheduleBounds);
+      if (frame !== null) {
+        window.cancelAnimationFrame(frame);
+      }
+      void window.unitApi.browser.detach({ windowId, sessionId: session.id });
+    };
+  }, [session.id, windowId]);
+
+  const publishViewportBounds = useCallback(() => {
+    const viewport = viewportRef.current;
+    if (!viewport) {
+      return;
+    }
+    void window.unitApi.browser.updateBounds({
+      windowId,
+      sessionId: session.id,
+      bounds: toClientRect(viewport.getBoundingClientRect())
+    });
+  }, [session.id, windowId]);
+
+  useLayoutEffect(() => {
+    publishViewportBounds();
+  });
+
+  const navigate = useCallback(async () => {
+    setNavigationError(null);
+    const url = normalizeBrowserNavigationUrl(addressValue);
+    setAddressValue(url);
+    await window.unitApi.applets.updateAppletSessionState({
+      sessionId: session.id,
+      state: {
+        ...session.state,
+        browser: { url }
+      }
+    });
+    const nextStatus = await window.unitApi.browser.navigate({ windowId, sessionId: session.id, url });
+    setStatus(nextStatus);
+  }, [addressValue, session.id, session.state, windowId]);
+
+  const runBrowserAction = useCallback(
+    async (action: "back" | "forward" | "reload" | "stop") => {
+      setNavigationError(null);
+      const payload = { windowId, sessionId: session.id };
+      const nextStatus =
+        action === "back"
+          ? await window.unitApi.browser.goBack(payload)
+          : action === "forward"
+            ? await window.unitApi.browser.goForward(payload)
+            : action === "reload"
+              ? await window.unitApi.browser.reload(payload)
+              : await window.unitApi.browser.stop(payload);
+      setStatus(nextStatus);
+    },
+    [session.id, windowId]
+  );
+
+  return (
+    <div className="browser-surface">
+      <form
+        className="browser-toolbar"
+        onSubmit={(event) => {
+          event.preventDefault();
+          void navigate().catch((error: unknown) => setNavigationError(errorMessage(error)));
+        }}
+      >
+        <button
+          className="icon-button"
+          type="button"
+          aria-label="Go back"
+          disabled={!status?.canGoBack}
+          onClick={() => void runBrowserAction("back").catch((error: unknown) => setNavigationError(errorMessage(error)))}
+        >
+          <ArrowLeft size={15} />
+        </button>
+        <button
+          className="icon-button"
+          type="button"
+          aria-label="Go forward"
+          disabled={!status?.canGoForward}
+          onClick={() => void runBrowserAction("forward").catch((error: unknown) => setNavigationError(errorMessage(error)))}
+        >
+          <ArrowRight size={15} />
+        </button>
+        <button
+          className="icon-button"
+          type="button"
+          aria-label={status?.loading ? "Stop loading" : "Reload"}
+          onClick={() => void runBrowserAction(status?.loading ? "stop" : "reload").catch((error: unknown) => setNavigationError(errorMessage(error)))}
+        >
+          {status?.loading ? <X size={15} /> : <RefreshCw size={15} />}
+        </button>
+        <input
+          aria-label="Browser address"
+          spellCheck={false}
+          value={addressValue}
+          onChange={(event) => setAddressValue(event.target.value)}
+          onFocus={(event) => event.currentTarget.select()}
+        />
+      </form>
+      <div className="browser-viewport-shell">
+        <div className="browser-native-viewport" ref={viewportRef} />
+        {navigationError ? <div className="browser-status-line">{navigationError}</div> : null}
+      </div>
+    </div>
+  );
+}
+
+function renderAppletBody(session: AppletSession, windowId: number) {
   const { kind } = session;
   if (kind === "terminal" || kind === "wslTerminal") {
     return <TerminalSurface session={session} />;
   }
   if (kind === "fileViewer") {
-    return (
-      <div className="file-viewer">
-        <nav className="file-tree">
-          <span>UNIT-0</span>
-          <span>src</span>
-          <span className="selected">App.tsx</span>
-          <span>main.ts</span>
-          <span>scope.md</span>
-        </nav>
-        <pre className="code-view">
-          <code>{`export function App() {
-  return <WorkspaceSurface />;
-}
-
-type AppletSession = {
-  id: string;
-  kind: AppletKind;
-};`}</code>
-        </pre>
-      </div>
-    );
+    return <FileViewerSurface session={session} />;
   }
   if (kind === "browser") {
-    return (
-      <div className="browser-surface">
-        <div className="browser-toolbar">
-          <span>http://localhost:5173/</span>
-          <Search size={14} />
-        </div>
-        <div className="browser-page">
-          <h1>Atlas</h1>
-          <p>Build faster. Ship sooner.</p>
-          <div className="browser-row">
-            <span>Home</span>
-            <span>Docs</span>
-            <span>Pricing</span>
-          </div>
-        </div>
-      </div>
-    );
+    return <BrowserSurface session={session} windowId={windowId} />;
   }
   if (kind === "chat") {
     return (

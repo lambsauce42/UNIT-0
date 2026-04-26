@@ -263,7 +263,7 @@ test("persists primary tab order and active workspace across restart", async () 
   await app.close();
 });
 
-test("creates a named workspace tab, renames it from tab context menu, closes it, and reopens it", async () => {
+test("creates, renames, reopens, and closes a workspace from the manager", async () => {
   const dataDir = makeDataDir();
   let app = await launchApp(dataDir);
   let page = await firstWindow(app);
@@ -295,13 +295,35 @@ test("creates a named workspace tab, renames it from tab context menu, closes it
   await expect(page.getByTestId(`workspace-tab-${workspaceId}`)).toBeVisible();
   await expect(page.getByTestId(`workspace-tab-${workspaceId}`)).toHaveClass(/active/);
 
-  await closeTabByTestId(page, `workspace-tab-${workspaceId}`);
+  await page.evaluate(async (targetWorkspaceId) => {
+    const payload = await window.unitApi.tabs.bootstrap();
+    const tab = Object.values(payload.state.tabs).find((item) => item.workspaceId === targetWorkspaceId);
+    if (!tab) {
+      throw new Error(`Missing tab for workspace ${targetWorkspaceId}`);
+    }
+    await window.unitApi.tabs.closeTab({ windowId: payload.windowId, tabId: tab.id });
+  }, workspaceId);
   await expect(page.getByTestId(`workspace-tab-${workspaceId}`)).toHaveCount(0);
   await page.getByTestId("workspace-tab-manager").click();
   await expect(page.getByTestId("workspace-manager")).toBeVisible();
   await page.getByTestId(`workspace-manager-row-${workspaceId}`).click();
   await expect(page.getByTestId(`workspace-tab-${workspaceId}`)).toBeVisible();
   await expect(page.getByTestId(`workspace-tab-${workspaceId}`)).toHaveClass(/active/);
+
+  await page.getByTestId("workspace-tab-manager").click();
+  await page.getByTestId(`workspace-manager-close-${workspaceId}`).click();
+  await expect(page.getByTestId(`workspace-manager-row-${workspaceId}`)).toHaveCount(0);
+  await expect(page.getByTestId(`workspace-tab-${workspaceId}`)).toHaveCount(0);
+  let state = await appState(page);
+  expect(state.workspaces[workspaceId]).toBeUndefined();
+  expect(Object.values(state.tabs).some((tab) => tab.workspaceId === workspaceId)).toBe(false);
+
+  await app.close();
+  app = await launchApp(dataDir);
+  page = await firstWindow(app);
+  state = await appState(page);
+  expect(state.workspaces[workspaceId]).toBeUndefined();
+  await expect(page.getByTestId(`workspace-manager-row-${workspaceId}`)).toHaveCount(0);
 
   await app.close();
 });

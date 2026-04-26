@@ -2,16 +2,25 @@ import { contextBridge, ipcRenderer } from "electron";
 import type {
   ActivateTabPayload,
   ApplyWorkspaceTemplatePayload,
+  BrowserBoundsPayload,
+  BrowserMountPayload,
+  BrowserNavigatePayload,
+  BrowserSessionPayload,
+  BrowserStatusPayload,
+  BrowserWindowVisibilityPayload,
   BeginTabDragPayload,
   BootstrapPayload,
   ChangeAppletInstanceKindPayload,
+  CloseWorkspacePayload,
   CloseTabPayload,
   CloseAppletInstancePayload,
   CreateAppletPayload,
   CreateWorkspacePayload,
   FinishTabDragPayload,
+  ListDirectoryPayload,
   MoveAppletInstancePayload,
   OpenWorkspaceTabPayload,
+  ReadFilePayload,
   ReplaceWorkspaceLayoutPayload,
   RegisterStripBoundsPayload,
   RenameWorkspacePayload,
@@ -20,8 +29,11 @@ import type {
   TerminalResizePayload,
   TerminalStartPayload,
   UnitApi,
+  SelectDirectoryPayload,
   UpdateLayoutRatiosPayload,
-  UpdateTabDragPayload
+  UpdateAppletSessionStatePayload,
+  UpdateTabDragPayload,
+  WriteFilePayload
 } from "../shared/types.js";
 
 const api: UnitApi = {
@@ -54,6 +66,7 @@ const api: UnitApi = {
     createWorkspace: (payload: CreateWorkspacePayload) => ipcRenderer.invoke("workspaces:createWorkspace", payload),
     openWorkspaceTab: (payload: OpenWorkspaceTabPayload) => ipcRenderer.invoke("workspaces:openWorkspaceTab", payload),
     renameWorkspace: (payload: RenameWorkspacePayload) => ipcRenderer.invoke("workspaces:renameWorkspace", payload),
+    closeWorkspace: (payload: CloseWorkspacePayload) => ipcRenderer.invoke("workspaces:closeWorkspace", payload),
     updateLayoutRatios: (payload: UpdateLayoutRatiosPayload) =>
       ipcRenderer.invoke("workspaces:updateLayoutRatios", payload),
     replaceLayout: (payload: ReplaceWorkspaceLayoutPayload) => ipcRenderer.invoke("workspaces:replaceLayout", payload),
@@ -64,7 +77,9 @@ const api: UnitApi = {
     closeAppletInstance: (payload: CloseAppletInstancePayload) => ipcRenderer.invoke("applets:closeAppletInstance", payload),
     changeAppletInstanceKind: (payload: ChangeAppletInstanceKindPayload) =>
       ipcRenderer.invoke("applets:changeAppletInstanceKind", payload),
-    moveAppletInstance: (payload: MoveAppletInstancePayload) => ipcRenderer.invoke("applets:moveAppletInstance", payload)
+    moveAppletInstance: (payload: MoveAppletInstancePayload) => ipcRenderer.invoke("applets:moveAppletInstance", payload),
+    updateAppletSessionState: (payload: UpdateAppletSessionStatePayload) =>
+      ipcRenderer.invoke("applets:updateAppletSessionState", payload)
   },
   terminal: {
     start: (payload: TerminalStartPayload) => ipcRenderer.invoke("terminal:start", payload),
@@ -74,6 +89,29 @@ const api: UnitApi = {
       const handler = (_event: Electron.IpcRendererEvent, payload: TerminalDataPayload) => callback(payload);
       ipcRenderer.on("terminal:data", handler);
       return () => ipcRenderer.off("terminal:data", handler);
+    }
+  },
+  fileSystem: {
+    listDirectory: (payload: ListDirectoryPayload) => ipcRenderer.invoke("fileSystem:listDirectory", payload),
+    readFile: (payload: ReadFilePayload) => ipcRenderer.invoke("fileSystem:readFile", payload),
+    writeFile: (payload: WriteFilePayload) => ipcRenderer.invoke("fileSystem:writeFile", payload),
+    selectDirectory: (payload: SelectDirectoryPayload) => ipcRenderer.invoke("fileSystem:selectDirectory", payload)
+  },
+  browser: {
+    mount: (payload: BrowserMountPayload) => ipcRenderer.invoke("browser:mount", payload),
+    updateBounds: (payload: BrowserBoundsPayload) => ipcRenderer.invoke("browser:updateBounds", payload),
+    detach: (payload: BrowserSessionPayload) => ipcRenderer.invoke("browser:detach", payload),
+    navigate: (payload: BrowserNavigatePayload) => ipcRenderer.invoke("browser:navigate", payload),
+    goBack: (payload: BrowserSessionPayload) => ipcRenderer.invoke("browser:goBack", payload),
+    goForward: (payload: BrowserSessionPayload) => ipcRenderer.invoke("browser:goForward", payload),
+    reload: (payload: BrowserSessionPayload) => ipcRenderer.invoke("browser:reload", payload),
+    stop: (payload: BrowserSessionPayload) => ipcRenderer.invoke("browser:stop", payload),
+    setWindowViewsVisible: (payload: BrowserWindowVisibilityPayload) =>
+      ipcRenderer.invoke("browser:setWindowViewsVisible", payload),
+    onStatus: (callback: (payload: BrowserStatusPayload) => void) => {
+      const handler = (_event: Electron.IpcRendererEvent, payload: BrowserStatusPayload) => callback(payload);
+      ipcRenderer.on("browser:status", handler);
+      return () => ipcRenderer.off("browser:status", handler);
     }
   }
 };

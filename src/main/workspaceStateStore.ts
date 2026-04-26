@@ -7,12 +7,15 @@ import type {
   AppletKind,
   AppletInstance,
   AppletSession,
+  AppletSessionState,
   TabHostSnapshot,
+  UpdateAppletSessionStatePayload,
   Workspace,
   WorkspaceLayoutLeaf,
   WorkspaceLayoutNode,
   WorkspaceTab
 } from "../shared/types.js";
+import { normalizeBrowserNavigationUrl } from "../shared/browserUrls.js";
 import { templateLayoutToWorkspaceLayout } from "../shared/templatePlanner.js";
 import { workspaceTemplateById } from "../shared/workspaceTemplates.js";
 
@@ -37,6 +40,10 @@ export type AppletMutationResult = {
   deletedSessionId?: string;
   changedSessionId?: string;
   previousKind?: AppletKind;
+};
+
+export type CloseWorkspaceResult = {
+  deletedSessionIds: string[];
 };
 
 export type ChangeAppletKindOptions = {
@@ -69,11 +76,11 @@ export type ApplyTemplateResult = {
 };
 
 const DEFAULT_APPLET_SESSIONS: Record<string, AppletSession> = {
-  "session-terminal": { id: "session-terminal", kind: "terminal", title: "Terminal" },
-  "session-file-viewer": { id: "session-file-viewer", kind: "fileViewer", title: "File Viewer" },
-  "session-browser": { id: "session-browser", kind: "browser", title: "Browser" },
-  "session-chat": { id: "session-chat", kind: "chat", title: "Chat" },
-  "session-sandbox": { id: "session-sandbox", kind: "sandbox", title: "Sandbox" }
+  "session-terminal": { id: "session-terminal", kind: "terminal", title: "Terminal", state: {} },
+  "session-file-viewer": { id: "session-file-viewer", kind: "fileViewer", title: "File Viewer", state: {} },
+  "session-browser": { id: "session-browser", kind: "browser", title: "Browser", state: {} },
+  "session-chat": { id: "session-chat", kind: "chat", title: "Chat", state: {} },
+  "session-sandbox": { id: "session-sandbox", kind: "sandbox", title: "Sandbox", state: {} }
 };
 
 type SeedWorkspace = Omit<Workspace, "applets" | "shelfAppletIds"> & {
@@ -147,6 +154,7 @@ type AppletSessionRow = {
   id: string;
   kind: AppletKind;
   title: string;
+  state_json: string;
 };
 
 type WorkspaceRow = {
@@ -200,11 +208,14 @@ export class WorkspaceStateStore {
   load(): WorkspaceStateModel {
     const appletSessions = Object.fromEntries(
       this.db
-        .prepare("SELECT id, kind, title FROM applet_sessions ORDER BY id")
+        .prepare("SELECT id, kind, title, state_json FROM applet_sessions ORDER BY id")
         .all()
         .map((row) => {
           const session = row as AppletSessionRow;
-          return [session.id, session];
+          return [
+            session.id,
+            { id: session.id, kind: session.kind, title: session.title, state: parseAppletSessionState(session.state_json) }
+          ];
         })
     );
     const workspaces: Record<string, Workspace> = Object.fromEntries(
@@ -347,6 +358,45 @@ export class WorkspaceStateStore {
     this.savePrimaryHost(host);
   }
 
+  closeWorkspace(workspaceId: string): CloseWorkspaceResult {
+    if (workspaceId === "manager") {
+      throw new Error("Workspace Manager cannot be closed");
+    }
+    const workspace = this.db.prepare("SELECT id FROM workspaces WHERE id = ?").get(workspaceId) as WorkspaceRow | undefined;
+    if (!workspace) {
+      throw new Error(`Workspace ${workspaceId} does not exist`);
+    }
+    const sessionIds = (
+      this.db.prepare("SELECT session_id FROM applet_instances WHERE workspace_id = ?").all(workspaceId) as Array<{
+        session_id: string;
+      }>
+    ).map((row) => row.session_id);
+
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db.prepare("DELETE FROM workspace_shelf_applets WHERE workspace_id = ?").run(workspaceId);
+      this.db.prepare("DELETE FROM workspace_layouts WHERE workspace_id = ?").run(workspaceId);
+      this.db.prepare("DELETE FROM workspace_tabs WHERE workspace_id = ?").run(workspaceId);
+      this.db.prepare("DELETE FROM applet_instances WHERE workspace_id = ?").run(workspaceId);
+      this.db.prepare("DELETE FROM workspaces WHERE id = ?").run(workspaceId);
+      const deletedSessionIds: string[] = [];
+      for (const sessionId of new Set(sessionIds)) {
+        const usage = this.db
+          .prepare("SELECT COUNT(*) AS count FROM applet_instances WHERE session_id = ?")
+          .get(sessionId) as { count: number };
+        if (usage.count === 0) {
+          this.db.prepare("DELETE FROM applet_sessions WHERE id = ?").run(sessionId);
+          deletedSessionIds.push(sessionId);
+        }
+      }
+      this.db.exec("COMMIT");
+      return { deletedSessionIds };
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
   renameWorkspace(workspaceId: string, title: string): Workspace {
     const resolvedTitle = title.trim();
     if (!resolvedTitle) {
@@ -378,7 +428,8 @@ export class WorkspaceStateStore {
     const session: AppletSession = {
       id: `session-${options.kind}-${randomUUID()}`,
       kind: options.kind,
-      title: titleForAppletKind(options.kind)
+      title: titleForAppletKind(options.kind),
+      state: {}
     };
     const instance: AppletInstance = {
       id: `${workspace.id}-${options.kind}-${randomUUID()}`,
@@ -394,8 +445,8 @@ export class WorkspaceStateStore {
     this.db.exec("BEGIN IMMEDIATE");
     try {
       this.db
-        .prepare("INSERT INTO applet_sessions (id, kind, title) VALUES (?, ?, ?)")
-        .run(session.id, session.kind, session.title);
+        .prepare("INSERT INTO applet_sessions (id, kind, title, state_json) VALUES (?, ?, ?, ?)")
+        .run(session.id, session.kind, session.title, JSON.stringify(session.state));
       this.db
         .prepare("INSERT INTO applet_instances (id, workspace_id, session_id, area, sort_order) VALUES (?, ?, ?, ?, ?)")
         .run(instance.id, workspace.id, instance.sessionId, session.kind, this.nextAppletSortOrder(workspace.id));
@@ -488,8 +539,8 @@ export class WorkspaceStateStore {
     this.db.exec("BEGIN IMMEDIATE");
     try {
       this.db
-        .prepare("UPDATE applet_sessions SET kind = ?, title = ? WHERE id = ?")
-        .run(nextSession.kind, nextSession.title, nextSession.id);
+        .prepare("UPDATE applet_sessions SET kind = ?, title = ?, state_json = ? WHERE id = ?")
+        .run(nextSession.kind, nextSession.title, JSON.stringify(nextSession.state), nextSession.id);
       this.db.prepare("UPDATE applet_instances SET area = ? WHERE id = ? AND workspace_id = ?").run(
         nextSession.kind,
         options.appletInstanceId,
@@ -529,6 +580,22 @@ export class WorkspaceStateStore {
       throw error;
     }
     return nextWorkspace;
+  }
+
+  updateAppletSessionState(options: UpdateAppletSessionStatePayload): AppletSession {
+    const model = this.load();
+    const currentSession = model.appletSessions[options.sessionId];
+    if (!currentSession) {
+      throw new Error(`Applet session ${options.sessionId} does not exist`);
+    }
+    const nextSession: AppletSession = {
+      ...currentSession,
+      state: normalizeAppletSessionState(options.state)
+    };
+    this.db
+      .prepare("UPDATE applet_sessions SET state_json = ? WHERE id = ?")
+      .run(JSON.stringify(nextSession.state), nextSession.id);
+    return nextSession;
   }
 
   updateLayoutRatios(options: UpdateLayoutRatiosOptions): Workspace {
@@ -622,7 +689,8 @@ export class WorkspaceStateStore {
       const session: AppletSession = {
         id: `session-${assignment.kind}-${randomUUID()}`,
         kind: assignment.kind,
-        title: titleForAppletKind(assignment.kind)
+        title: titleForAppletKind(assignment.kind),
+        state: {}
       };
       const instance: AppletInstance = {
         id: `${workspace.id}-${assignment.kind}-${randomUUID()}`,
@@ -644,14 +712,14 @@ export class WorkspaceStateStore {
 
     this.db.exec("BEGIN IMMEDIATE");
     try {
-      const insertSession = this.db.prepare("INSERT INTO applet_sessions (id, kind, title) VALUES (?, ?, ?)");
+      const insertSession = this.db.prepare("INSERT INTO applet_sessions (id, kind, title, state_json) VALUES (?, ?, ?, ?)");
       const insertInstance = this.db.prepare(
         "INSERT INTO applet_instances (id, workspace_id, session_id, area, sort_order) VALUES (?, ?, ?, ?, ?)"
       );
       let nextSortOrder = this.nextAppletSortOrder(workspace.id);
       for (const instance of createdInstances) {
         const session = createdSessions[instance.sessionId];
-        insertSession.run(session.id, session.kind, session.title);
+        insertSession.run(session.id, session.kind, session.title, JSON.stringify(session.state));
         insertInstance.run(instance.id, workspace.id, instance.sessionId, session.kind, nextSortOrder);
         nextSortOrder += 1;
       }
@@ -683,7 +751,8 @@ export class WorkspaceStateStore {
       CREATE TABLE IF NOT EXISTS applet_sessions (
         id TEXT PRIMARY KEY,
         kind TEXT NOT NULL,
-        title TEXT NOT NULL
+        title TEXT NOT NULL,
+        state_json TEXT NOT NULL DEFAULT '{}'
       );
 
       CREATE TABLE IF NOT EXISTS workspaces (
@@ -731,6 +800,7 @@ export class WorkspaceStateStore {
       VALUES ('schema_version', '2')
       ON CONFLICT(key) DO NOTHING;
     `);
+    this.addColumnIfMissing("applet_sessions", "state_json", "TEXT NOT NULL DEFAULT '{}'");
     this.backfillMissingWorkspaceLayouts();
   }
 
@@ -741,9 +811,9 @@ export class WorkspaceStateStore {
     }
     this.db.exec("BEGIN IMMEDIATE");
     try {
-      const insertSession = this.db.prepare("INSERT INTO applet_sessions (id, kind, title) VALUES (?, ?, ?)");
+      const insertSession = this.db.prepare("INSERT INTO applet_sessions (id, kind, title, state_json) VALUES (?, ?, ?, ?)");
       for (const session of Object.values(DEFAULT_APPLET_SESSIONS)) {
-        insertSession.run(session.id, session.kind, session.title);
+        insertSession.run(session.id, session.kind, session.title, JSON.stringify(session.state));
       }
 
       const insertWorkspace = this.db.prepare("INSERT INTO workspaces (id, title, sort_order) VALUES (?, ?, ?)");
@@ -849,6 +919,13 @@ export class WorkspaceStateStore {
     return row.next;
   }
 
+  private addColumnIfMissing(tableName: string, columnName: string, columnDefinition: string): void {
+    const columns = this.db.prepare(`PRAGMA table_info(${tableName})`).all() as Array<{ name: string }>;
+    if (!columns.some((column) => column.name === columnName)) {
+      this.db.exec(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${columnDefinition}`);
+    }
+  }
+
   private saveWorkspaceLayoutInTransaction(workspaceId: string, layout: WorkspaceLayoutNode | null): void {
     this.db
       .prepare(
@@ -930,6 +1007,27 @@ function titleForAppletKind(kind: AppletKind): string {
     return "WSL Terminal";
   }
   return kind.charAt(0).toUpperCase() + kind.slice(1);
+}
+
+function parseAppletSessionState(stateJson: string): AppletSessionState {
+  const parsed = JSON.parse(stateJson) as unknown;
+  if (!parsed || typeof parsed !== "object") {
+    return {};
+  }
+  return normalizeAppletSessionState(parsed as AppletSessionState);
+}
+
+function normalizeAppletSessionState(state: AppletSessionState): AppletSessionState {
+  const nextState: AppletSessionState = {};
+  const rootPath = state.fileViewer?.rootPath;
+  if (typeof rootPath === "string" && rootPath.trim()) {
+    nextState.fileViewer = { rootPath: rootPath.trim() };
+  }
+  const browserUrl = state.browser?.url;
+  if (typeof browserUrl === "string" && browserUrl.trim()) {
+    nextState.browser = { url: normalizeBrowserNavigationUrl(browserUrl) };
+  }
+  return nextState;
 }
 
 function insertAppletLeaf(

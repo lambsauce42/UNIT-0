@@ -1,19 +1,28 @@
-import { app, BrowserWindow, Menu, ipcMain, screen } from "electron";
+import { app, BrowserWindow, Menu, dialog, ipcMain, screen } from "electron";
+import fs from "node:fs/promises";
 import path from "node:path";
 import type {
   AppletKind,
   AppletSession,
   ApplyWorkspaceTemplatePayload,
   BeginTabDragPayload,
+  BrowserBoundsPayload,
+  BrowserMountPayload,
+  BrowserNavigatePayload,
+  BrowserSessionPayload,
+  BrowserWindowVisibilityPayload,
   BootstrapPayload,
   ChangeAppletInstanceKindPayload,
   CloseAppletInstancePayload,
+  CloseWorkspacePayload,
   CloseTabPayload,
   CreateAppletPayload,
   CreateWorkspacePayload,
   FinishTabDragPayload,
+  ListDirectoryPayload,
   MoveAppletInstancePayload,
   OpenWorkspaceTabPayload,
+  ReadFilePayload,
   ReplaceWorkspaceLayoutPayload,
   RectLike,
   RegisterStripBoundsPayload,
@@ -27,15 +36,19 @@ import type {
   TabHostState,
   UnitState,
   UpdateLayoutRatiosPayload,
+  UpdateAppletSessionStatePayload,
   UpdateTabDragPayload,
   Workspace,
   WorkspaceLayoutNode,
   AppletInstance,
-  WorkspaceTab
+  WorkspaceTab,
+  SelectDirectoryPayload,
+  WriteFilePayload
 } from "../shared/types.js";
 import { WORKSPACE_TAB_SIZE } from "../shared/tabMetrics.js";
 import { WorkspaceStateStore } from "./workspaceStateStore.js";
 import { TerminalManager } from "./terminalManager.js";
+import { BrowserViewManager } from "./browserViewManager.js";
 
 const preloadPath = path.join(__dirname, "../preload/preload.js");
 const rendererEntry = path.join(__dirname, "../renderer/index.html");
@@ -321,6 +334,30 @@ class TabRegistry {
     }
   }
 
+  closeWorkspace(payload: CloseWorkspacePayload): { closeWindowIds: number[]; deletedSessionIds: string[] } {
+    const workspace = this.workspaces[payload.workspaceId];
+    if (!workspace || payload.workspaceId === "manager" || this.dragSession) {
+      throw new Error(`Cannot close workspace ${payload.workspaceId}`);
+    }
+    const removedTabIds = Object.values(this.tabs)
+      .filter((tab) => tab.workspaceId === payload.workspaceId)
+      .map((tab) => tab.id);
+    const result = this.store.closeWorkspace(payload.workspaceId);
+    delete this.workspaces[payload.workspaceId];
+    for (const tabId of removedTabIds) {
+      delete this.tabs[tabId];
+    }
+    for (const sessionId of result.deletedSessionIds) {
+      delete this.appletSessions[sessionId];
+    }
+    for (const host of Object.values(this.hosts)) {
+      host.tabIds = host.tabIds.filter((tabId) => !removedTabIds.includes(tabId));
+      this.normalizeHost(host);
+    }
+    this.persistPrimaryHost();
+    return { closeWindowIds: this.emptyDetachedWindowIds(), deletedSessionIds: result.deletedSessionIds };
+  }
+
   updateLayoutRatios(payload: UpdateLayoutRatiosPayload): void {
     const workspace = this.workspaces[payload.workspaceId];
     if (!workspace || this.dragSession) {
@@ -401,6 +438,14 @@ class TabRegistry {
       throw new Error(`Cannot move applet instance ${payload.appletInstanceId}`);
     }
     this.workspaces[payload.workspaceId] = this.store.moveAppletInstance(payload);
+  }
+
+  updateAppletSessionState(payload: UpdateAppletSessionStatePayload): void {
+    const currentSession = this.appletSessions[payload.sessionId];
+    if (!currentSession || this.dragSession) {
+      throw new Error(`Cannot update applet session ${payload.sessionId}`);
+    }
+    this.appletSessions[payload.sessionId] = this.store.updateAppletSessionState(payload);
   }
 
   windowClosed(windowId: number): void {
@@ -726,6 +771,8 @@ class TabRegistry {
 
 let registry: TabRegistry;
 let terminalManager: TerminalManager;
+let browserViewManager: BrowserViewManager;
+const defaultFileViewerRoot = path.resolve(process.cwd());
 
 function workspaceDatabasePath(): string {
   const dataDir = process.env.UNIT0_DATA_DIR ?? app.getPath("userData");
@@ -817,6 +864,139 @@ function isTerminalAppletKind(kind: AppletKind): boolean {
   return kind === "terminal" || kind === "wslTerminal";
 }
 
+function isBrowserAppletKind(kind: AppletKind): boolean {
+  return kind === "browser";
+}
+
+async function listFileViewerDirectory(payload: ListDirectoryPayload) {
+  const rootPath = await resolveFileViewerRoot(payload.rootPath);
+  const directoryPath = await resolveFileViewerPath(rootPath, payload.directoryId);
+  const stats = await fs.stat(directoryPath);
+  if (!stats.isDirectory()) {
+    throw new Error(`File tree path is not a directory: ${payload.directoryId || "."}`);
+  }
+  const entries = await fs.readdir(directoryPath, { withFileTypes: true });
+  const resolvedEntries = (
+    await Promise.all(
+      entries.map(async (entry) => {
+        const absolutePath = path.join(directoryPath, entry.name);
+        const entryStats = await fs.stat(absolutePath).catch(() => null);
+        if (!entryStats || (!entryStats.isDirectory() && !entryStats.isFile())) {
+          return null;
+        }
+        await assertInsideFileViewerRoot(rootPath, absolutePath);
+        return {
+          id: fileViewerIdForPath(rootPath, absolutePath),
+          name: entry.name,
+          kind: entryStats.isDirectory() ? "directory" as const : "file" as const,
+          children: entryStats.isDirectory() ? [] : undefined,
+          loaded: false
+        };
+      })
+    )
+  ).filter((entry): entry is NonNullable<typeof entry> => entry !== null);
+  resolvedEntries.sort((left, right) => {
+    if (left.kind !== right.kind) {
+      return left.kind === "directory" ? -1 : 1;
+    }
+    return left.name.localeCompare(right.name, undefined, { numeric: true, sensitivity: "base" });
+  });
+  return {
+    rootId: "__workspace_root__",
+    rootName: path.basename(rootPath) || rootPath,
+    rootPath,
+    directoryId: payload.directoryId,
+    entries: resolvedEntries
+  };
+}
+
+async function readFileViewerFile(payload: ReadFilePayload) {
+  const rootPath = await resolveFileViewerRoot(payload.rootPath);
+  const filePath = await resolveFileViewerPath(rootPath, payload.fileId);
+  const stats = await fs.stat(filePath);
+  if (!stats.isFile()) {
+    throw new Error(`File tree path is not a file: ${payload.fileId}`);
+  }
+  const buffer = await fs.readFile(filePath);
+  if (buffer.includes(0)) {
+    throw new Error(`Binary files are not rendered in the file viewer: ${payload.fileId}`);
+  }
+  return {
+    id: payload.fileId,
+    name: path.basename(filePath),
+    content: buffer.toString("utf8")
+  };
+}
+
+async function writeFileViewerFile(payload: WriteFilePayload) {
+  const rootPath = await resolveFileViewerRoot(payload.rootPath);
+  const filePath = await resolveFileViewerPath(rootPath, payload.fileId);
+  const stats = await fs.stat(filePath);
+  if (!stats.isFile()) {
+    throw new Error(`File tree path is not a file: ${payload.fileId}`);
+  }
+  await fs.writeFile(filePath, payload.content, "utf8");
+  return {
+    id: payload.fileId,
+    name: path.basename(filePath),
+    content: payload.content
+  };
+}
+
+async function selectFileViewerDirectory(payload: SelectDirectoryPayload) {
+  const currentPath = await directoryOrDefault(payload.currentPath);
+  const result = await dialog.showOpenDialog({
+    defaultPath: currentPath,
+    properties: ["openDirectory"]
+  });
+  return { rootPath: result.canceled ? null : result.filePaths[0] };
+}
+
+async function resolveFileViewerRoot(rootPath: string): Promise<string> {
+  const resolvedRoot = path.resolve(rootPath || defaultFileViewerRoot);
+  const stats = await fs.stat(resolvedRoot);
+  if (!stats.isDirectory()) {
+    throw new Error(`File viewer root is not a directory: ${resolvedRoot}`);
+  }
+  return fs.realpath(resolvedRoot);
+}
+
+async function directoryOrDefault(directoryPath: string | undefined): Promise<string> {
+  if (!directoryPath) {
+    return defaultFileViewerRoot;
+  }
+  const resolved = path.resolve(directoryPath);
+  const stats = await fs.stat(resolved).catch(() => null);
+  return stats?.isDirectory() ? resolved : defaultFileViewerRoot;
+}
+
+async function resolveFileViewerPath(rootPath: string, fileId: string): Promise<string> {
+  if (path.isAbsolute(fileId)) {
+    throw new Error("File viewer paths must be relative to the workspace root");
+  }
+  const normalized = path.normalize(fileId);
+  if (normalized === ".." || normalized.startsWith(`..${path.sep}`)) {
+    throw new Error("File viewer paths cannot leave the workspace root");
+  }
+  const absolutePath = path.resolve(rootPath, normalized === "." ? "" : normalized);
+  await assertInsideFileViewerRoot(rootPath, absolutePath);
+  return absolutePath;
+}
+
+async function assertInsideFileViewerRoot(rootPath: string, absolutePath: string): Promise<void> {
+  const [rootRealPath, targetRealPath] = await Promise.all([fs.realpath(rootPath), fs.realpath(absolutePath)]);
+  const relative = path.relative(rootRealPath, targetRealPath);
+  if (relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative))) {
+    return;
+  }
+  throw new Error("File viewer paths cannot leave the workspace root");
+}
+
+function fileViewerIdForPath(rootPath: string, absolutePath: string): string {
+  const relative = path.relative(rootPath, absolutePath);
+  return relative.split(path.sep).join("/");
+}
+
 async function loadRenderer(browserWindow: BrowserWindow): Promise<void> {
   const devServerUrl = process.env.VITE_DEV_SERVER_URL;
   if (devServerUrl) {
@@ -857,6 +1037,7 @@ function createWindow(options: { tabId?: string; x?: number; y?: number; primary
     }
   });
   browserWindow.on("closed", () => {
+    browserViewManager?.disposeWindow(browserWindow.id);
     windows.delete(browserWindow.id);
     const pending = pendingAlignments.get(browserWindow.id);
     if (pending) {
@@ -1204,6 +1385,7 @@ app.whenReady().then(() => {
       }
     }
   });
+  browserViewManager = new BrowserViewManager((windowId) => windows.get(windowId));
   Menu.setApplicationMenu(null);
   ipcMain.handle("unit:bootstrap", (event) => payloadFor(BrowserWindow.fromWebContents(event.sender)?.id ?? 0));
   ipcMain.handle("tabs:bootstrap", (event) => payloadFor(BrowserWindow.fromWebContents(event.sender)?.id ?? 0));
@@ -1270,6 +1452,17 @@ app.whenReady().then(() => {
     registry.renameWorkspace(payload.workspaceId, payload.title);
     broadcastState();
   });
+  ipcMain.handle("workspaces:closeWorkspace", (_event, payload: CloseWorkspacePayload) => {
+    const result = registry.closeWorkspace(payload);
+    for (const sessionId of result.deletedSessionIds) {
+      terminalManager.dispose(sessionId);
+      browserViewManager.disposeSession(sessionId);
+    }
+    for (const windowId of result.closeWindowIds) {
+      windows.get(windowId)?.close();
+    }
+    broadcastState();
+  });
   ipcMain.handle("workspaces:updateLayoutRatios", (_event, payload: UpdateLayoutRatiosPayload) => {
     registry.updateLayoutRatios(payload);
     broadcastState();
@@ -1306,6 +1499,7 @@ app.whenReady().then(() => {
     }
     if (deletedSessionId) {
       terminalManager.dispose(deletedSessionId);
+      browserViewManager.disposeSession(deletedSessionId);
     }
     console.info("[unit0:applet-close] main close committed", {
       ...payload,
@@ -1322,10 +1516,20 @@ app.whenReady().then(() => {
     ) {
       terminalManager.dispose(result.sessionId);
     }
+    if (
+      result.previousKind !== payload.kind &&
+      (isBrowserAppletKind(result.previousKind) || isBrowserAppletKind(payload.kind))
+    ) {
+      browserViewManager.disposeSession(result.sessionId);
+    }
     broadcastState();
   });
   ipcMain.handle("applets:moveAppletInstance", (_event, payload: MoveAppletInstancePayload) => {
     registry.moveAppletInstance(payload);
+    broadcastState();
+  });
+  ipcMain.handle("applets:updateAppletSessionState", (_event, payload: UpdateAppletSessionStatePayload) => {
+    registry.updateAppletSessionState(payload);
     broadcastState();
   });
   ipcMain.handle("tabs:registerStripBounds", (_event, payload: RegisterStripBoundsPayload) => {
@@ -1347,11 +1551,31 @@ app.whenReady().then(() => {
   ipcMain.handle("terminal:resize", (_event, payload: TerminalResizePayload) => {
     terminalManager.resize(payload);
   });
+  ipcMain.handle("fileSystem:listDirectory", (_event, payload: ListDirectoryPayload) => listFileViewerDirectory(payload));
+  ipcMain.handle("fileSystem:readFile", (_event, payload: ReadFilePayload) => readFileViewerFile(payload));
+  ipcMain.handle("fileSystem:writeFile", (_event, payload: WriteFilePayload) => writeFileViewerFile(payload));
+  ipcMain.handle("fileSystem:selectDirectory", (_event, payload: SelectDirectoryPayload) => selectFileViewerDirectory(payload));
+  ipcMain.handle("browser:mount", (_event, payload: BrowserMountPayload) => browserViewManager.mount(payload));
+  ipcMain.handle("browser:updateBounds", (_event, payload: BrowserBoundsPayload) => {
+    browserViewManager.updateBounds(payload);
+  });
+  ipcMain.handle("browser:detach", (_event, payload: BrowserSessionPayload) => {
+    browserViewManager.detach(payload);
+  });
+  ipcMain.handle("browser:navigate", (_event, payload: BrowserNavigatePayload) => browserViewManager.navigate(payload));
+  ipcMain.handle("browser:goBack", (_event, payload: BrowserSessionPayload) => browserViewManager.goBack(payload));
+  ipcMain.handle("browser:goForward", (_event, payload: BrowserSessionPayload) => browserViewManager.goForward(payload));
+  ipcMain.handle("browser:reload", (_event, payload: BrowserSessionPayload) => browserViewManager.reload(payload));
+  ipcMain.handle("browser:stop", (_event, payload: BrowserSessionPayload) => browserViewManager.stop(payload));
+  ipcMain.handle("browser:setWindowViewsVisible", (_event, payload: BrowserWindowVisibilityPayload) => {
+    browserViewManager.setWindowViewsVisible(payload);
+  });
   createWindow({ primary: true });
 });
 
 app.on("window-all-closed", () => {
   terminalManager?.disposeAll();
+  browserViewManager?.disposeAll();
   destroyCaptureOverlays();
   if (process.platform !== "darwin") {
     app.quit();
