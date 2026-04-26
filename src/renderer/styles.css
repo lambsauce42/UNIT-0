@@ -379,9 +379,7 @@ button {
 }
 
 .splitter-highlight {
-  border-radius: 4px;
-  background: rgba(122, 162, 255, 0.26);
-  box-shadow: 0 0 0 1px rgba(122, 162, 255, 0.42);
+  background: rgba(122, 162, 255, 0.42);
   pointer-events: none;
 }
 
