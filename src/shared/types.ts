@@ -1,4 +1,5 @@
-export type AppletKind = "terminal" | "fileViewer" | "browser" | "chat" | "sandbox";
+export type AppletKind = "terminal" | "wslTerminal" | "fileViewer" | "browser" | "chat" | "sandbox";
+export type TerminalAppletKind = Extract<AppletKind, "terminal" | "wslTerminal">;
 
 export interface AppletSession {
   id: string;
@@ -185,6 +186,34 @@ export interface MoveAppletInstancePayload {
   placement: "first" | "second";
 }
 
+export interface TerminalStartPayload {
+  sessionId: string;
+  kind: TerminalAppletKind;
+  cols: number;
+  rows: number;
+}
+
+export interface TerminalStartResult {
+  sessionId: string;
+  output: string;
+}
+
+export interface TerminalInputPayload {
+  sessionId: string;
+  data: string;
+}
+
+export interface TerminalResizePayload {
+  sessionId: string;
+  cols: number;
+  rows: number;
+}
+
+export interface TerminalDataPayload {
+  sessionId: string;
+  data: string;
+}
+
 export interface UnitApi {
   bootstrap: () => Promise<BootstrapPayload>;
   onStateChanged: (callback: (payload: BootstrapPayload) => void) => () => void;
@@ -213,5 +242,11 @@ export interface UnitApi {
     createApplet: (payload: CreateAppletPayload) => Promise<AppletInstance>;
     closeAppletInstance: (payload: CloseAppletInstancePayload) => Promise<void>;
     moveAppletInstance: (payload: MoveAppletInstancePayload) => Promise<void>;
+  };
+  terminal: {
+    start: (payload: TerminalStartPayload) => Promise<TerminalStartResult>;
+    input: (payload: TerminalInputPayload) => void;
+    resize: (payload: TerminalResizePayload) => Promise<void>;
+    onData: (callback: (payload: TerminalDataPayload) => void) => () => void;
   };
 }

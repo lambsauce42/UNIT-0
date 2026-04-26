@@ -729,6 +729,9 @@ function titleForAppletKind(kind: AppletKind): string {
   if (kind === "fileViewer") {
     return "File Viewer";
   }
+  if (kind === "wslTerminal") {
+    return "WSL Terminal";
+  }
   return kind.charAt(0).toUpperCase() + kind.slice(1);
 }
 

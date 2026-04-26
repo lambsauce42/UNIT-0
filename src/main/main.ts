@@ -15,6 +15,9 @@ import type {
   RectLike,
   RegisterStripBoundsPayload,
   RenameWorkspacePayload,
+  TerminalInputPayload,
+  TerminalResizePayload,
+  TerminalStartPayload,
   TabDragSession,
   TabDropTarget,
   TabHostSnapshot,
@@ -28,6 +31,7 @@ import type {
 } from "../shared/types.js";
 import { WORKSPACE_TAB_SIZE } from "../shared/tabMetrics.js";
 import { WorkspaceStateStore } from "./workspaceStateStore.js";
+import { TerminalManager } from "./terminalManager.js";
 
 const preloadPath = path.join(__dirname, "../preload/preload.js");
 const rendererEntry = path.join(__dirname, "../renderer/index.html");
@@ -361,7 +365,7 @@ class TabRegistry {
     return structuredClone(result.instance);
   }
 
-  closeAppletInstance(payload: CloseAppletInstancePayload): void {
+  closeAppletInstance(payload: CloseAppletInstancePayload): string | undefined {
     const workspace = this.workspaces[payload.workspaceId];
     if (!workspace || this.dragSession) {
       throw new Error(`Cannot close applet instance ${payload.appletInstanceId}`);
@@ -371,6 +375,7 @@ class TabRegistry {
     if (result.deletedSessionId) {
       delete this.appletSessions[result.deletedSessionId];
     }
+    return result.deletedSessionId;
   }
 
   moveAppletInstance(payload: MoveAppletInstancePayload): void {
@@ -703,6 +708,7 @@ class TabRegistry {
 }
 
 let registry: TabRegistry;
+let terminalManager: TerminalManager;
 
 function workspaceDatabasePath(): string {
   const dataDir = process.env.UNIT0_DATA_DIR ?? app.getPath("userData");
@@ -1148,6 +1154,13 @@ function escapeHtml(value: string): string {
 app.whenReady().then(() => {
   const workspaceStore = new WorkspaceStateStore(workspaceDatabasePath());
   registry = new TabRegistry(workspaceStore);
+  terminalManager = new TerminalManager((payload) => {
+    for (const browserWindow of windows.values()) {
+      if (!browserWindow.isDestroyed()) {
+        browserWindow.webContents.send("terminal:data", payload);
+      }
+    }
+  });
   Menu.setApplicationMenu(null);
   ipcMain.handle("unit:bootstrap", (event) => payloadFor(BrowserWindow.fromWebContents(event.sender)?.id ?? 0));
   ipcMain.handle("tabs:bootstrap", (event) => payloadFor(BrowserWindow.fromWebContents(event.sender)?.id ?? 0));
@@ -1228,7 +1241,10 @@ app.whenReady().then(() => {
     return applet;
   });
   ipcMain.handle("applets:closeAppletInstance", (_event, payload: CloseAppletInstancePayload) => {
-    registry.closeAppletInstance(payload);
+    const deletedSessionId = registry.closeAppletInstance(payload);
+    if (deletedSessionId) {
+      terminalManager.dispose(deletedSessionId);
+    }
     broadcastState();
   });
   ipcMain.handle("applets:moveAppletInstance", (_event, payload: MoveAppletInstancePayload) => {
@@ -1243,13 +1259,22 @@ app.whenReady().then(() => {
       for (const detachedId of registry.beginShutdown()) {
         windows.get(detachedId)?.close();
       }
+      terminalManager.disposeAll();
       destroyCaptureOverlays();
     }
+  });
+  ipcMain.handle("terminal:start", (_event, payload: TerminalStartPayload) => terminalManager.start(payload));
+  ipcMain.on("terminal:input", (_event, payload: TerminalInputPayload) => {
+    terminalManager.input(payload);
+  });
+  ipcMain.handle("terminal:resize", (_event, payload: TerminalResizePayload) => {
+    terminalManager.resize(payload);
   });
   createWindow({ primary: true });
 });
 
 app.on("window-all-closed", () => {
+  terminalManager?.disposeAll();
   destroyCaptureOverlays();
   if (process.platform !== "darwin") {
     app.quit();

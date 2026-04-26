@@ -13,6 +13,10 @@ import type {
   ReplaceWorkspaceLayoutPayload,
   RegisterStripBoundsPayload,
   RenameWorkspacePayload,
+  TerminalDataPayload,
+  TerminalInputPayload,
+  TerminalResizePayload,
+  TerminalStartPayload,
   UnitApi,
   UpdateLayoutRatiosPayload,
   UpdateTabDragPayload
@@ -56,6 +60,16 @@ const api: UnitApi = {
     createApplet: (payload: CreateAppletPayload) => ipcRenderer.invoke("applets:createApplet", payload),
     closeAppletInstance: (payload: CloseAppletInstancePayload) => ipcRenderer.invoke("applets:closeAppletInstance", payload),
     moveAppletInstance: (payload: MoveAppletInstancePayload) => ipcRenderer.invoke("applets:moveAppletInstance", payload)
+  },
+  terminal: {
+    start: (payload: TerminalStartPayload) => ipcRenderer.invoke("terminal:start", payload),
+    input: (payload: TerminalInputPayload) => ipcRenderer.send("terminal:input", payload),
+    resize: (payload: TerminalResizePayload) => ipcRenderer.invoke("terminal:resize", payload),
+    onData: (callback: (payload: TerminalDataPayload) => void) => {
+      const handler = (_event: Electron.IpcRendererEvent, payload: TerminalDataPayload) => callback(payload);
+      ipcRenderer.on("terminal:data", handler);
+      return () => ipcRenderer.off("terminal:data", handler);
+    }
   }
 };
 

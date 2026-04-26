@@ -632,8 +632,8 @@ test("clamps splitter resize at the minimum applet size", async () => {
   const fileBox = await page.getByTestId("layout-leaf-atlas-file-viewer").boundingBox();
   expect(terminalBox).not.toBeNull();
   expect(fileBox).not.toBeNull();
-  expect(terminalBox!.width).toBeGreaterThanOrEqual(199);
-  expect(fileBox!.width).toBeGreaterThanOrEqual(199);
+  expect(terminalBox!.width).toBeGreaterThanOrEqual(49);
+  expect(fileBox!.width).toBeGreaterThanOrEqual(49);
 
   await app.close();
 });

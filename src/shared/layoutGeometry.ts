@@ -1,7 +1,7 @@
 import type { WorkspaceLayoutNode } from "./types";
 
 export const TILE_GUTTER_SIZE = 8;
-export const MIN_APPLET_SIZE = 200;
+export const MIN_APPLET_SIZE = 50;
 
 export type SplitDirection = "row" | "column";
 export type EdgeAxis = "vertical" | "horizontal";

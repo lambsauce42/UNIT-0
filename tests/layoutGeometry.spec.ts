@@ -157,11 +157,11 @@ test("resize projection clamps using every touching leaf", () => {
     first: leaf("left"),
     second: leaf("right")
   };
-  const geometry = computeCanonicalLayout(layout, { width: 508, height: 420 });
-  const target = resizeTargetAt(geometry, { x: 254, y: 120 });
+  const geometry = computeCanonicalLayout(layout, { width: 128, height: 120 });
+  const target = resizeTargetAt(geometry, { x: 64, y: 60 });
 
   expect(target).toBeTruthy();
   const projected = projectResize(geometry, target!, { x: 120, y: 0 }, MIN_APPLET_SIZE);
-  expect(projected.dx).toBe(50);
-  expect(projected.ratios.root).toBeCloseTo((250 + 50) / 500, 8);
+  expect(projected.dx).toBe(10);
+  expect(projected.ratios.root).toBeCloseTo((60 + 10) / 120, 8);
 });
