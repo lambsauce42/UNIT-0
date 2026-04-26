@@ -11,6 +11,7 @@ import type {
   FinishTabDragPayload,
   MoveAppletInstancePayload,
   OpenWorkspaceTabPayload,
+  ReplaceWorkspaceLayoutPayload,
   RectLike,
   RegisterStripBoundsPayload,
   RenameWorkspacePayload,
@@ -318,6 +319,14 @@ class TabRegistry {
       throw new Error(`Cannot update layout ratios for workspace ${payload.workspaceId}`);
     }
     this.workspaces[payload.workspaceId] = this.store.updateLayoutRatios(payload);
+  }
+
+  replaceLayout(payload: ReplaceWorkspaceLayoutPayload): void {
+    const workspace = this.workspaces[payload.workspaceId];
+    if (!workspace || this.dragSession) {
+      throw new Error(`Cannot replace layout for workspace ${payload.workspaceId}`);
+    }
+    this.workspaces[payload.workspaceId] = this.store.replaceWorkspaceLayout(payload);
   }
 
   createApplet(payload: CreateAppletPayload): AppletInstance {
@@ -1191,6 +1200,10 @@ app.whenReady().then(() => {
   });
   ipcMain.handle("workspaces:updateLayoutRatios", (_event, payload: UpdateLayoutRatiosPayload) => {
     registry.updateLayoutRatios(payload);
+    broadcastState();
+  });
+  ipcMain.handle("workspaces:replaceLayout", (_event, payload: ReplaceWorkspaceLayoutPayload) => {
+    registry.replaceLayout(payload);
     broadcastState();
   });
   ipcMain.handle("applets:createApplet", (_event, payload: CreateAppletPayload) => {

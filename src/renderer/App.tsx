@@ -34,7 +34,9 @@ import {
   completedEdgeGroups,
   computeCanonicalLayout,
   projectResize,
+  rebuildLayoutFromLeafRects,
   resizeTargetAt,
+  resizeLeafRectsForTarget,
   type CanonicalLayoutGeometry,
   type EdgeGroup,
   type ResizeTarget
@@ -739,8 +741,10 @@ function WorkspaceSurface({ state, workspace }: { state: UnitState; workspace: W
   const resizeDragRef = useRef<ResizeDragState | null>(null);
   const resizePublishRafRef = useRef<number | null>(null);
   const pendingResizeRatiosRef = useRef<Record<string, number> | null>(null);
+  const pendingResizeLayoutRef = useRef<WorkspaceLayoutNode | null>(null);
   const [layoutSize, setLayoutSize] = useState<LayoutSize>({ width: 0, height: 0 });
   const [ratioOverrides, setRatioOverrides] = useState<Record<string, number>>({});
+  const [layoutOverride, setLayoutOverride] = useState<WorkspaceLayoutNode | null>(null);
   const [hoverResizeTarget, setHoverResizeTarget] = useState<ResizeTarget | null>(null);
   const [resizeDrag, setResizeDrag] = useState<ResizeDragState | null>(null);
   const appletsById = useMemo(
@@ -768,8 +772,8 @@ function WorkspaceSurface({ state, workspace }: { state: UnitState; workspace: W
   );
   const ratioOverrideKey = JSON.stringify(ratioOverrides);
   const effectiveLayout = useMemo(
-    () => (workspace.layout ? applyRatioOverrides(workspace.layout, ratioOverrides) : null),
-    [workspace.layout, ratioOverrideKey]
+    () => layoutOverride ?? (workspace.layout ? applyRatioOverrides(workspace.layout, ratioOverrides) : null),
+    [layoutOverride, workspace.layout, ratioOverrideKey]
   );
   const layoutGeometry = useMemo(
     () =>
@@ -805,6 +809,7 @@ function WorkspaceSurface({ state, workspace }: { state: UnitState; workspace: W
   useEffect(() => {
     if (!resizeDragRef.current) {
       setRatioOverrides({});
+      setLayoutOverride(null);
     }
   }, [workspace.id, workspace.layout]);
   const localTilingPoint = useCallback((clientX: number, clientY: number): { x: number; y: number } | null => {
@@ -820,6 +825,7 @@ function WorkspaceSurface({ state, workspace }: { state: UnitState; workspace: W
   }, []);
   const publishResizeRatios = useCallback(
     (ratios: Record<string, number>) => {
+      pendingResizeLayoutRef.current = null;
       pendingResizeRatiosRef.current = ratios;
       if (resizePublishRafRef.current !== null) {
         return;
@@ -835,13 +841,37 @@ function WorkspaceSurface({ state, workspace }: { state: UnitState; workspace: W
     },
     [workspace.id]
   );
+  const publishResizeLayout = useCallback(
+    (layout: WorkspaceLayoutNode) => {
+      pendingResizeRatiosRef.current = null;
+      pendingResizeLayoutRef.current = layout;
+      if (resizePublishRafRef.current !== null) {
+        return;
+      }
+      resizePublishRafRef.current = window.requestAnimationFrame(() => {
+        resizePublishRafRef.current = null;
+        const nextLayout = pendingResizeLayoutRef.current;
+        pendingResizeLayoutRef.current = null;
+        if (nextLayout) {
+          void window.unitApi.workspaces.replaceLayout({ workspaceId: workspace.id, layout: nextLayout });
+        }
+      });
+    },
+    [workspace.id]
+  );
   const flushResizeRatios = useCallback(() => {
     if (resizePublishRafRef.current !== null) {
       window.cancelAnimationFrame(resizePublishRafRef.current);
       resizePublishRafRef.current = null;
     }
     const nextRatios = pendingResizeRatiosRef.current;
+    const nextLayout = pendingResizeLayoutRef.current;
     pendingResizeRatiosRef.current = null;
+    pendingResizeLayoutRef.current = null;
+    if (nextLayout) {
+      void window.unitApi.workspaces.replaceLayout({ workspaceId: workspace.id, layout: nextLayout });
+      return;
+    }
     if (nextRatios && Object.keys(nextRatios).length > 0) {
       void window.unitApi.workspaces.updateLayoutRatios({ workspaceId: workspace.id, ratios: nextRatios });
     }
@@ -886,8 +916,17 @@ function WorkspaceSurface({ state, workspace }: { state: UnitState; workspace: W
         x: point.x - drag.startX,
         y: point.y - drag.startY
       });
+      if (requiresStructuralResize(drag.geometry, drag.target)) {
+        const resizedLeaves = resizeLeafRectsForTarget(drag.geometry, drag.target, projected.dx, projected.dy);
+        const nextLayout = rebuildLayoutFromLeafRects(drag.layout, resizedLeaves, drag.geometry.rect);
+        setLayoutOverride(nextLayout);
+        setRatioOverrides({});
+        publishResizeLayout(nextLayout);
+        return;
+      }
       const nextRatios = compensatedResizeRatios(drag, projected.ratios, projected.dx, projected.dy, layoutSize);
       setRatioOverrides((current) => ({ ...current, ...nextRatios }));
+      setLayoutOverride(null);
       publishResizeRatios(nextRatios);
     };
     const finishDrag = (event: PointerEvent) => {
@@ -911,7 +950,7 @@ function WorkspaceSurface({ state, workspace }: { state: UnitState; workspace: W
         resizePublishRafRef.current = null;
       }
     };
-  }, [flushResizeRatios, layoutSize, localTilingPoint, publishResizeRatios]);
+  }, [flushResizeRatios, layoutSize, localTilingPoint, publishResizeLayout, publishResizeRatios]);
   const dropTargetFor = useCallback(
     (clientX: number, clientY: number, draggedInstanceId: string): AppletDropTarget | null => {
       const surface = surfaceRef.current;
@@ -1179,6 +1218,42 @@ function compensatedResizeRatios(
   return nextRatios;
 }
 
+function requiresStructuralResize(geometry: CanonicalLayoutGeometry, target: ResizeTarget): boolean {
+  return [target.vertical, target.horizontal]
+    .filter((group): group is EdgeGroup => group !== null)
+    .some((group) => groupRequiresStructuralResize(geometry, group));
+}
+
+function groupRequiresStructuralResize(geometry: CanonicalLayoutGeometry, group: EdgeGroup): boolean {
+  const touchedBefore = new Set(group.edges.map((edge) => edge.beforeLeafId));
+  const touchedAfter = new Set(group.edges.map((edge) => edge.afterLeafId));
+  const splits = new Map(geometry.splits.map((split) => [split.id, split]));
+  for (const splitId of new Set(group.edges.map((edge) => edge.splitId))) {
+    const split = splits.get(splitId);
+    if (!split) {
+      continue;
+    }
+    const firstIds = new Set(split.firstLeafIds);
+    const secondIds = new Set(split.secondLeafIds);
+    if (!sameSet(firstIds, touchedBefore) || !sameSet(secondIds, touchedAfter)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function sameSet(left: Set<string>, right: Set<string>): boolean {
+  if (left.size !== right.size) {
+    return false;
+  }
+  for (const value of left) {
+    if (!right.has(value)) {
+      return false;
+    }
+  }
+  return true;
+}
+
 function addBranchCompensation(
   startGeometry: CanonicalLayoutGeometry,
   previewGeometry: CanonicalLayoutGeometry,
@@ -1322,7 +1397,7 @@ function liveGroupForSnapshot(snapshot: EdgeGroup, liveGroups: EdgeGroup[]): Edg
 }
 
 function edgeSignature(edge: EdgeGroup["edges"][number]): string {
-  return `${edge.splitId}:${edge.beforeLeafId}:${edge.afterLeafId}`;
+  return `${edge.beforeLeafId}:${edge.afterLeafId}`;
 }
 
 function combineDisplayGroups(groups: EdgeGroup[]): EdgeGroup {

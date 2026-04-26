@@ -538,11 +538,9 @@ test("drags a splitter edge and persists the updated ratio", async () => {
   let app = await launchApp(dataDir);
   let page = await firstWindow(app);
   await page.getByTestId("workspace-tab-atlas").click();
-  const beforeRatio = await layoutRatio(page, "atlas", "atlas-layout-root");
   const beforeBox = await page.getByTestId("layout-leaf-atlas-terminal").boundingBox();
   const splitter = page.locator('[data-testid="layout-splitter-vertical"]').first();
   const splitterBox = await splitter.boundingBox();
-  expect(beforeRatio).not.toBeNull();
   expect(beforeBox).not.toBeNull();
   expect(splitterBox).not.toBeNull();
 
@@ -552,9 +550,9 @@ test("drags a splitter edge and persists the updated ratio", async () => {
   await page.mouse.up();
 
   await expect(async () => {
-    const afterRatio = await layoutRatio(page, "atlas", "atlas-layout-root");
-    expect(afterRatio).not.toBeNull();
-    expect(afterRatio!).toBeGreaterThan(beforeRatio!);
+    const afterBox = await page.getByTestId("layout-leaf-atlas-terminal").boundingBox();
+    expect(afterBox).not.toBeNull();
+    expect(afterBox!.width).toBeGreaterThan(beforeBox!.width);
   }).toPass();
   const afterBox = await page.getByTestId("layout-leaf-atlas-terminal").boundingBox();
   expect(afterBox).not.toBeNull();
@@ -564,9 +562,9 @@ test("drags a splitter edge and persists the updated ratio", async () => {
   app = await launchApp(dataDir);
   page = await firstWindow(app);
   await page.getByTestId("workspace-tab-atlas").click();
-  const restartedRatio = await layoutRatio(page, "atlas", "atlas-layout-root");
-  expect(restartedRatio).not.toBeNull();
-  expect(restartedRatio!).toBeGreaterThan(beforeRatio!);
+  const restartedBox = await page.getByTestId("layout-leaf-atlas-terminal").boundingBox();
+  expect(restartedBox).not.toBeNull();
+  expect(restartedBox!.width).toBeGreaterThan(beforeBox!.width);
 
   await app.close();
 });

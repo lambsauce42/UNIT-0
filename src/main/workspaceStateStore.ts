@@ -47,6 +47,11 @@ export type UpdateLayoutRatiosOptions = {
   ratios: Record<string, number>;
 };
 
+export type ReplaceWorkspaceLayoutOptions = {
+  workspaceId: string;
+  layout: WorkspaceLayoutNode;
+};
+
 const DEFAULT_APPLET_SESSIONS: Record<string, AppletSession> = {
   "session-terminal": { id: "session-terminal", kind: "terminal", title: "Terminal" },
   "session-file-viewer": { id: "session-file-viewer", kind: "fileViewer", title: "File Viewer" },
@@ -457,6 +462,25 @@ export class WorkspaceStateStore {
     this.db.exec("BEGIN IMMEDIATE");
     try {
       this.saveWorkspaceLayoutInTransaction(workspace.id, nextLayout);
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+    return nextWorkspace;
+  }
+
+  replaceWorkspaceLayout(options: ReplaceWorkspaceLayoutOptions): Workspace {
+    const model = this.load();
+    const workspace = model.workspaces[options.workspaceId];
+    if (!workspace) {
+      throw new Error(`Workspace ${options.workspaceId} does not exist`);
+    }
+    validateWorkspaceLayoutForWorkspace(options.layout, workspace);
+    const nextWorkspace = { ...workspace, layout: options.layout };
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.saveWorkspaceLayoutInTransaction(workspace.id, options.layout);
       this.db.exec("COMMIT");
     } catch (error) {
       this.db.exec("ROLLBACK");

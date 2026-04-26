@@ -216,6 +216,33 @@ export function applyRatioOverrides(node: WorkspaceLayoutNode, ratios: Record<st
   };
 }
 
+export function resizeLeafRectsForTarget(
+  geometry: CanonicalLayoutGeometry,
+  target: ResizeTarget,
+  dx: number,
+  dy: number
+): CanonicalLeaf[] {
+  const leaves = geometry.leaves.map((leaf) => ({ ...leaf, rect: { ...leaf.rect } }));
+  const byId = new Map(leaves.map((leaf) => [leaf.id, leaf]));
+  if (target.vertical && dx !== 0) {
+    applyGroupDelta(byId, target.vertical, dx);
+  }
+  if (target.horizontal && dy !== 0) {
+    applyGroupDelta(byId, target.horizontal, dy);
+  }
+  return leaves;
+}
+
+export function rebuildLayoutFromLeafRects(
+  baseLayout: WorkspaceLayoutNode,
+  leaves: CanonicalLeaf[],
+  rect: IntRect,
+  gutterSize = TILE_GUTTER_SIZE
+): WorkspaceLayoutNode {
+  const reusableIds = reusableSplitIds(baseLayout);
+  return buildLayoutFromRects(leaves, rect, reusableIds, gutterSize);
+}
+
 function buildNodeGeometry(
   node: WorkspaceLayoutNode,
   rect: IntRect,
@@ -439,4 +466,165 @@ function addGroupRatios(
     }
     ratios[splitId] = (split.firstSize + delta) / split.availableSize;
   }
+}
+
+function applyGroupDelta(leaves: Map<string, CanonicalLeaf>, group: EdgeGroup, delta: number): void {
+  const beforeIds = new Set(group.edges.map((edge) => edge.beforeLeafId));
+  const afterIds = new Set(group.edges.map((edge) => edge.afterLeafId));
+  for (const leafId of beforeIds) {
+    const leaf = leaves.get(leafId);
+    if (!leaf) {
+      continue;
+    }
+    if (group.axis === "vertical") {
+      leaf.rect.right += delta;
+    } else {
+      leaf.rect.bottom += delta;
+    }
+  }
+  for (const leafId of afterIds) {
+    const leaf = leaves.get(leafId);
+    if (!leaf) {
+      continue;
+    }
+    if (group.axis === "vertical") {
+      leaf.rect.left += delta;
+    } else {
+      leaf.rect.top += delta;
+    }
+  }
+}
+
+function reusableSplitIds(layout: WorkspaceLayoutNode): Map<string, string> {
+  const ids = new Map<string, string>();
+  const visit = (node: WorkspaceLayoutNode): string[] => {
+    if (node.type === "leaf") {
+      return [node.id];
+    }
+    const first = visit(node.first);
+    const second = visit(node.second);
+    ids.set(splitPartitionKey(node.direction, first, second), node.id);
+    return [...first, ...second].sort();
+  };
+  visit(layout);
+  return ids;
+}
+
+function buildLayoutFromRects(
+  leaves: CanonicalLeaf[],
+  rect: IntRect,
+  reusableIds: Map<string, string>,
+  gutterSize: number
+): WorkspaceLayoutNode {
+  if (leaves.length === 1) {
+    return { id: leaves[0].id, type: "leaf", appletInstanceId: leaves[0].appletInstanceId };
+  }
+  const verticalCut = findVerticalCut(leaves, rect, gutterSize);
+  if (verticalCut) {
+    return splitFromCut("row", verticalCut.left, verticalCut.right, leaves, rect, reusableIds, gutterSize);
+  }
+  const horizontalCut = findHorizontalCut(leaves, rect, gutterSize);
+  if (horizontalCut) {
+    return splitFromCut("column", horizontalCut.top, horizontalCut.bottom, leaves, rect, reusableIds, gutterSize);
+  }
+  throw new Error("Cannot rebuild workspace layout from non-slicing applet rectangles");
+}
+
+function splitFromCut(
+  direction: SplitDirection,
+  cutStart: number,
+  cutEnd: number,
+  leaves: CanonicalLeaf[],
+  rect: IntRect,
+  reusableIds: Map<string, string>,
+  gutterSize: number
+): WorkspaceLayoutNode {
+  const firstLeaves =
+    direction === "row" ? leaves.filter((leaf) => leaf.rect.right <= cutStart) : leaves.filter((leaf) => leaf.rect.bottom <= cutStart);
+  const secondLeaves =
+    direction === "row" ? leaves.filter((leaf) => leaf.rect.left >= cutEnd) : leaves.filter((leaf) => leaf.rect.top >= cutEnd);
+  const firstRect =
+    direction === "row"
+      ? { left: rect.left, top: rect.top, right: cutStart, bottom: rect.bottom }
+      : { left: rect.left, top: rect.top, right: rect.right, bottom: cutStart };
+  const secondRect =
+    direction === "row"
+      ? { left: cutEnd, top: rect.top, right: rect.right, bottom: rect.bottom }
+      : { left: rect.left, top: cutEnd, right: rect.right, bottom: rect.bottom };
+  const first = buildLayoutFromRects(firstLeaves, firstRect, reusableIds, gutterSize);
+  const second = buildLayoutFromRects(secondLeaves, secondRect, reusableIds, gutterSize);
+  const firstIds = collectLeafNodeIds(first);
+  const secondIds = collectLeafNodeIds(second);
+  const availableSize = Math.max(1, (direction === "row" ? rect.right - rect.left : rect.bottom - rect.top) - gutterSize);
+  const firstSize = direction === "row" ? cutStart - rect.left : cutStart - rect.top;
+  return {
+    id:
+      reusableIds.get(splitPartitionKey(direction, firstIds, secondIds)) ??
+      `split-${direction}-${[...firstIds, ...secondIds].sort().join("-")}`,
+    type: "split",
+    direction,
+    ratio: firstSize / availableSize,
+    first,
+    second
+  };
+}
+
+function findVerticalCut(leaves: CanonicalLeaf[], rect: IntRect, gutterSize: number): { left: number; right: number } | null {
+  const candidates = [...new Set(leaves.map((leaf) => leaf.rect.right))]
+    .filter((cut) => cut > rect.left && cut + gutterSize < rect.right)
+    .sort((left, right) => left - right);
+  for (const left of candidates) {
+    const right = left + gutterSize;
+    if (validCut(leaves, "row", left, right)) {
+      return { left, right };
+    }
+  }
+  return null;
+}
+
+function findHorizontalCut(leaves: CanonicalLeaf[], rect: IntRect, gutterSize: number): { top: number; bottom: number } | null {
+  const candidates = [...new Set(leaves.map((leaf) => leaf.rect.bottom))]
+    .filter((cut) => cut > rect.top && cut + gutterSize < rect.bottom)
+    .sort((left, right) => left - right);
+  for (const top of candidates) {
+    const bottom = top + gutterSize;
+    if (validCut(leaves, "column", top, bottom)) {
+      return { top, bottom };
+    }
+  }
+  return null;
+}
+
+function validCut(leaves: CanonicalLeaf[], direction: SplitDirection, cutStart: number, cutEnd: number): boolean {
+  let firstCount = 0;
+  let secondCount = 0;
+  for (const leaf of leaves) {
+    if (direction === "row") {
+      if (leaf.rect.right <= cutStart) {
+        firstCount += 1;
+      } else if (leaf.rect.left >= cutEnd) {
+        secondCount += 1;
+      } else {
+        return false;
+      }
+    } else if (leaf.rect.bottom <= cutStart) {
+      firstCount += 1;
+    } else if (leaf.rect.top >= cutEnd) {
+      secondCount += 1;
+    } else {
+      return false;
+    }
+  }
+  return firstCount > 0 && secondCount > 0;
+}
+
+function collectLeafNodeIds(node: WorkspaceLayoutNode): string[] {
+  if (node.type === "leaf") {
+    return [node.id];
+  }
+  return [...collectLeafNodeIds(node.first), ...collectLeafNodeIds(node.second)].sort();
+}
+
+function splitPartitionKey(direction: SplitDirection, firstLeafIds: string[], secondLeafIds: string[]): string {
+  return `${direction}:${[...firstLeafIds].sort().join(",")}|${[...secondLeafIds].sort().join(",")}`;
 }

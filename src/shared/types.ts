@@ -160,6 +160,11 @@ export interface UpdateLayoutRatiosPayload {
   ratios: Record<string, number>;
 }
 
+export interface ReplaceWorkspaceLayoutPayload {
+  workspaceId: string;
+  layout: WorkspaceLayoutNode;
+}
+
 export interface CreateAppletPayload {
   workspaceId: string;
   kind: AppletKind;
@@ -202,6 +207,7 @@ export interface UnitApi {
     openWorkspaceTab: (payload: OpenWorkspaceTabPayload) => Promise<void>;
     renameWorkspace: (payload: RenameWorkspacePayload) => Promise<void>;
     updateLayoutRatios: (payload: UpdateLayoutRatiosPayload) => Promise<void>;
+    replaceLayout: (payload: ReplaceWorkspaceLayoutPayload) => Promise<void>;
   };
   applets: {
     createApplet: (payload: CreateAppletPayload) => Promise<AppletInstance>;

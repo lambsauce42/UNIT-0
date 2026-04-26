@@ -10,6 +10,7 @@ import type {
   FinishTabDragPayload,
   MoveAppletInstancePayload,
   OpenWorkspaceTabPayload,
+  ReplaceWorkspaceLayoutPayload,
   RegisterStripBoundsPayload,
   RenameWorkspacePayload,
   UnitApi,
@@ -48,7 +49,8 @@ const api: UnitApi = {
     openWorkspaceTab: (payload: OpenWorkspaceTabPayload) => ipcRenderer.invoke("workspaces:openWorkspaceTab", payload),
     renameWorkspace: (payload: RenameWorkspacePayload) => ipcRenderer.invoke("workspaces:renameWorkspace", payload),
     updateLayoutRatios: (payload: UpdateLayoutRatiosPayload) =>
-      ipcRenderer.invoke("workspaces:updateLayoutRatios", payload)
+      ipcRenderer.invoke("workspaces:updateLayoutRatios", payload),
+    replaceLayout: (payload: ReplaceWorkspaceLayoutPayload) => ipcRenderer.invoke("workspaces:replaceLayout", payload)
   },
   applets: {
     createApplet: (payload: CreateAppletPayload) => ipcRenderer.invoke("applets:createApplet", payload),
