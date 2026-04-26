@@ -178,6 +178,12 @@ export interface CloseAppletInstancePayload {
   appletInstanceId: string;
 }
 
+export interface ChangeAppletInstanceKindPayload {
+  workspaceId: string;
+  appletInstanceId: string;
+  kind: AppletKind;
+}
+
 export interface MoveAppletInstancePayload {
   workspaceId: string;
   appletInstanceId: string;
@@ -241,6 +247,7 @@ export interface UnitApi {
   applets: {
     createApplet: (payload: CreateAppletPayload) => Promise<AppletInstance>;
     closeAppletInstance: (payload: CloseAppletInstancePayload) => Promise<void>;
+    changeAppletInstanceKind: (payload: ChangeAppletInstanceKindPayload) => Promise<void>;
     moveAppletInstance: (payload: MoveAppletInstancePayload) => Promise<void>;
   };
   terminal: {

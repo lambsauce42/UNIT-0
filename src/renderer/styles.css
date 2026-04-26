@@ -561,7 +561,8 @@ button {
   text-align: left;
 }
 
-.applet-picker-menu button:hover {
+.applet-picker-menu button:hover,
+.applet-picker-menu button.active {
   background: var(--bg-hover);
 }
 

@@ -389,6 +389,35 @@ test("applet picker spawns a selected applet kind", async () => {
   await app.close();
 });
 
+test("applet change type button updates the mounted applet kind", async () => {
+  const dataDir = makeDataDir();
+  let app = await launchApp(dataDir);
+  let page = await firstWindow(app);
+  await page.getByTestId("workspace-tab-atlas").click();
+
+  await page.locator('[data-applet-instance-id="atlas-terminal"]').getByLabel("Terminal change applet type").click();
+  await page.getByRole("menuitemradio", { name: "Chat" }).click();
+
+  await expect(page.locator('section[data-applet-instance-id="atlas-terminal"]')).toHaveAttribute(
+    "data-testid",
+    "applet-chat"
+  );
+  const state = await appState(page);
+  const instance = state.workspaces.atlas.applets.find((item) => item.id === "atlas-terminal");
+  expect(instance).toBeTruthy();
+  expect(state.appletSessions[instance!.sessionId]?.kind).toBe("chat");
+  await app.close();
+
+  app = await launchApp(dataDir);
+  page = await firstWindow(app);
+  await page.getByTestId("workspace-tab-atlas").click();
+  await expect(page.locator('section[data-applet-instance-id="atlas-terminal"]')).toHaveAttribute(
+    "data-testid",
+    "applet-chat"
+  );
+  await app.close();
+});
+
 test("drags an applet to a root edge with preview and persists placement", async () => {
   const dataDir = makeDataDir();
   let app = await launchApp(dataDir);

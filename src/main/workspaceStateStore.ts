@@ -32,6 +32,14 @@ export type AppletMutationResult = {
   appletSessions: Record<string, AppletSession>;
   instance?: AppletInstance;
   deletedSessionId?: string;
+  changedSessionId?: string;
+  previousKind?: AppletKind;
+};
+
+export type ChangeAppletKindOptions = {
+  workspaceId: string;
+  appletInstanceId: string;
+  kind: AppletKind;
 };
 
 export type MoveAppletOptions = {
@@ -423,6 +431,53 @@ export class WorkspaceStateStore {
       delete appletSessions[deletedSessionId];
     }
     return { workspace: nextWorkspace, appletSessions, deletedSessionId };
+  }
+
+  changeAppletInstanceKind(options: ChangeAppletKindOptions): AppletMutationResult {
+    const model = this.load();
+    const workspace = model.workspaces[options.workspaceId];
+    if (!workspace) {
+      throw new Error(`Workspace ${options.workspaceId} does not exist`);
+    }
+    const instance = workspace.applets.find((item) => item.id === options.appletInstanceId);
+    if (!instance) {
+      throw new Error(`Applet instance ${options.appletInstanceId} does not exist in workspace ${options.workspaceId}`);
+    }
+    const currentSession = model.appletSessions[instance.sessionId];
+    if (!currentSession) {
+      throw new Error(`Applet instance ${options.appletInstanceId} references missing session ${instance.sessionId}`);
+    }
+    if (currentSession.kind === options.kind) {
+      return { workspace, appletSessions: model.appletSessions, changedSessionId: currentSession.id, previousKind: currentSession.kind };
+    }
+
+    const nextSession: AppletSession = {
+      ...currentSession,
+      kind: options.kind,
+      title: titleForAppletKind(options.kind)
+    };
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db
+        .prepare("UPDATE applet_sessions SET kind = ?, title = ? WHERE id = ?")
+        .run(nextSession.kind, nextSession.title, nextSession.id);
+      this.db.prepare("UPDATE applet_instances SET area = ? WHERE id = ? AND workspace_id = ?").run(
+        nextSession.kind,
+        options.appletInstanceId,
+        options.workspaceId
+      );
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+
+    return {
+      workspace,
+      appletSessions: { ...model.appletSessions, [nextSession.id]: nextSession },
+      changedSessionId: nextSession.id,
+      previousKind: currentSession.kind
+    };
   }
 
   moveAppletInstance(options: MoveAppletOptions): Workspace {

@@ -7,9 +7,9 @@ import {
   Globe,
   Grid2X2,
   Monitor,
-  MoreHorizontal,
   Plus,
   Power,
+  Replace,
   Search,
   Settings,
   SquareTerminal,
@@ -2066,7 +2066,8 @@ function AppletFrame({
   onCancelAppletDrag: () => void;
 }) {
   const Icon = iconByKind[session.kind];
-  const [menuOpen, setMenuOpen] = useState(false);
+  const [addMenuOpen, setAddMenuOpen] = useState(false);
+  const [changeMenuOpen, setChangeMenuOpen] = useState(false);
   const dragRef = useRef<{
     pointerId: number;
     startX: number;
@@ -2077,6 +2078,16 @@ function AppletFrame({
   } | null>(null);
   const canSplitAnyDirection = canSplitRow || canSplitColumn;
   const pickerSplitDirection = canSplitRow ? "row" : "column";
+  const changeAppletKind = (kind: AppletKind) => {
+    if (kind === session.kind) {
+      return;
+    }
+    void window.unitApi.applets.changeAppletInstanceKind({
+      workspaceId,
+      appletInstanceId: instanceId,
+      kind
+    });
+  };
   const createApplet = (kind: AppletKind, splitDirection: "row" | "column") => {
     if ((splitDirection === "row" && !canSplitRow) || (splitDirection === "column" && !canSplitColumn)) {
       return;
@@ -2089,18 +2100,20 @@ function AppletFrame({
     });
   };
   useEffect(() => {
-    if (!menuOpen) {
+    if (!addMenuOpen && !changeMenuOpen) {
       return;
     }
     const closeMenu = (event: PointerEvent) => {
       if (event.target instanceof Element && event.target.closest(`[data-applet-instance-id="${instanceId}"]`)) {
         return;
       }
-      setMenuOpen(false);
+      setAddMenuOpen(false);
+      setChangeMenuOpen(false);
     };
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
-        setMenuOpen(false);
+        setAddMenuOpen(false);
+        setChangeMenuOpen(false);
       }
     };
     document.addEventListener("pointerdown", closeMenu);
@@ -2109,7 +2122,7 @@ function AppletFrame({
       document.removeEventListener("pointerdown", closeMenu);
       document.removeEventListener("keydown", onKeyDown);
     };
-  }, [instanceId, menuOpen]);
+  }, [addMenuOpen, changeMenuOpen, instanceId]);
   useEffect(() => {
     const onPointerMove = (event: PointerEvent) => {
       const drag = dragRef.current;
@@ -2204,14 +2217,17 @@ function AppletFrame({
               className="icon-button"
               type="button"
               aria-haspopup="menu"
-              aria-expanded={menuOpen}
+              aria-expanded={addMenuOpen}
               aria-label={`${session.title} add applet`}
               disabled={!canSplitAnyDirection}
-              onClick={() => setMenuOpen((open) => !open)}
+              onClick={() => {
+                setAddMenuOpen((open) => !open);
+                setChangeMenuOpen(false);
+              }}
             >
               <Plus size={16} />
             </button>
-            {menuOpen ? (
+            {addMenuOpen ? (
               <div className="applet-picker-menu" role="menu">
                 {appletCatalog.map((item) => {
                   const ItemIcon = iconByKind[item.kind];
@@ -2222,7 +2238,45 @@ function AppletFrame({
                       type="button"
                       onClick={() => {
                         createApplet(item.kind, pickerSplitDirection);
-                        setMenuOpen(false);
+                        setAddMenuOpen(false);
+                      }}
+                    >
+                      <ItemIcon size={14} />
+                      <span>{item.label}</span>
+                    </button>
+                  );
+                })}
+              </div>
+            ) : null}
+          </div>
+          <div className="applet-picker">
+            <button
+              className="icon-button"
+              type="button"
+              aria-haspopup="menu"
+              aria-expanded={changeMenuOpen}
+              aria-label={`${session.title} change applet type`}
+              onClick={() => {
+                setChangeMenuOpen((open) => !open);
+                setAddMenuOpen(false);
+              }}
+            >
+              <Replace size={16} />
+            </button>
+            {changeMenuOpen ? (
+              <div className="applet-picker-menu" role="menu">
+                {appletCatalog.map((item) => {
+                  const ItemIcon = iconByKind[item.kind];
+                  return (
+                    <button
+                      key={item.kind}
+                      className={item.kind === session.kind ? "active" : undefined}
+                      role="menuitemradio"
+                      aria-checked={item.kind === session.kind}
+                      type="button"
+                      onClick={() => {
+                        changeAppletKind(item.kind);
+                        setChangeMenuOpen(false);
                       }}
                     >
                       <ItemIcon size={14} />
@@ -2260,9 +2314,6 @@ function AppletFrame({
             }}
           >
             <Trash2 size={15} />
-          </button>
-          <button className="icon-button" type="button" aria-label={`${session.title} menu`}>
-            <MoreHorizontal size={17} />
           </button>
         </div>
       </header>

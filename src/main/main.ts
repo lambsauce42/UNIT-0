@@ -2,9 +2,11 @@ import { app, BrowserWindow, Menu, ipcMain, screen } from "electron";
 import fs from "node:fs";
 import path from "node:path";
 import type {
+  AppletKind,
   AppletSession,
   BeginTabDragPayload,
   BootstrapPayload,
+  ChangeAppletInstanceKindPayload,
   CloseAppletInstancePayload,
   CloseTabPayload,
   CreateAppletPayload,
@@ -387,6 +389,22 @@ class TabRegistry {
       delete this.appletSessions[result.deletedSessionId];
     }
     return result.deletedSessionId;
+  }
+
+  changeAppletInstanceKind(payload: ChangeAppletInstanceKindPayload): { sessionId: string; previousKind: AppletKind } {
+    const workspace = this.workspaces[payload.workspaceId];
+    if (!workspace || this.dragSession) {
+      throw new Error(`Cannot change applet instance ${payload.appletInstanceId}`);
+    }
+    const result = this.store.changeAppletInstanceKind(payload);
+    this.workspaces[payload.workspaceId] = result.workspace;
+    for (const [sessionId, session] of Object.entries(result.appletSessions)) {
+      this.appletSessions[sessionId] = session;
+    }
+    if (!result.changedSessionId || !result.previousKind) {
+      throw new Error("Applet kind change did not return a changed session");
+    }
+    return { sessionId: result.changedSessionId, previousKind: result.previousKind };
   }
 
   moveAppletInstance(payload: MoveAppletInstancePayload): void {
@@ -783,6 +801,10 @@ function scheduleDragBroadcast(): void {
     dragBroadcastTimer = null;
     broadcastState();
   }, 16);
+}
+
+function isTerminalAppletKind(kind: AppletKind): boolean {
+  return kind === "terminal" || kind === "wslTerminal";
 }
 
 async function loadRenderer(browserWindow: BrowserWindow): Promise<void> {
@@ -1255,6 +1277,16 @@ app.whenReady().then(() => {
     const deletedSessionId = registry.closeAppletInstance(payload);
     if (deletedSessionId) {
       terminalManager.dispose(deletedSessionId);
+    }
+    broadcastState();
+  });
+  ipcMain.handle("applets:changeAppletInstanceKind", (_event, payload: ChangeAppletInstanceKindPayload) => {
+    const result = registry.changeAppletInstanceKind(payload);
+    if (
+      result.previousKind !== payload.kind &&
+      (isTerminalAppletKind(result.previousKind) || isTerminalAppletKind(payload.kind))
+    ) {
+      terminalManager.dispose(result.sessionId);
     }
     broadcastState();
   });

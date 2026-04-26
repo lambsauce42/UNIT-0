@@ -3,6 +3,7 @@ import type {
   ActivateTabPayload,
   BeginTabDragPayload,
   BootstrapPayload,
+  ChangeAppletInstanceKindPayload,
   CloseTabPayload,
   CloseAppletInstancePayload,
   CreateAppletPayload,
@@ -59,6 +60,8 @@ const api: UnitApi = {
   applets: {
     createApplet: (payload: CreateAppletPayload) => ipcRenderer.invoke("applets:createApplet", payload),
     closeAppletInstance: (payload: CloseAppletInstancePayload) => ipcRenderer.invoke("applets:closeAppletInstance", payload),
+    changeAppletInstanceKind: (payload: ChangeAppletInstanceKindPayload) =>
+      ipcRenderer.invoke("applets:changeAppletInstanceKind", payload),
     moveAppletInstance: (payload: MoveAppletInstancePayload) => ipcRenderer.invoke("applets:moveAppletInstance", payload)
   },
   terminal: {
