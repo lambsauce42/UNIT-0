@@ -803,6 +803,13 @@ function WorkspaceSurface({ state, workspace }: { state: UnitState; workspace: W
     () => (layoutGeometry ? completedEdgeGroups(layoutGeometry.primitiveEdges, layoutGeometry.leaves) : []),
     [layoutGeometry]
   );
+  const resizeEnabledGroups = useMemo(
+    () =>
+      layoutGeometry
+        ? completedGroups.filter((group) => resizeGroupMeetsMinimumSize(layoutGeometry, group))
+        : [],
+    [completedGroups, layoutGeometry]
+  );
   useLayoutEffect(() => {
     const surface = surfaceRef.current;
     if (!surface) {
@@ -907,7 +914,12 @@ function WorkspaceSurface({ state, workspace }: { state: UnitState; workspace: W
   }, [workspace.id]);
   const beginResizeDrag = useCallback(
     (event: ReactPointerEvent<HTMLElement>, target: ResizeTarget) => {
-      if (!layoutGeometry || !effectiveLayout || event.button !== 0) {
+      if (
+        !layoutGeometry ||
+        !effectiveLayout ||
+        event.button !== 0 ||
+        !resizeTargetMeetsMinimumSize(layoutGeometry, target)
+      ) {
         return;
       }
       const point = localTilingPoint(event.clientX, event.clientY);
@@ -1116,7 +1128,7 @@ function WorkspaceSurface({ state, workspace }: { state: UnitState; workspace: W
   const draggedApplet = appletDrag ? appletByInstanceId.get(appletDrag.instanceId) : null;
   const DragIcon = draggedApplet?.session ? iconByKind[draggedApplet.session.kind] : SquareTerminal;
   const activeResizeTarget = resizeDrag?.target ?? hoverResizeTarget;
-  const activeResizeGroups = resizeGroupsForTarget(activeResizeTarget, completedGroups);
+  const activeResizeGroups = resizeGroupsForTarget(activeResizeTarget, resizeEnabledGroups);
   return (
     <section className="workspace-surface" data-testid="workspace-surface" ref={surfaceRef}>
       {effectiveLayout && layoutGeometry ? (
@@ -1133,14 +1145,15 @@ function WorkspaceSurface({ state, workspace }: { state: UnitState; workspace: W
               return;
             }
             const point = localTilingPoint(clientX, clientY);
-            setHoverResizeTarget(point ? resizeTargetAt(layoutGeometry, point) : null);
+            const target = point ? resizeTargetAt(layoutGeometry, point) : null;
+            setHoverResizeTarget(target && resizeTargetMeetsMinimumSize(layoutGeometry, target) ? target : null);
           }}
           onLeaveResizeTarget={() => {
             if (!resizeDragRef.current) {
               setHoverResizeTarget(null);
             }
           }}
-          completedGroups={completedGroups}
+          completedGroups={resizeEnabledGroups}
           activeGroups={activeResizeGroups}
           onBeginResizeDrag={beginResizeDrag}
         />
@@ -1405,7 +1418,12 @@ function clampStructuralAxis(
 function validStructuralResize(drag: ResizeDragState, dx: number, dy: number): boolean {
   try {
     const leaves = resizeLeafRectsForTarget(drag.geometry, drag.target, dx, dy);
-    if (!leaves.every((leaf) => rectMeetsMinSize(leaf.rect))) {
+    const affectedLeafIds = affectedResizeLeafIds(drag.target);
+    if (
+      !leaves.every(
+        (leaf) => !affectedLeafIds.has(leaf.id) || resizeTargetLeafMeetsMinimum(drag.target, leaf.rect)
+      )
+    ) {
       return false;
     }
     const layout = rebuildLayoutFromLeafRects(drag.layout, leaves, drag.geometry.rect);
@@ -1413,7 +1431,9 @@ function validStructuralResize(drag: ResizeDragState, dx: number, dy: number): b
       width: drag.geometry.rect.right - drag.geometry.rect.left,
       height: drag.geometry.rect.bottom - drag.geometry.rect.top
     });
-    return geometry.leaves.every((leaf) => rectMeetsMinSize(leaf.rect));
+    return geometry.leaves.every(
+      (leaf) => !affectedLeafIds.has(leaf.id) || resizeTargetLeafMeetsMinimum(drag.target, leaf.rect)
+    );
   } catch {
     return false;
   }
@@ -1421,6 +1441,59 @@ function validStructuralResize(drag: ResizeDragState, dx: number, dy: number): b
 
 function rectMeetsMinSize(rect: { left: number; top: number; right: number; bottom: number }): boolean {
   return rect.right - rect.left >= MIN_APPLET_SIZE && rect.bottom - rect.top >= MIN_APPLET_SIZE;
+}
+
+function resizeTargetMeetsMinimumSize(geometry: CanonicalLayoutGeometry, target: ResizeTarget): boolean {
+  const leavesById = new Map(geometry.leaves.map((leaf) => [leaf.id, leaf]));
+  for (const leafId of affectedResizeLeafIds(target)) {
+    const leaf = leavesById.get(leafId);
+    if (!leaf || !resizeTargetLeafMeetsMinimum(target, leaf.rect)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function resizeGroupMeetsMinimumSize(geometry: CanonicalLayoutGeometry, group: EdgeGroup): boolean {
+  const leavesById = new Map(geometry.leaves.map((leaf) => [leaf.id, leaf]));
+  for (const leafId of affectedGroupLeafIds(group)) {
+    const leaf = leavesById.get(leafId);
+    if (!leaf || !resizeGroupLeafMeetsMinimum(group, leaf.rect)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function resizeTargetLeafMeetsMinimum(
+  target: ResizeTarget,
+  rect: { left: number; top: number; right: number; bottom: number }
+): boolean {
+  return (
+    (!target.vertical || rect.right - rect.left >= MIN_APPLET_SIZE) &&
+    (!target.horizontal || rect.bottom - rect.top >= MIN_APPLET_SIZE)
+  );
+}
+
+function resizeGroupLeafMeetsMinimum(
+  group: EdgeGroup,
+  rect: { left: number; top: number; right: number; bottom: number }
+): boolean {
+  return group.axis === "vertical"
+    ? rect.right - rect.left >= MIN_APPLET_SIZE
+    : rect.bottom - rect.top >= MIN_APPLET_SIZE;
+}
+
+function affectedResizeLeafIds(target: ResizeTarget): Set<string> {
+  return new Set(
+    [target.vertical, target.horizontal]
+      .filter((group): group is EdgeGroup => group !== null)
+      .flatMap((group) => [...affectedGroupLeafIds(group)])
+  );
+}
+
+function affectedGroupLeafIds(group: EdgeGroup): Set<string> {
+  return new Set(group.edges.flatMap((edge) => [edge.beforeLeafId, edge.afterLeafId]));
 }
 
 function addBranchCompensation(

@@ -503,10 +503,13 @@ test("splits a pane down with stacked geometry", async () => {
   await page.getByLabel("Workspace name").fill("Stacked Split Workspace");
   await page.getByRole("button", { name: "Create" }).click();
   await page.getByRole("button", { name: "New terminal" }).last().click();
+  await expect(page.getByTestId("applet-terminal")).toHaveCount(1);
   const beforeLeaves = await layoutLeafOrder(page);
 
   const instanceId = beforeLeaves[0];
-  await page.locator(`[data-applet-instance-id="${instanceId}"]`).getByLabel("Terminal split down").click();
+  const splitDown = page.locator(`[data-applet-instance-id="${instanceId}"]`).getByLabel("Terminal split down");
+  await expect(splitDown).toBeEnabled();
+  await splitDown.click();
   await expect(async () => {
     expect(await layoutLeafOrder(page)).toHaveLength(beforeLeaves.length + 1);
   }).toPass();
