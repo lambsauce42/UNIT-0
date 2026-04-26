@@ -73,9 +73,6 @@ const api: UnitApi = {
       ipcRenderer.on("terminal:data", handler);
       return () => ipcRenderer.off("terminal:data", handler);
     }
-  },
-  debug: {
-    resizeLog: (payload: unknown) => ipcRenderer.send("debug:resizeLog", payload)
   }
 };
 

@@ -126,49 +126,6 @@ type ResizeSnapGuide = {
 const WORKSPACE_SURFACE_PADDING = 10;
 const RESIZE_SNAP_RADIUS = 8;
 
-function resizeDebugEnabled(): boolean {
-  try {
-    return localStorage.getItem("unit0.resizeDebug") === "1" || window.location.search.includes("resizeDebug=1");
-  } catch {
-    return false;
-  }
-}
-
-function logResizeDebug(event: string, payload: unknown): void {
-  const entry = {
-    at: new Date().toISOString(),
-    event,
-    payload
-  };
-  window.unitApi.debug.resizeLog(entry);
-  if (!resizeDebugEnabled()) {
-    return;
-  }
-  console.log(`[unit0:resize] ${event}`, payload);
-  try {
-    const key = "unit0.resizeDebugLog";
-    const current = JSON.parse(localStorage.getItem(key) ?? "[]") as unknown;
-    const entries = Array.isArray(current) ? current : [];
-    entries.push(entry);
-    localStorage.setItem(key, JSON.stringify(entries.slice(-300)));
-  } catch {
-    // Debug logging must not affect resize behavior.
-  }
-}
-
-function installResizeDebugHelpers(): void {
-  try {
-    Object.assign(window, {
-      unitResizeDebugDump: () => JSON.parse(localStorage.getItem("unit0.resizeDebugLog") ?? "[]"),
-      unitResizeDebugClear: () => localStorage.removeItem("unit0.resizeDebugLog")
-    });
-  } catch {
-    // Debug helpers are best-effort and must not affect app startup.
-  }
-}
-
-installResizeDebugHelpers();
-
 export function App() {
   const [payload, setPayload] = useState<BootstrapPayload | null>(null);
 
@@ -801,7 +758,6 @@ function WorkspaceSurface({ state, workspace }: { state: UnitState; workspace: W
   const resizePublishRafRef = useRef<number | null>(null);
   const pendingResizeRatiosRef = useRef<Record<string, number> | null>(null);
   const pendingResizeLayoutRef = useRef<WorkspaceLayoutNode | null>(null);
-  const lastResizeDebugKeyRef = useRef("");
   const [layoutSize, setLayoutSize] = useState<LayoutSize>({ width: 0, height: 0 });
   const [ratioOverrides, setRatioOverrides] = useState<Record<string, number>>({});
   const [layoutOverride, setLayoutOverride] = useState<WorkspaceLayoutNode | null>(null);
@@ -903,10 +859,9 @@ function WorkspaceSurface({ state, workspace }: { state: UnitState; workspace: W
         const nextRatios = pendingResizeRatiosRef.current;
         pendingResizeRatiosRef.current = null;
         if (nextRatios && Object.keys(nextRatios).length > 0) {
-          logResizeDebug("persist-ratios", { workspaceId: workspace.id, ratios: nextRatios });
           void window.unitApi.workspaces
             .updateLayoutRatios({ workspaceId: workspace.id, ratios: nextRatios })
-            .catch((error) => logResizeDebug("persist-ratios-error", errorMessage(error)));
+            .catch((error) => console.error("Failed to update layout ratios", error));
         }
       });
     },
@@ -924,10 +879,9 @@ function WorkspaceSurface({ state, workspace }: { state: UnitState; workspace: W
         const nextLayout = pendingResizeLayoutRef.current;
         pendingResizeLayoutRef.current = null;
         if (nextLayout) {
-          logResizeDebug("persist-layout", { workspaceId: workspace.id, layout: summarizeLayout(nextLayout) });
           void window.unitApi.workspaces
             .replaceLayout({ workspaceId: workspace.id, layout: nextLayout })
-            .catch((error) => logResizeDebug("persist-layout-error", errorMessage(error)));
+            .catch((error) => console.error("Failed to replace workspace layout", error));
         }
       });
     },
@@ -943,17 +897,15 @@ function WorkspaceSurface({ state, workspace }: { state: UnitState; workspace: W
     pendingResizeRatiosRef.current = null;
     pendingResizeLayoutRef.current = null;
     if (nextLayout) {
-      logResizeDebug("flush-layout", { workspaceId: workspace.id, layout: summarizeLayout(nextLayout) });
       void window.unitApi.workspaces
         .replaceLayout({ workspaceId: workspace.id, layout: nextLayout })
-        .catch((error) => logResizeDebug("flush-layout-error", errorMessage(error)));
+        .catch((error) => console.error("Failed to replace workspace layout", error));
       return;
     }
     if (nextRatios && Object.keys(nextRatios).length > 0) {
-      logResizeDebug("flush-ratios", { workspaceId: workspace.id, ratios: nextRatios });
       void window.unitApi.workspaces
         .updateLayoutRatios({ workspaceId: workspace.id, ratios: nextRatios })
-        .catch((error) => logResizeDebug("flush-ratios-error", errorMessage(error)));
+        .catch((error) => console.error("Failed to update layout ratios", error));
     }
   }, [workspace.id]);
   const beginResizeDrag = useCallback(
@@ -984,36 +936,10 @@ function WorkspaceSurface({ state, workspace }: { state: UnitState; workspace: W
         layout: effectiveLayout
       };
       resizeDragRef.current = nextDrag;
-      lastResizeDebugKeyRef.current = "";
       setResizeDrag(nextDrag);
       setHoverResizeTarget(target);
-      logResizeDebug("begin", {
-        workspaceId: workspace.id,
-        point,
-        grabOffset: { x: nextDrag.grabOffsetX, y: nextDrag.grabOffsetY },
-        target: summarizeResizeTarget(target),
-        snapCandidates: summarizeSnapCandidates(layoutGeometry, target),
-        completedGroups: completedEdgeGroups(layoutGeometry.primitiveEdges, layoutGeometry.leaves).map(summarizeGroup),
-        layoutSize,
-        splits: layoutGeometry.splits.map((split) => ({
-          id: split.id,
-          direction: split.direction,
-          rect: split.rect,
-          gutterRect: split.gutterRect,
-          firstLeafIds: split.firstLeafIds,
-          secondLeafIds: split.secondLeafIds,
-          firstSize: split.firstSize,
-          secondSize: split.secondSize,
-          availableSize: split.availableSize
-        })),
-        leaves: layoutGeometry.leaves.map((leaf) => ({
-          id: leaf.id,
-          appletInstanceId: leaf.appletInstanceId,
-          rect: leaf.rect
-        }))
-      });
     },
-    [effectiveLayout, layoutGeometry, layoutSize, localTilingPoint, workspace.id]
+    [effectiveLayout, layoutGeometry, localTilingPoint]
   );
   useEffect(() => {
     const onPointerMove = (event: PointerEvent) => {
@@ -1033,51 +959,11 @@ function WorkspaceSurface({ state, workspace }: { state: UnitState; workspace: W
       const snapped = snapTrace.snapped;
       const projected = projectResize(drag.geometry, drag.target, snapped);
       const structural = requiresStructuralResize(drag.geometry, drag.target);
-      const debugKey = `${rawDelta.x}:${rawDelta.y}:${snapped.x}:${snapped.y}:${projected.dx}:${projected.dy}:${structural}`;
-      if (debugKey !== lastResizeDebugKeyRef.current) {
-        lastResizeDebugKeyRef.current = debugKey;
-        logResizeDebug("project", {
-          point,
-          altKey: event.altKey,
-          rawDelta,
-          snappedDelta: { x: snapped.x, y: snapped.y },
-          snapGuides: snapped.guides,
-          snapTrace,
-          clampedDelta: { x: projected.dx, y: projected.dy },
-          structural,
-          ratios: projected.ratios,
-          target: summarizeResizeTarget(drag.target),
-          pointerDownTarget: summarizeResizeTarget(drag.target)
-        });
-      }
       if (structural) {
         const structuralDelta = clampStructuralResize(drag, projected.dx, projected.dy);
-        if ((projected.dx !== 0 || projected.dy !== 0) && structuralDelta.dx === 0 && structuralDelta.dy === 0) {
-          logResizeDebug("structural-clamped-to-zero", {
-            requestedDelta: { dx: projected.dx, dy: projected.dy },
-            rawDelta,
-            snappedDelta: { x: snapped.x, y: snapped.y },
-            snapGuides: snapped.guides,
-            target: summarizeResizeTarget(drag.target),
-            pointerDownTarget: summarizeResizeTarget(drag.target),
-            invalidAtRequested: structuralResizeInvalidReason(drag, projected.dx, projected.dy),
-            invalidAtRaw: structuralResizeInvalidReason(drag, rawDelta.x, rawDelta.y),
-            leaves: drag.geometry.leaves.map((leaf) => ({
-              id: leaf.id,
-              appletInstanceId: leaf.appletInstanceId,
-              rect: leaf.rect
-            }))
-          });
-        }
         setResizeSnapGuides(activeSnapGuides(drag.target, snapped.guides, structuralDelta.dx, structuralDelta.dy, snapped));
         const resizedLeaves = resizeLeafRectsForTarget(drag.geometry, drag.target, structuralDelta.dx, structuralDelta.dy);
         const nextLayout = rebuildLayoutFromLeafRects(drag.layout, resizedLeaves, drag.geometry.rect);
-        logResizeDebug("structural-layout", {
-          requestedDelta: { dx: projected.dx, dy: projected.dy },
-          structuralDelta,
-          leaves: resizedLeaves.map((leaf) => ({ id: leaf.id, appletInstanceId: leaf.appletInstanceId, rect: leaf.rect })),
-          layout: summarizeLayout(nextLayout)
-        });
         setLayoutOverride(nextLayout);
         setRatioOverrides({});
         publishResizeLayout(nextLayout);
@@ -1085,26 +971,6 @@ function WorkspaceSurface({ state, workspace }: { state: UnitState; workspace: W
       }
       setResizeSnapGuides(activeSnapGuides(drag.target, snapped.guides, projected.dx, projected.dy, snapped));
       const nextRatios = compensatedResizeRatios(drag, projected.ratios, projected.dx, projected.dy, layoutSize);
-      if (
-        (rawDelta.x !== 0 || rawDelta.y !== 0) &&
-        projected.dx === 0 &&
-        projected.dy === 0 &&
-        !structural
-      ) {
-        logResizeDebug("ratio-clamped-to-zero", {
-          rawDelta,
-          snappedDelta: { x: snapped.x, y: snapped.y },
-          snapGuides: snapped.guides,
-          target: summarizeResizeTarget(drag.target),
-          pointerDownTarget: summarizeResizeTarget(drag.target),
-          ratios: projected.ratios,
-          leaves: drag.geometry.leaves.map((leaf) => ({
-            id: leaf.id,
-            appletInstanceId: leaf.appletInstanceId,
-            rect: leaf.rect
-          }))
-        });
-      }
       setRatioOverrides((current) => ({ ...current, ...nextRatios }));
       setLayoutOverride(null);
       publishResizeRatios(nextRatios);
@@ -1117,7 +983,6 @@ function WorkspaceSurface({ state, workspace }: { state: UnitState; workspace: W
       resizeDragRef.current = null;
       setResizeDrag(null);
       setResizeSnapGuides([]);
-      logResizeDebug("end", { workspaceId: workspace.id });
       flushResizeRatios();
     };
     document.addEventListener("pointermove", onPointerMove);
@@ -1388,44 +1253,6 @@ function WorkspaceLayout({
   );
 }
 
-function summarizeResizeTarget(target: ResizeTarget) {
-  return {
-    type: target.type,
-    vertical: target.vertical ? summarizeGroup(target.vertical) : null,
-    horizontal: target.horizontal ? summarizeGroup(target.horizontal) : null
-  };
-}
-
-function summarizeGroup(group: EdgeGroup) {
-  return {
-    axis: group.axis,
-    center: group.center,
-    start: group.start,
-    end: group.end,
-    edges: group.edges.map((edge) => ({
-      splitId: edge.splitId,
-      beforeLeafId: edge.beforeLeafId,
-      afterLeafId: edge.afterLeafId,
-      start: edge.start,
-      end: edge.end
-    }))
-  };
-}
-
-function summarizeLayout(node: WorkspaceLayoutNode): unknown {
-  if (node.type === "leaf") {
-    return { id: node.id, type: node.type, appletInstanceId: node.appletInstanceId };
-  }
-  return {
-    id: node.id,
-    type: node.type,
-    direction: node.direction,
-    ratio: node.ratio,
-    first: summarizeLayout(node.first),
-    second: summarizeLayout(node.second)
-  };
-}
-
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
@@ -1571,27 +1398,6 @@ function snapCandidates(geometry: CanonicalLayoutGeometry, group: EdgeGroup): Sn
   return [...candidates.values()];
 }
 
-function summarizeSnapCandidates(geometry: CanonicalLayoutGeometry, target: ResizeTarget): unknown {
-  return {
-    vertical: target.vertical
-      ? {
-          groupCenter: target.vertical.center,
-          candidates: snapCandidates(geometry, target.vertical)
-            .sort((left, right) => left.center - right.center || left.start - right.start || left.end - right.end)
-            .map(({ center, start, end, edgeCount }) => ({ center, start, end, edgeCount }))
-        }
-      : null,
-    horizontal: target.horizontal
-      ? {
-          groupCenter: target.horizontal.center,
-          candidates: snapCandidates(geometry, target.horizontal)
-            .sort((left, right) => left.center - right.center || left.start - right.start || left.end - right.end)
-            .map(({ center, start, end, edgeCount }) => ({ center, start, end, edgeCount }))
-        }
-      : null
-  };
-}
-
 function activeSnapGuides(
   target: ResizeTarget,
   guides: ResizeSnapGuide[],
@@ -1705,10 +1511,6 @@ function clampStructuralAxis(
 }
 
 function validStructuralResize(drag: ResizeDragState, dx: number, dy: number): boolean {
-  return structuralResizeInvalidReason(drag, dx, dy) === null;
-}
-
-function structuralResizeInvalidReason(drag: ResizeDragState, dx: number, dy: number): unknown {
   try {
     const leaves = resizeLeafRectsForTarget(drag.geometry, drag.target, dx, dy);
     const affectedLeafIds = affectedResizeLeafIds(drag.target);
@@ -1717,41 +1519,18 @@ function structuralResizeInvalidReason(drag: ResizeDragState, dx: number, dy: nu
         (leaf) => !affectedLeafIds.has(leaf.id) || resizeTargetLeafMeetsMinimum(drag.target, leaf.rect)
       )
     ) {
-      return {
-        reason: "minimum-size",
-        affectedLeafIds: [...affectedLeafIds],
-        leaves: leaves.map((leaf) => ({ id: leaf.id, appletInstanceId: leaf.appletInstanceId, rect: leaf.rect }))
-      };
+      return false;
     }
     const layout = rebuildLayoutFromLeafRects(drag.layout, leaves, drag.geometry.rect);
     const geometry = computeCanonicalLayout(layout, {
       width: drag.geometry.rect.right - drag.geometry.rect.left,
       height: drag.geometry.rect.bottom - drag.geometry.rect.top
     });
-    if (
-      !geometry.leaves.every(
-        (leaf) => !affectedLeafIds.has(leaf.id) || resizeTargetLeafMeetsMinimum(drag.target, leaf.rect)
-      )
-    ) {
-      return {
-        reason: "rebuilt-minimum-size",
-        affectedLeafIds: [...affectedLeafIds],
-        leaves: geometry.leaves.map((leaf) => ({ id: leaf.id, appletInstanceId: leaf.appletInstanceId, rect: leaf.rect })),
-        layout: summarizeLayout(layout)
-      };
-    }
-    return null;
-  } catch (error) {
-    return {
-      reason: "rebuild-error",
-      message: errorMessage(error),
-      target: summarizeResizeTarget(drag.target),
-      movedLeaves: resizeLeafRectsForTarget(drag.geometry, drag.target, dx, dy).map((leaf) => ({
-        id: leaf.id,
-        appletInstanceId: leaf.appletInstanceId,
-        rect: leaf.rect
-      }))
-    };
+    return geometry.leaves.every(
+      (leaf) => !affectedLeafIds.has(leaf.id) || resizeTargetLeafMeetsMinimum(drag.target, leaf.rect)
+    );
+  } catch {
+    return false;
   }
 }
 
