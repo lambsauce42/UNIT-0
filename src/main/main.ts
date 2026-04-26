@@ -28,6 +28,7 @@ import type {
   UpdateLayoutRatiosPayload,
   UpdateTabDragPayload,
   Workspace,
+  WorkspaceLayoutNode,
   AppletInstance,
   WorkspaceTab
 } from "../shared/types.js";
@@ -721,6 +722,27 @@ function payloadFor(windowId: number): BootstrapPayload {
   return { windowId, state: registry.snapshot() };
 }
 
+function workspaceAppletCloseSummary(workspace: Workspace | undefined): object {
+  if (!workspace) {
+    return { workspaceFound: false };
+  }
+  return {
+    workspaceFound: true,
+    workspaceId: workspace.id,
+    appletIds: workspace.applets.map((instance) => instance.id),
+    sessionIds: workspace.applets.map((instance) => instance.sessionId),
+    layoutAppletIds: workspace.layout ? collectLayoutAppletIds(workspace.layout) : [],
+    layout: workspace.layout
+  };
+}
+
+function collectLayoutAppletIds(node: WorkspaceLayoutNode): string[] {
+  if (node.type === "leaf") {
+    return [node.appletInstanceId];
+  }
+  return [...collectLayoutAppletIds(node.first), ...collectLayoutAppletIds(node.second)];
+}
+
 function stripCorrection(windowId: number): { dx: number; dy: number } {
   const browserWindow = windows.get(windowId);
   if (!browserWindow || browserWindow.isDestroyed()) {
@@ -1247,10 +1269,29 @@ app.whenReady().then(() => {
     return applet;
   });
   ipcMain.handle("applets:closeAppletInstance", (_event, payload: CloseAppletInstancePayload) => {
-    const deletedSessionId = registry.closeAppletInstance(payload);
+    console.info("[unit0:applet-close] main close requested", {
+      ...payload,
+      before: workspaceAppletCloseSummary(registry.workspaces[payload.workspaceId])
+    });
+    let deletedSessionId: string | undefined;
+    try {
+      deletedSessionId = registry.closeAppletInstance(payload);
+    } catch (error) {
+      console.error("[unit0:applet-close] main close failed", {
+        ...payload,
+        error,
+        afterFailure: workspaceAppletCloseSummary(registry.workspaces[payload.workspaceId])
+      });
+      throw error;
+    }
     if (deletedSessionId) {
       terminalManager.dispose(deletedSessionId);
     }
+    console.info("[unit0:applet-close] main close committed", {
+      ...payload,
+      deletedSessionId,
+      after: workspaceAppletCloseSummary(registry.workspaces[payload.workspaceId])
+    });
     broadcastState();
   });
   ipcMain.handle("applets:changeAppletInstanceKind", (_event, payload: ChangeAppletInstanceKindPayload) => {

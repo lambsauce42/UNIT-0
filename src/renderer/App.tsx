@@ -1,25 +1,42 @@
 import {
+  Activity,
   Bot,
   Code2,
   Columns2,
+  Database,
+  FolderOpen,
+  Globe,
+  GitBranch,
+  Grid2X2,
+  Layers3,
+  LayoutDashboard,
+  Monitor,
   PanelRight,
   PanelTop,
-  Globe,
-  Grid2X2,
-  Monitor,
   Plus,
   Power,
+  RadioTower,
+  RefreshCw,
   Replace,
   Search,
+  Server,
   Settings,
   SquareTerminal,
-  Trash2,
-  X
+  Trash2
 } from "lucide-react";
 import { FitAddon } from "@xterm/addon-fit";
 import { Terminal as XTerm } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type PointerEvent as ReactPointerEvent,
+  type SVGProps
+} from "react";
 import type {
   AppletKind,
   AppletSession,
@@ -125,6 +142,15 @@ type ResizeSnapGuide = {
 
 const WORKSPACE_SURFACE_PADDING = 10;
 const RESIZE_SNAP_RADIUS = 8;
+const TERMINAL_PTY_RESIZE_SETTLE_MS = 90;
+
+function TabCloseIcon(props: SVGProps<SVGSVGElement>) {
+  return (
+    <svg aria-hidden="true" focusable="false" viewBox="0 0 14 14" {...props}>
+      <path d="M3.65 3.65 10.35 10.35M10.35 3.65 3.65 10.35" />
+    </svg>
+  );
+}
 
 export function App() {
   const [payload, setPayload] = useState<BootstrapPayload | null>(null);
@@ -580,9 +606,8 @@ function WorkspaceTabStrip({ host, state, windowId }: { host: TabHostState; stat
         <Grid2X2 size={14} />
         <span>{tab.title}</span>
         {tab.closable ? (
-          <X
+          <TabCloseIcon
             className="tab-close"
-            size={14}
             onPointerDown={(event) => event.stopPropagation()}
             onClick={(event) => {
               event.stopPropagation();
@@ -726,25 +751,225 @@ function WorkspaceNameDialog({
 function WorkspaceManagerSurface({ state }: { state: UnitState }) {
   const workspaces = Object.values(state.workspaces).filter((workspace) => workspace.id !== "manager");
   const primaryHost = state.hosts[state.primaryWindowId];
+  const sessions = Object.values(state.appletSessions);
+  const mountedSessionCounts = workspaces.reduce<Record<string, number>>((counts, workspace) => {
+    for (const applet of workspace.applets) {
+      counts[applet.sessionId] = (counts[applet.sessionId] ?? 0) + 1;
+    }
+    return counts;
+  }, {});
+  const activeHostCount = Object.values(state.hosts).filter((host) => host.tabIds.length > 0).length;
+  const activeWorkspaceCount = new Set(
+    Object.values(state.hosts)
+      .flatMap((host) => host.tabIds)
+      .map((tabId) => state.tabs[tabId]?.workspaceId)
+      .filter((workspaceId): workspaceId is string => Boolean(workspaceId) && workspaceId !== "manager")
+  ).size;
+  const appletCount = workspaces.reduce((count, workspace) => count + workspace.applets.length, 0);
+  const sharedSessionCount = Object.values(mountedSessionCounts).filter((count) => count > 1).length;
+  const kindCounts = sessions.reduce<Record<AppletKind, number>>(
+    (counts, session) => ({ ...counts, [session.kind]: counts[session.kind] + 1 }),
+    { terminal: 0, wslTerminal: 0, fileViewer: 0, browser: 0, chat: 0, sandbox: 0 }
+  );
+  const runtimeRows = [
+    { icon: SquareTerminal, label: "Terminals", value: kindCounts.terminal + kindCounts.wslTerminal, tone: "green" },
+    { icon: Globe, label: "Browsers", value: kindCounts.browser, tone: "blue" },
+    { icon: Bot, label: "Chats", value: kindCounts.chat, tone: "violet" },
+    { icon: Monitor, label: "Sandboxes", value: kindCounts.sandbox, tone: "amber" }
+  ];
   return (
     <section className="workspace-manager" data-testid="workspace-manager">
-      <div className="manager-list">
-        {workspaces.map((workspace) => (
-          <button
-            className="manager-row"
-            data-testid={`workspace-manager-row-${workspace.id}`}
-            key={workspace.id}
-            onClick={() => {
-              if (primaryHost) {
-                void window.unitApi.workspaces.openWorkspaceTab({ windowId: primaryHost.windowId, workspaceId: workspace.id });
-              }
-            }}
-            type="button"
-          >
-            <span>{workspace.title}</span>
-            <span>{workspace.applets.length}</span>
+      <div className="manager-command">
+        <div className="manager-title-block">
+          <span className="manager-kicker">UNIT-0</span>
+          <h1>Workspace Manager</h1>
+        </div>
+        <label className="manager-search">
+          <Search size={16} />
+          <input aria-label="Search workspaces" placeholder="Search workspaces, sessions, files, chats" />
+        </label>
+        <div className="manager-actions">
+          <button className="manager-action-button primary" type="button">
+            <Plus size={16} />
+            <span>Workspace</span>
           </button>
-        ))}
+          <button className="manager-action-button" type="button">
+            <LayoutDashboard size={16} />
+            <span>Template</span>
+          </button>
+        </div>
+      </div>
+
+      <div className="manager-metrics" aria-label="Workspace summary">
+        <div>
+          <span>{workspaces.length}</span>
+          <small>Workspaces</small>
+        </div>
+        <div>
+          <span>{activeWorkspaceCount}</span>
+          <small>Open</small>
+        </div>
+        <div>
+          <span>{sessions.length}</span>
+          <small>Sessions</small>
+        </div>
+        <div>
+          <span>{sharedSessionCount}</span>
+          <small>Shared</small>
+        </div>
+        <div>
+          <span>{appletCount}</span>
+          <small>Applets</small>
+        </div>
+        <div>
+          <span>{activeHostCount}</span>
+          <small>Windows</small>
+        </div>
+      </div>
+
+      <div className="manager-grid">
+        <section className="manager-panel manager-library">
+          <div className="manager-panel-header">
+            <div>
+              <h2>Workspace Library</h2>
+              <span>Project context, layout, sessions, runtime state</span>
+            </div>
+            <button className="icon-button" type="button" aria-label="Workspace library settings">
+              <Settings size={16} />
+            </button>
+          </div>
+          <div className="manager-table">
+            <div className="manager-table-head">
+              <span>Workspace</span>
+              <span>Mounted</span>
+              <span>Runtime</span>
+              <span>Status</span>
+            </div>
+            {workspaces.map((workspace, index) => {
+              const open = Object.values(state.hosts).some((host) =>
+                host.tabIds.some((tabId) => state.tabs[tabId]?.workspaceId === workspace.id)
+              );
+              const primaryKinds = workspace.applets
+                .slice(0, 3)
+                .map((applet) => state.appletSessions[applet.sessionId]?.kind)
+                .filter((kind): kind is AppletKind => Boolean(kind));
+              return (
+                <button
+                  className="manager-workspace-row"
+                  data-testid={`workspace-manager-row-${workspace.id}`}
+                  key={workspace.id}
+                  onClick={() => {
+                    if (primaryHost) {
+                      void window.unitApi.workspaces.openWorkspaceTab({
+                        windowId: primaryHost.windowId,
+                        workspaceId: workspace.id
+                      });
+                    }
+                  }}
+                  type="button"
+                >
+                  <span className="manager-workspace-main">
+                    <FolderOpen size={17} />
+                    <span>
+                      <strong>{workspace.title}</strong>
+                      <small>{index === 0 ? "C:\\Users\\Max\\Desktop\\Code\\Unit-0" : "No project root linked"}</small>
+                    </span>
+                  </span>
+                  <span className="manager-kind-stack">
+                    {primaryKinds.map((kind, kindIndex) => {
+                      const Icon = iconByKind[kind];
+                      return <Icon key={`${workspace.id}-${kind}-${kindIndex}`} size={15} />;
+                    })}
+                    <small>{workspace.applets.length}</small>
+                  </span>
+                  <span className={`manager-runtime ${open ? "online" : ""}`}>
+                    <Activity size={14} />
+                    {open ? "Live" : "Idle"}
+                  </span>
+                  <span className="manager-status">
+                    <GitBranch size={14} />
+                    {index === 0 ? "main" : "clean"}
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+        </section>
+
+        <aside className="manager-side">
+          <section className="manager-panel">
+            <div className="manager-panel-header compact">
+              <div>
+                <h2>Runtime</h2>
+                <span>Active service surface</span>
+              </div>
+              <RadioTower size={17} />
+            </div>
+            <div className="manager-runtime-list">
+              {runtimeRows.map((row) => {
+                const Icon = row.icon;
+                return (
+                  <div className={`manager-runtime-row ${row.tone}`} key={row.label}>
+                    <Icon size={16} />
+                    <span>{row.label}</span>
+                    <strong>{row.value}</strong>
+                  </div>
+                );
+              })}
+            </div>
+          </section>
+
+          <section className="manager-panel">
+            <div className="manager-panel-header compact">
+              <div>
+                <h2>Templates</h2>
+                <span>Workspace launch shapes</span>
+              </div>
+              <Layers3 size={17} />
+            </div>
+            <div className="manager-template-list">
+              <button type="button">
+                <Code2 size={16} />
+                <span>Web App Debugging</span>
+              </button>
+              <button type="button">
+                <Bot size={16} />
+                <span>Research + Chat</span>
+              </button>
+              <button type="button">
+                <Server size={16} />
+                <span>Sandbox Lab</span>
+              </button>
+            </div>
+          </section>
+        </aside>
+
+        <section className="manager-panel manager-sessions">
+          <div className="manager-panel-header">
+            <div>
+              <h2>Shared Sessions</h2>
+              <span>Mountable applet runtime graph</span>
+            </div>
+            <Database size={17} />
+          </div>
+          <div className="manager-session-strip">
+            {sessions.slice(0, 6).map((session) => {
+              const Icon = iconByKind[session.kind];
+              const mountCount = mountedSessionCounts[session.id] ?? 0;
+              return (
+                <div className="manager-session-item" key={session.id}>
+                  <Icon size={17} />
+                  <span>
+                    <strong>{session.title}</strong>
+                    <small>
+                      {mountCount} mount{mountCount === 1 ? "" : "s"}
+                    </small>
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+        </section>
       </div>
     </section>
   );
@@ -764,6 +989,7 @@ function WorkspaceSurface({ state, workspace }: { state: UnitState; workspace: W
   const [hoverResizeTarget, setHoverResizeTarget] = useState<ResizeTarget | null>(null);
   const [resizeDrag, setResizeDrag] = useState<ResizeDragState | null>(null);
   const [resizeSnapGuides, setResizeSnapGuides] = useState<ResizeSnapGuide[]>([]);
+  const [switchSourceInstanceId, setSwitchSourceInstanceId] = useState<string | null>(null);
   const appletsById = useMemo(
     () =>
       new Map(
@@ -788,10 +1014,45 @@ function WorkspaceSurface({ state, workspace }: { state: UnitState; workspace: W
     [state.appletSessions, workspace.applets]
   );
   const ratioOverrideKey = JSON.stringify(ratioOverrides);
-  const effectiveLayout = useMemo(
-    () => layoutOverride ?? (workspace.layout ? applyRatioOverrides(workspace.layout, ratioOverrides) : null),
-    [layoutOverride, workspace.layout, ratioOverrideKey]
+  const workspaceAppletIdList = useMemo(() => workspace.applets.map((instance) => instance.id), [workspace.applets]);
+  const workspaceAppletIds = useMemo(() => new Set(workspaceAppletIdList), [workspaceAppletIdList]);
+  const layoutOverrideAppletIds = useMemo(
+    () => (layoutOverride ? collectLayoutAppletIds(layoutOverride) : []),
+    [layoutOverride]
   );
+  const layoutOverrideMatchesWorkspace =
+    layoutOverride !== null && sameStringMembers(layoutOverrideAppletIds, workspaceAppletIdList);
+  if (layoutOverride && !layoutOverrideMatchesWorkspace) {
+    console.error("[unit0:layout-integrity] stale layout override ignored", {
+      workspaceId: workspace.id,
+      workspaceAppletIds: workspaceAppletIdList,
+      workspaceLayoutAppletIds: workspace.layout ? collectLayoutAppletIds(workspace.layout) : [],
+      overrideLayoutAppletIds: layoutOverrideAppletIds,
+      ratioOverrideIds: Object.keys(ratioOverrides)
+    });
+  }
+  const activeLayoutOverride = layoutOverrideMatchesWorkspace ? layoutOverride : null;
+  const effectiveLayout = useMemo(
+    () => activeLayoutOverride ?? (workspace.layout ? applyRatioOverrides(workspace.layout, ratioOverrides) : null),
+    [activeLayoutOverride, workspace.layout, ratioOverrideKey]
+  );
+  const layoutSource = activeLayoutOverride ? "override" : "workspace";
+  const effectiveLayoutAppletIds = useMemo(
+    () => (effectiveLayout ? collectLayoutAppletIds(effectiveLayout) : []),
+    [effectiveLayout]
+  );
+  const missingEffectiveLayoutAppletIds = effectiveLayoutAppletIds.filter((appletId) => !workspaceAppletIds.has(appletId));
+  if (missingEffectiveLayoutAppletIds.length > 0) {
+    console.error("[unit0:layout-integrity] effective layout references missing applet(s)", {
+      workspaceId: workspace.id,
+      layoutSource,
+      missingAppletIds: missingEffectiveLayoutAppletIds,
+      workspaceAppletIds: workspace.applets.map((instance) => instance.id),
+      workspaceLayoutAppletIds: workspace.layout ? collectLayoutAppletIds(workspace.layout) : [],
+      overrideLayoutAppletIds: layoutOverride ? collectLayoutAppletIds(layoutOverride) : [],
+      ratioOverrideIds: Object.keys(ratioOverrides)
+    });
+  }
   const layoutGeometry = useMemo(
     () =>
       effectiveLayout && layoutSize.width > 0 && layoutSize.height > 0
@@ -836,6 +1097,16 @@ function WorkspaceSurface({ state, workspace }: { state: UnitState; workspace: W
       setLayoutOverride(null);
     }
   }, [workspace.id, workspace.layout]);
+  useEffect(() => {
+    if (layoutOverride && !layoutOverrideMatchesWorkspace) {
+      setLayoutOverride(null);
+    }
+  }, [layoutOverride, layoutOverrideMatchesWorkspace]);
+  useEffect(() => {
+    if (switchSourceInstanceId && !workspace.applets.some((instance) => instance.id === switchSourceInstanceId)) {
+      setSwitchSourceInstanceId(null);
+    }
+  }, [switchSourceInstanceId, workspace.applets]);
   const localTilingPoint = useCallback((clientX: number, clientY: number): { x: number; y: number } | null => {
     const surface = surfaceRef.current;
     if (!surface) {
@@ -1099,6 +1370,28 @@ function WorkspaceSurface({ state, workspace }: { state: UnitState; workspace: W
     appletDragRef.current = null;
     setAppletDrag(null);
   }, []);
+  const beginAppletSwitch = useCallback((instanceId: string) => {
+    setSwitchSourceInstanceId((current) => (current === instanceId ? null : instanceId));
+  }, []);
+  const selectAppletSwitchTarget = useCallback(
+    (targetInstanceId: string) => {
+      if (!switchSourceInstanceId || !workspace.layout) {
+        return;
+      }
+      if (targetInstanceId === switchSourceInstanceId) {
+        setSwitchSourceInstanceId(null);
+        return;
+      }
+      const nextLayout = swapLayoutAppletInstances(workspace.layout, switchSourceInstanceId, targetInstanceId);
+      setSwitchSourceInstanceId(null);
+      setRatioOverrides({});
+      setLayoutOverride(nextLayout);
+      void window.unitApi.workspaces
+        .replaceLayout({ workspaceId: workspace.id, layout: nextLayout })
+        .catch((error) => console.error("Failed to switch applet positions", error));
+    },
+    [switchSourceInstanceId, workspace.id, workspace.layout]
+  );
   const draggedApplet = appletDrag ? appletByInstanceId.get(appletDrag.instanceId) : null;
   const DragIcon = draggedApplet?.session ? iconByKind[draggedApplet.session.kind] : SquareTerminal;
   const activeResizeTarget = resizeDrag?.target ?? hoverResizeTarget;
@@ -1114,6 +1407,9 @@ function WorkspaceSurface({ state, workspace }: { state: UnitState; workspace: W
           onUpdateAppletDrag={updateAppletDrag}
           onFinishAppletDrag={finishAppletDrag}
           onCancelAppletDrag={cancelAppletDrag}
+          switchSourceInstanceId={switchSourceInstanceId}
+          onBeginAppletSwitch={beginAppletSwitch}
+          onSelectAppletSwitchTarget={selectAppletSwitchTarget}
           onHoverResizeTarget={(clientX, clientY) => {
             if (resizeDragRef.current) {
               return;
@@ -1182,6 +1478,9 @@ function WorkspaceLayout({
   onUpdateAppletDrag,
   onFinishAppletDrag,
   onCancelAppletDrag,
+  switchSourceInstanceId,
+  onBeginAppletSwitch,
+  onSelectAppletSwitchTarget,
   onHoverResizeTarget,
   onLeaveResizeTarget,
   completedGroups,
@@ -1196,6 +1495,9 @@ function WorkspaceLayout({
   onUpdateAppletDrag: (clientX: number, clientY: number) => void;
   onFinishAppletDrag: () => void;
   onCancelAppletDrag: () => void;
+  switchSourceInstanceId: string | null;
+  onBeginAppletSwitch: (instanceId: string) => void;
+  onSelectAppletSwitchTarget: (instanceId: string) => void;
   onHoverResizeTarget: (clientX: number, clientY: number) => void;
   onLeaveResizeTarget: () => void;
   completedGroups: EdgeGroup[];
@@ -1217,11 +1519,24 @@ function WorkspaceLayout({
       {geometry.leaves.map((leaf) => {
         const applet = appletsById.get(leaf.appletInstanceId);
         if (!applet?.session) {
+          console.error("[unit0:layout-render] layout leaf references missing applet instance", {
+            workspaceId,
+            leafId: leaf.id,
+            missingAppletId: leaf.appletInstanceId,
+            mountedAppletIds: [...appletsById.keys()],
+            geometryLeafAppletIds: geometry.leaves.map((geometryLeaf) => geometryLeaf.appletInstanceId)
+          });
           throw new Error(`Layout leaf references missing applet instance ${leaf.appletInstanceId}`);
         }
         return (
           <div
-            className="layout-leaf"
+            className={[
+              "layout-leaf",
+              switchSourceInstanceId === leaf.appletInstanceId ? "layout-leaf-switch-source" : "",
+              switchSourceInstanceId && switchSourceInstanceId !== leaf.appletInstanceId ? "layout-leaf-switch-target" : ""
+            ]
+              .filter(Boolean)
+              .join(" ")}
             data-testid={`layout-leaf-${leaf.appletInstanceId}`}
             data-layout-leaf-id={leaf.id}
             data-applet-instance-id={leaf.appletInstanceId}
@@ -1239,6 +1554,9 @@ function WorkspaceLayout({
               onUpdateAppletDrag={onUpdateAppletDrag}
               onFinishAppletDrag={onFinishAppletDrag}
               onCancelAppletDrag={onCancelAppletDrag}
+              switchSourceInstanceId={switchSourceInstanceId}
+              onBeginAppletSwitch={onBeginAppletSwitch}
+              onSelectAppletSwitchTarget={onSelectAppletSwitchTarget}
             />
           </div>
         );
@@ -1255,6 +1573,42 @@ function WorkspaceLayout({
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function swapLayoutAppletInstances(
+  node: WorkspaceLayoutNode,
+  firstInstanceId: string,
+  secondInstanceId: string
+): WorkspaceLayoutNode {
+  if (node.type === "leaf") {
+    if (node.appletInstanceId === firstInstanceId) {
+      return { ...node, appletInstanceId: secondInstanceId };
+    }
+    if (node.appletInstanceId === secondInstanceId) {
+      return { ...node, appletInstanceId: firstInstanceId };
+    }
+    return { ...node };
+  }
+  return {
+    ...node,
+    first: swapLayoutAppletInstances(node.first, firstInstanceId, secondInstanceId),
+    second: swapLayoutAppletInstances(node.second, firstInstanceId, secondInstanceId)
+  };
+}
+
+function collectLayoutAppletIds(node: WorkspaceLayoutNode): string[] {
+  if (node.type === "leaf") {
+    return [node.appletInstanceId];
+  }
+  return [...collectLayoutAppletIds(node.first), ...collectLayoutAppletIds(node.second)];
+}
+
+function sameStringMembers(left: string[], right: string[]): boolean {
+  if (left.length !== right.length) {
+    return false;
+  }
+  const rightSet = new Set(right);
+  return left.every((item) => rightSet.has(item));
 }
 
 type ResizeSnapTrace = {
@@ -1831,7 +2185,10 @@ function AppletFrame({
   onBeginAppletDrag,
   onUpdateAppletDrag,
   onFinishAppletDrag,
-  onCancelAppletDrag
+  onCancelAppletDrag,
+  switchSourceInstanceId,
+  onBeginAppletSwitch,
+  onSelectAppletSwitchTarget
 }: {
   session: AppletSession;
   instanceId: string;
@@ -1843,6 +2200,9 @@ function AppletFrame({
   onUpdateAppletDrag: (clientX: number, clientY: number) => void;
   onFinishAppletDrag: () => void;
   onCancelAppletDrag: () => void;
+  switchSourceInstanceId: string | null;
+  onBeginAppletSwitch: (instanceId: string) => void;
+  onSelectAppletSwitchTarget: (instanceId: string) => void;
 }) {
   const Icon = iconByKind[session.kind];
   const [addMenuOpen, setAddMenuOpen] = useState(false);
@@ -1856,7 +2216,6 @@ function AppletFrame({
     dragging: boolean;
   } | null>(null);
   const canSplitAnyDirection = canSplitRow || canSplitColumn;
-  const pickerSplitDirection = canSplitRow ? "row" : "column";
   const changeAppletKind = (kind: AppletKind) => {
     if (kind === session.kind) {
       return;
@@ -1961,10 +2320,32 @@ function AppletFrame({
     session.title
   ]);
   return (
-    <section className="applet-frame" data-testid={`applet-${session.kind}`} data-applet-instance-id={instanceId}>
+    <section
+      className={[
+        "applet-frame",
+        switchSourceInstanceId === instanceId ? "applet-frame-switch-source" : "",
+        switchSourceInstanceId && switchSourceInstanceId !== instanceId ? "applet-frame-switch-target" : ""
+      ]
+        .filter(Boolean)
+        .join(" ")}
+      data-testid={`applet-${session.kind}`}
+      data-applet-instance-id={instanceId}
+      onClick={(event) => {
+        if (!switchSourceInstanceId) {
+          return;
+        }
+        if (event.target instanceof Element && event.target.closest(".applet-actions")) {
+          return;
+        }
+        onSelectAppletSwitchTarget(instanceId);
+      }}
+    >
       <header
         className="applet-header"
         onPointerDown={(event) => {
+            if (switchSourceInstanceId) {
+              return;
+            }
             if (event.button !== 0) {
               return;
             }
@@ -2011,18 +2392,38 @@ function AppletFrame({
                 {appletCatalog.map((item) => {
                   const ItemIcon = iconByKind[item.kind];
                   return (
-                    <button
-                      key={item.kind}
-                      role="menuitem"
-                      type="button"
-                      onClick={() => {
-                        createApplet(item.kind, pickerSplitDirection);
-                        setAddMenuOpen(false);
-                      }}
-                    >
-                      <ItemIcon size={14} />
-                      <span>{item.label}</span>
-                    </button>
+                    <div className="applet-picker-menu-item" key={item.kind} role="none">
+                      <span className="applet-picker-menu-label">
+                        <ItemIcon size={14} />
+                        <span>{item.label}</span>
+                      </span>
+                      <span className="applet-picker-split-controls">
+                        <button
+                          aria-label={`Add ${item.label} split right`}
+                          disabled={!canSplitRow}
+                          role="menuitem"
+                          type="button"
+                          onClick={() => {
+                            createApplet(item.kind, "row");
+                            setAddMenuOpen(false);
+                          }}
+                        >
+                          <PanelRight size={15} />
+                        </button>
+                        <button
+                          aria-label={`Add ${item.label} split down`}
+                          disabled={!canSplitColumn}
+                          role="menuitem"
+                          type="button"
+                          onClick={() => {
+                            createApplet(item.kind, "column");
+                            setAddMenuOpen(false);
+                          }}
+                        >
+                          <PanelTop size={15} />
+                        </button>
+                      </span>
+                    </div>
                   );
                 })}
               </div>
@@ -2040,7 +2441,7 @@ function AppletFrame({
                 setAddMenuOpen(false);
               }}
             >
-              <Replace size={16} />
+              <RefreshCw size={16} />
             </button>
             {changeMenuOpen ? (
               <div className="applet-picker-menu" role="menu">
@@ -2067,6 +2468,19 @@ function AppletFrame({
             ) : null}
           </div>
           <button
+            className={switchSourceInstanceId === instanceId ? "icon-button active" : "icon-button"}
+            type="button"
+            aria-label={`${session.title} switch places`}
+            aria-pressed={switchSourceInstanceId === instanceId}
+            onClick={() => {
+              setAddMenuOpen(false);
+              setChangeMenuOpen(false);
+              onBeginAppletSwitch(instanceId);
+            }}
+          >
+            <Replace size={16} />
+          </button>
+          <button
             className="icon-button"
             type="button"
             aria-label={`${session.title} split right`}
@@ -2089,7 +2503,15 @@ function AppletFrame({
             type="button"
             aria-label={`${session.title} close`}
             onClick={() => {
-              void window.unitApi.applets.closeAppletInstance({ workspaceId, appletInstanceId: instanceId });
+              console.info("[unit0:applet-close] renderer close requested", {
+                workspaceId,
+                appletInstanceId: instanceId,
+                sessionId: session.id,
+                kind: session.kind
+              });
+              void window.unitApi.applets
+                .closeAppletInstance({ workspaceId, appletInstanceId: instanceId })
+                .catch((error) => console.error("[unit0:applet-close] renderer close failed", error));
             }}
           >
             <Trash2 size={15} />
@@ -2135,18 +2557,37 @@ function TerminalSurface({ session }: { session: AppletSession }) {
 
     let terminalDimensions = fitTerminal(container, fit, terminal);
     let resizeFrame: number | null = null;
+    let ptyResizeTimer: number | null = null;
+    let pendingPtyDimensions: { cols: number; rows: number } | null = null;
+    const publishPtyResize = () => {
+      ptyResizeTimer = null;
+      if (!pendingPtyDimensions) {
+        return;
+      }
+      const dimensions = pendingPtyDimensions;
+      pendingPtyDimensions = null;
+      void window.unitApi.terminal.resize({
+        sessionId: session.id,
+        cols: dimensions.cols,
+        rows: dimensions.rows
+      });
+    };
+    const schedulePtyResize = (dimensions: { cols: number; rows: number }) => {
+      pendingPtyDimensions = dimensions;
+      if (ptyResizeTimer !== null) {
+        window.clearTimeout(ptyResizeTimer);
+      }
+      ptyResizeTimer = window.setTimeout(publishPtyResize, TERMINAL_PTY_RESIZE_SETTLE_MS);
+    };
     const publishResize = () => {
       resizeFrame = null;
-      const nextDimensions = fitTerminal(container, fit, terminal);
+      const nextDimensions = proposedTerminalDimensions(container, fit, terminal);
       if (nextDimensions.cols === terminalDimensions.cols && nextDimensions.rows === terminalDimensions.rows) {
         return;
       }
+      terminal.resize(nextDimensions.cols, nextDimensions.rows);
       terminalDimensions = nextDimensions;
-      void window.unitApi.terminal.resize({
-        sessionId: session.id,
-        cols: nextDimensions.cols,
-        rows: nextDimensions.rows
-      });
+      schedulePtyResize(nextDimensions);
     };
     const scheduleResize = () => {
       if (resizeFrame !== null) {
@@ -2188,6 +2629,9 @@ function TerminalSurface({ session }: { session: AppletSession }) {
       if (resizeFrame !== null) {
         window.cancelAnimationFrame(resizeFrame);
       }
+      if (ptyResizeTimer !== null) {
+        window.clearTimeout(ptyResizeTimer);
+      }
       removeDataListener();
       dataSubscription.dispose();
       terminal.dispose();
@@ -2200,10 +2644,20 @@ function TerminalSurface({ session }: { session: AppletSession }) {
 }
 
 function fitTerminal(container: HTMLElement, fit: FitAddon, terminal: XTerm): { cols: number; rows: number } {
-  if (container.clientWidth > 0 && container.clientHeight > 0) {
-    fit.fit();
+  const dimensions = proposedTerminalDimensions(container, fit, terminal);
+  terminal.resize(dimensions.cols, dimensions.rows);
+  return dimensions;
+}
+
+function proposedTerminalDimensions(container: HTMLElement, fit: FitAddon, terminal: XTerm): { cols: number; rows: number } {
+  if (container.clientWidth <= 0 || container.clientHeight <= 0) {
+    return { cols: Math.max(2, terminal.cols), rows: Math.max(1, terminal.rows) };
   }
-  return { cols: Math.max(2, terminal.cols), rows: Math.max(1, terminal.rows) };
+  const dimensions = fit.proposeDimensions();
+  if (!dimensions) {
+    return { cols: Math.max(2, terminal.cols), rows: Math.max(1, terminal.rows) };
+  }
+  return { cols: Math.max(2, dimensions.cols), rows: Math.max(1, dimensions.rows) };
 }
 
 function renderAppletBody(session: AppletSession) {

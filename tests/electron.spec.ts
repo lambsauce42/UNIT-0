@@ -367,7 +367,7 @@ test("applet picker spawns a selected applet kind", async () => {
   const beforeBrowserCount = await page.getByTestId("applet-browser").count();
 
   await page.locator('[data-applet-instance-id="atlas-terminal"]').getByLabel("Terminal add applet").click();
-  await page.getByRole("menuitem", { name: "Browser" }).click();
+  await page.getByRole("menuitem", { name: "Add Browser split right" }).click();
 
   await expect(page.getByTestId("applet-browser")).toHaveCount(beforeBrowserCount + 1);
   const state = await appState(page);
@@ -377,7 +377,7 @@ test("applet picker spawns a selected applet kind", async () => {
   expect(browserInstances.length).toBeGreaterThanOrEqual(2);
 
   await page.locator('[data-applet-instance-id="atlas-terminal"]').getByLabel("Terminal add applet").click();
-  await page.getByRole("menuitem", { name: "WSL Terminal" }).click();
+  await page.getByRole("menuitem", { name: "Add WSL Terminal split down" }).click();
 
   await expect(page.getByTestId("applet-wslTerminal")).toHaveCount(1);
   const stateWithWsl = await appState(page);
@@ -415,6 +415,47 @@ test("applet change type button updates the mounted applet kind", async () => {
     "data-testid",
     "applet-chat"
   );
+  await app.close();
+});
+
+test("applet switch places button swaps two mounted applets and persists layout", async () => {
+  const dataDir = makeDataDir();
+  let app = await launchApp(dataDir);
+  let page = await firstWindow(app);
+  await page.getByTestId("workspace-tab-atlas").click();
+
+  const terminalBefore = await page.getByTestId("layout-leaf-atlas-terminal").boundingBox();
+  const browserBefore = await page.getByTestId("layout-leaf-atlas-browser").boundingBox();
+  expect(terminalBefore).not.toBeNull();
+  expect(browserBefore).not.toBeNull();
+
+  await page.locator('[data-applet-instance-id="atlas-terminal"]').getByLabel("Terminal switch places").click();
+  await expect(page.locator('section[data-applet-instance-id="atlas-terminal"]')).toHaveClass(/applet-frame-switch-source/);
+  await page.locator('section[data-applet-instance-id="atlas-browser"]').click();
+
+  await expect(async () => {
+    const terminalAfter = await page.getByTestId("layout-leaf-atlas-terminal").boundingBox();
+    const browserAfter = await page.getByTestId("layout-leaf-atlas-browser").boundingBox();
+    expect(terminalAfter).not.toBeNull();
+    expect(browserAfter).not.toBeNull();
+    expect(Math.abs(terminalAfter!.x - browserBefore!.x)).toBeLessThan(2);
+    expect(Math.abs(terminalAfter!.y - browserBefore!.y)).toBeLessThan(2);
+    expect(Math.abs(browserAfter!.x - terminalBefore!.x)).toBeLessThan(2);
+    expect(Math.abs(browserAfter!.y - terminalBefore!.y)).toBeLessThan(2);
+  }).toPass();
+  await app.close();
+
+  app = await launchApp(dataDir);
+  page = await firstWindow(app);
+  await page.getByTestId("workspace-tab-atlas").click();
+  const terminalRestarted = await page.getByTestId("layout-leaf-atlas-terminal").boundingBox();
+  const browserRestarted = await page.getByTestId("layout-leaf-atlas-browser").boundingBox();
+  expect(terminalRestarted).not.toBeNull();
+  expect(browserRestarted).not.toBeNull();
+  expect(Math.abs(terminalRestarted!.x - browserBefore!.x)).toBeLessThan(2);
+  expect(Math.abs(terminalRestarted!.y - browserBefore!.y)).toBeLessThan(2);
+  expect(Math.abs(browserRestarted!.x - terminalBefore!.x)).toBeLessThan(2);
+  expect(Math.abs(browserRestarted!.y - terminalBefore!.y)).toBeLessThan(2);
   await app.close();
 });
 
