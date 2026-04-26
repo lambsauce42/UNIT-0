@@ -249,4 +249,7 @@ export interface UnitApi {
     resize: (payload: TerminalResizePayload) => Promise<void>;
     onData: (callback: (payload: TerminalDataPayload) => void) => () => void;
   };
+  debug: {
+    resizeLog: (payload: unknown) => void;
+  };
 }

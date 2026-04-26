@@ -318,6 +318,27 @@ test("spawns a terminal in an empty workspace and persists it across restart", a
   await expect(page.getByTestId("workspace-empty")).toBeVisible();
   await page.getByRole("button", { name: "New terminal" }).last().click();
   await expect(page.getByTestId("applet-terminal")).toHaveCount(1);
+  await expect(page.locator(".terminal-surface .xterm")).toBeVisible();
+  await expect(async () => {
+    const overflow = await page.locator(".terminal-surface").evaluate((element) => ({
+      horizontal: element.scrollWidth - element.clientWidth,
+      vertical: element.scrollHeight - element.clientHeight
+    }));
+    expect(overflow.horizontal).toBeLessThanOrEqual(1);
+    expect(overflow.vertical).toBeLessThanOrEqual(1);
+  }).toPass();
+  await expect(async () => {
+    const scrollbarWidth = await page.locator(".terminal-surface .xterm-viewport").evaluate(
+      (element) => element.getBoundingClientRect().width - element.clientWidth
+    );
+    expect(scrollbarWidth).toBeLessThanOrEqual(1);
+  }).toPass();
+  await expect(async () => {
+    const customScrollbarWidth = await page
+      .locator(".terminal-surface .xterm-scrollable-element > .scrollbar.vertical")
+      .evaluate((element) => element.getBoundingClientRect().width);
+    expect(customScrollbarWidth).toBeLessThanOrEqual(8);
+  }).toPass();
   const surfaceBox = await page.getByTestId("workspace-surface").boundingBox();
   const leafBox = await page.locator("[data-testid^='layout-leaf-']").boundingBox();
   expect(surfaceBox).not.toBeNull();
@@ -354,6 +375,16 @@ test("applet picker spawns a selected applet kind", async () => {
     (instance) => state.appletSessions[instance.sessionId]?.kind === "browser"
   );
   expect(browserInstances.length).toBeGreaterThanOrEqual(2);
+
+  await page.locator('[data-applet-instance-id="atlas-terminal"]').getByLabel("Terminal add applet").click();
+  await page.getByRole("menuitem", { name: "WSL Terminal" }).click();
+
+  await expect(page.getByTestId("applet-wslTerminal")).toHaveCount(1);
+  const stateWithWsl = await appState(page);
+  const wslInstances = stateWithWsl.workspaces.atlas.applets.filter(
+    (instance) => stateWithWsl.appletSessions[instance.sessionId]?.kind === "wslTerminal"
+  );
+  expect(wslInstances).toHaveLength(1);
 
   await app.close();
 });
@@ -531,7 +562,17 @@ test("disables split controls when the pane cannot fit two minimum applets", asy
   const page = await firstWindow(app);
   await page.getByTestId("workspace-tab-atlas").click();
 
-  await expect(page.locator('[data-applet-instance-id="atlas-browser"]').getByLabel("Browser split down")).toBeDisabled();
+  const splitter = page.locator('[data-testid="layout-splitter-vertical"]').first();
+  const splitterBox = await splitter.boundingBox();
+  expect(splitterBox).not.toBeNull();
+
+  await page.mouse.move(splitterBox!.x + splitterBox!.width / 2, splitterBox!.y + splitterBox!.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(splitterBox!.x - 1000, splitterBox!.y + splitterBox!.height / 2, { steps: 12 });
+  await page.mouse.up();
+
+  await expect(page.locator('[data-applet-instance-id="atlas-terminal"]').getByLabel("Terminal split right")).toBeDisabled();
+  await expect(page.locator('[data-applet-instance-id="atlas-terminal"]').getByLabel("Terminal split down")).toBeEnabled();
 
   await app.close();
 });
@@ -546,6 +587,90 @@ test("highlights the completed splitter group on hover", async () => {
 
   await page.mouse.move(box!.x + box!.width / 2, box!.y + box!.height / 2);
   await expect(page.locator('[data-testid="layout-splitter-highlight-vertical"]').first()).toBeVisible();
+
+  await app.close();
+});
+
+test("snaps splitter drags to independent aligned splitter targets unless Alt is held", async () => {
+  const dataDir = makeDataDir();
+  let app = await launchApp(dataDir);
+  let page = await firstWindow(app);
+  await page.getByTestId("workspace-tab-atlas").click();
+  await expect(page.getByTestId("workspace-layout")).toBeVisible();
+  await app.close();
+
+  const db = new DatabaseSync(path.join(dataDir, "unit0.sqlite"));
+  const layout = {
+    id: "atlas-snap-root",
+    type: "split",
+    direction: "column",
+    ratio: 0.5,
+    first: {
+      id: "atlas-snap-top",
+      type: "split",
+      direction: "row",
+      ratio: 0.34,
+      first: { id: "leaf-atlas-terminal", type: "leaf", appletInstanceId: "atlas-terminal" },
+      second: { id: "leaf-atlas-file-viewer", type: "leaf", appletInstanceId: "atlas-file-viewer" }
+    },
+    second: {
+      id: "atlas-snap-bottom",
+      type: "split",
+      direction: "row",
+      ratio: 0.66,
+      first: { id: "leaf-atlas-browser", type: "leaf", appletInstanceId: "atlas-browser" },
+      second: {
+        id: "atlas-snap-bottom-right",
+        type: "split",
+        direction: "column",
+        ratio: 0.5,
+        first: { id: "leaf-atlas-chat", type: "leaf", appletInstanceId: "atlas-chat" },
+        second: { id: "leaf-atlas-sandbox", type: "leaf", appletInstanceId: "atlas-sandbox" }
+      }
+    }
+  };
+  db.prepare("UPDATE workspace_layouts SET layout_json = ? WHERE workspace_id = 'atlas'").run(JSON.stringify(layout));
+  db.close();
+
+  app = await launchApp(dataDir);
+  page = await firstWindow(app);
+  await page.getByTestId("workspace-tab-atlas").click();
+  const verticalSplitters = page.locator('[data-testid="layout-splitter-vertical"]');
+  await expect(verticalSplitters).toHaveCount(2);
+  const topSplitter = await verticalSplitters.nth(0).boundingBox();
+  const bottomSplitter = await verticalSplitters.nth(1).boundingBox();
+  expect(topSplitter).not.toBeNull();
+  expect(bottomSplitter).not.toBeNull();
+  const topCenterX = topSplitter!.x + topSplitter!.width / 2;
+  const bottomCenterX = bottomSplitter!.x + bottomSplitter!.width / 2;
+  const bottomCenterY = bottomSplitter!.y + bottomSplitter!.height / 2;
+
+  await page.mouse.move(bottomCenterX, bottomCenterY);
+  await page.mouse.down();
+  await page.keyboard.down("Alt");
+  await page.mouse.move(topCenterX + 5, bottomCenterY, { steps: 6 });
+  await expect(page.locator('[data-testid="layout-splitter-snap-vertical"]')).toHaveCount(0);
+  await page.mouse.move(bottomCenterX, bottomCenterY, { steps: 6 });
+  await page.mouse.up();
+  await page.keyboard.up("Alt");
+
+  const resetBottomSplitter = await verticalSplitters.nth(1).boundingBox();
+  expect(resetBottomSplitter).not.toBeNull();
+  const resetBottomCenterX = resetBottomSplitter!.x + resetBottomSplitter!.width / 2;
+  const resetBottomCenterY = resetBottomSplitter!.y + resetBottomSplitter!.height / 2;
+  await page.mouse.move(resetBottomCenterX, resetBottomCenterY);
+  await page.mouse.down();
+  await page.mouse.move(topCenterX + 5, resetBottomCenterY, { steps: 6 });
+  await expect(page.locator('[data-testid="layout-splitter-snap-vertical"]').first()).toBeVisible();
+  await page.mouse.up();
+
+  await expect(async () => {
+    const alignedTop = await verticalSplitters.nth(0).boundingBox();
+    const alignedBottom = await verticalSplitters.nth(1).boundingBox();
+    expect(alignedTop).not.toBeNull();
+    expect(alignedBottom).not.toBeNull();
+    expect(Math.abs(alignedTop!.x - alignedBottom!.x)).toBeLessThanOrEqual(1);
+  }).toPass();
 
   await app.close();
 });

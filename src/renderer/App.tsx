@@ -16,6 +16,9 @@ import {
   Trash2,
   X
 } from "lucide-react";
+import { FitAddon } from "@xterm/addon-fit";
+import { Terminal as XTerm } from "@xterm/xterm";
+import "@xterm/xterm/css/xterm.css";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import type {
   AppletKind,
@@ -66,6 +69,7 @@ type WorkspaceNameDialogState =
 
 const iconByKind: Record<AppletKind, typeof SquareTerminal> = {
   terminal: SquareTerminal,
+  wslTerminal: SquareTerminal,
   fileViewer: Code2,
   browser: Globe,
   chat: Bot,
@@ -74,6 +78,7 @@ const iconByKind: Record<AppletKind, typeof SquareTerminal> = {
 
 const appletCatalog: Array<{ kind: AppletKind; label: string }> = [
   { kind: "terminal", label: "Terminal" },
+  { kind: "wslTerminal", label: "WSL Terminal" },
   { kind: "fileViewer", label: "File Viewer" },
   { kind: "browser", label: "Browser" },
   { kind: "chat", label: "Chat" },
@@ -104,12 +109,22 @@ type ResizeDragState = {
   pointerId: number;
   startX: number;
   startY: number;
+  grabOffsetX: number;
+  grabOffsetY: number;
   target: ResizeTarget;
   geometry: CanonicalLayoutGeometry;
   layout: WorkspaceLayoutNode;
 };
 
+type ResizeSnapGuide = {
+  axis: "vertical" | "horizontal";
+  center: number;
+  start: number;
+  end: number;
+};
+
 const WORKSPACE_SURFACE_PADDING = 10;
+const RESIZE_SNAP_RADIUS = 8;
 
 function resizeDebugEnabled(): boolean {
   try {
@@ -120,11 +135,39 @@ function resizeDebugEnabled(): boolean {
 }
 
 function logResizeDebug(event: string, payload: unknown): void {
+  const entry = {
+    at: new Date().toISOString(),
+    event,
+    payload
+  };
+  window.unitApi.debug.resizeLog(entry);
   if (!resizeDebugEnabled()) {
     return;
   }
-  console.debug(`[unit0:resize] ${event}`, payload);
+  console.log(`[unit0:resize] ${event}`, payload);
+  try {
+    const key = "unit0.resizeDebugLog";
+    const current = JSON.parse(localStorage.getItem(key) ?? "[]") as unknown;
+    const entries = Array.isArray(current) ? current : [];
+    entries.push(entry);
+    localStorage.setItem(key, JSON.stringify(entries.slice(-300)));
+  } catch {
+    // Debug logging must not affect resize behavior.
+  }
 }
+
+function installResizeDebugHelpers(): void {
+  try {
+    Object.assign(window, {
+      unitResizeDebugDump: () => JSON.parse(localStorage.getItem("unit0.resizeDebugLog") ?? "[]"),
+      unitResizeDebugClear: () => localStorage.removeItem("unit0.resizeDebugLog")
+    });
+  } catch {
+    // Debug helpers are best-effort and must not affect app startup.
+  }
+}
+
+installResizeDebugHelpers();
 
 export function App() {
   const [payload, setPayload] = useState<BootstrapPayload | null>(null);
@@ -764,6 +807,7 @@ function WorkspaceSurface({ state, workspace }: { state: UnitState; workspace: W
   const [layoutOverride, setLayoutOverride] = useState<WorkspaceLayoutNode | null>(null);
   const [hoverResizeTarget, setHoverResizeTarget] = useState<ResizeTarget | null>(null);
   const [resizeDrag, setResizeDrag] = useState<ResizeDragState | null>(null);
+  const [resizeSnapGuides, setResizeSnapGuides] = useState<ResizeSnapGuide[]>([]);
   const appletsById = useMemo(
     () =>
       new Map(
@@ -933,6 +977,8 @@ function WorkspaceSurface({ state, workspace }: { state: UnitState; workspace: W
         pointerId: event.pointerId,
         startX: point.x,
         startY: point.y,
+        grabOffsetX: target.vertical ? point.x - target.vertical.center : 0,
+        grabOffsetY: target.horizontal ? point.y - target.horizontal.center : 0,
         target,
         geometry: layoutGeometry,
         layout: effectiveLayout
@@ -944,8 +990,22 @@ function WorkspaceSurface({ state, workspace }: { state: UnitState; workspace: W
       logResizeDebug("begin", {
         workspaceId: workspace.id,
         point,
+        grabOffset: { x: nextDrag.grabOffsetX, y: nextDrag.grabOffsetY },
         target: summarizeResizeTarget(target),
+        snapCandidates: summarizeSnapCandidates(layoutGeometry, target),
+        completedGroups: completedEdgeGroups(layoutGeometry.primitiveEdges, layoutGeometry.leaves).map(summarizeGroup),
         layoutSize,
+        splits: layoutGeometry.splits.map((split) => ({
+          id: split.id,
+          direction: split.direction,
+          rect: split.rect,
+          gutterRect: split.gutterRect,
+          firstLeafIds: split.firstLeafIds,
+          secondLeafIds: split.secondLeafIds,
+          firstSize: split.firstSize,
+          secondSize: split.secondSize,
+          availableSize: split.availableSize
+        })),
         leaves: layoutGeometry.leaves.map((leaf) => ({
           id: leaf.id,
           appletInstanceId: leaf.appletInstanceId,
@@ -965,24 +1025,51 @@ function WorkspaceSurface({ state, workspace }: { state: UnitState; workspace: W
       if (!point) {
         return;
       }
-      const projected = projectResize(drag.geometry, drag.target, {
+      const rawDelta = {
         x: point.x - drag.startX,
         y: point.y - drag.startY
-      });
+      };
+      const snapTrace = traceResizeSnap(drag, rawDelta, event.altKey);
+      const snapped = snapTrace.snapped;
+      const projected = projectResize(drag.geometry, drag.target, snapped);
       const structural = requiresStructuralResize(drag.geometry, drag.target);
-      const debugKey = `${point.x - drag.startX}:${point.y - drag.startY}:${projected.dx}:${projected.dy}:${structural}`;
+      const debugKey = `${rawDelta.x}:${rawDelta.y}:${snapped.x}:${snapped.y}:${projected.dx}:${projected.dy}:${structural}`;
       if (debugKey !== lastResizeDebugKeyRef.current) {
         lastResizeDebugKeyRef.current = debugKey;
         logResizeDebug("project", {
-          rawDelta: { x: point.x - drag.startX, y: point.y - drag.startY },
+          point,
+          altKey: event.altKey,
+          rawDelta,
+          snappedDelta: { x: snapped.x, y: snapped.y },
+          snapGuides: snapped.guides,
+          snapTrace,
           clampedDelta: { x: projected.dx, y: projected.dy },
           structural,
           ratios: projected.ratios,
-          target: summarizeResizeTarget(drag.target)
+          target: summarizeResizeTarget(drag.target),
+          pointerDownTarget: summarizeResizeTarget(drag.target)
         });
       }
       if (structural) {
         const structuralDelta = clampStructuralResize(drag, projected.dx, projected.dy);
+        if ((projected.dx !== 0 || projected.dy !== 0) && structuralDelta.dx === 0 && structuralDelta.dy === 0) {
+          logResizeDebug("structural-clamped-to-zero", {
+            requestedDelta: { dx: projected.dx, dy: projected.dy },
+            rawDelta,
+            snappedDelta: { x: snapped.x, y: snapped.y },
+            snapGuides: snapped.guides,
+            target: summarizeResizeTarget(drag.target),
+            pointerDownTarget: summarizeResizeTarget(drag.target),
+            invalidAtRequested: structuralResizeInvalidReason(drag, projected.dx, projected.dy),
+            invalidAtRaw: structuralResizeInvalidReason(drag, rawDelta.x, rawDelta.y),
+            leaves: drag.geometry.leaves.map((leaf) => ({
+              id: leaf.id,
+              appletInstanceId: leaf.appletInstanceId,
+              rect: leaf.rect
+            }))
+          });
+        }
+        setResizeSnapGuides(activeSnapGuides(drag.target, snapped.guides, structuralDelta.dx, structuralDelta.dy, snapped));
         const resizedLeaves = resizeLeafRectsForTarget(drag.geometry, drag.target, structuralDelta.dx, structuralDelta.dy);
         const nextLayout = rebuildLayoutFromLeafRects(drag.layout, resizedLeaves, drag.geometry.rect);
         logResizeDebug("structural-layout", {
@@ -996,7 +1083,28 @@ function WorkspaceSurface({ state, workspace }: { state: UnitState; workspace: W
         publishResizeLayout(nextLayout);
         return;
       }
+      setResizeSnapGuides(activeSnapGuides(drag.target, snapped.guides, projected.dx, projected.dy, snapped));
       const nextRatios = compensatedResizeRatios(drag, projected.ratios, projected.dx, projected.dy, layoutSize);
+      if (
+        (rawDelta.x !== 0 || rawDelta.y !== 0) &&
+        projected.dx === 0 &&
+        projected.dy === 0 &&
+        !structural
+      ) {
+        logResizeDebug("ratio-clamped-to-zero", {
+          rawDelta,
+          snappedDelta: { x: snapped.x, y: snapped.y },
+          snapGuides: snapped.guides,
+          target: summarizeResizeTarget(drag.target),
+          pointerDownTarget: summarizeResizeTarget(drag.target),
+          ratios: projected.ratios,
+          leaves: drag.geometry.leaves.map((leaf) => ({
+            id: leaf.id,
+            appletInstanceId: leaf.appletInstanceId,
+            rect: leaf.rect
+          }))
+        });
+      }
       setRatioOverrides((current) => ({ ...current, ...nextRatios }));
       setLayoutOverride(null);
       publishResizeRatios(nextRatios);
@@ -1008,6 +1116,7 @@ function WorkspaceSurface({ state, workspace }: { state: UnitState; workspace: W
       }
       resizeDragRef.current = null;
       setResizeDrag(null);
+      setResizeSnapGuides([]);
       logResizeDebug("end", { workspaceId: workspace.id });
       flushResizeRatios();
     };
@@ -1155,6 +1264,7 @@ function WorkspaceSurface({ state, workspace }: { state: UnitState; workspace: W
           }}
           completedGroups={resizeEnabledGroups}
           activeGroups={activeResizeGroups}
+          snapGuides={resizeSnapGuides}
           onBeginResizeDrag={beginResizeDrag}
         />
       ) : (
@@ -1211,6 +1321,7 @@ function WorkspaceLayout({
   onLeaveResizeTarget,
   completedGroups,
   activeGroups,
+  snapGuides,
   onBeginResizeDrag
 }: {
   geometry: CanonicalLayoutGeometry;
@@ -1224,6 +1335,7 @@ function WorkspaceLayout({
   onLeaveResizeTarget: () => void;
   completedGroups: EdgeGroup[];
   activeGroups: EdgeGroup[];
+  snapGuides: ResizeSnapGuide[];
   onBeginResizeDrag: (event: ReactPointerEvent<HTMLElement>, target: ResizeTarget) => void;
 }) {
   return (
@@ -1269,6 +1381,7 @@ function WorkspaceLayout({
       <SplitterOverlay
         completedGroups={completedGroups}
         activeGroups={activeGroups}
+        snapGuides={snapGuides}
         onBeginResizeDrag={onBeginResizeDrag}
       />
     </div>
@@ -1315,6 +1428,182 @@ function summarizeLayout(node: WorkspaceLayoutNode): unknown {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+type ResizeSnapTrace = {
+  snapped: { x: number; y: number; guides: ResizeSnapGuide[] };
+  disabled: boolean;
+  vertical: AxisSnapTrace | null;
+  horizontal: AxisSnapTrace | null;
+};
+
+type AxisSnapTrace = {
+  axis: "vertical" | "horizontal";
+  groupCenter: number;
+  delta: number;
+  currentCenter: number;
+  pointerCoordinate: number;
+  grabOffset: number;
+  radius: number;
+  chosen: { center: number; start: number; end: number; distance: number; delta: number } | null;
+  nearest: Array<{ center: number; start: number; end: number; edgeCount: number; distance: number }>;
+};
+
+type SnapCandidate = {
+  center: number;
+  start: number;
+  end: number;
+  edgeCount: number;
+  key: string;
+};
+
+function traceResizeSnap(drag: ResizeDragState, delta: { x: number; y: number }, disabled: boolean): ResizeSnapTrace {
+  if (disabled) {
+    return {
+      snapped: { x: Math.round(delta.x), y: Math.round(delta.y), guides: [] },
+      disabled: true,
+      vertical: null,
+      horizontal: null
+    };
+  }
+  let x = Math.round(delta.x);
+  let y = Math.round(delta.y);
+  const guides: ResizeSnapGuide[] = [];
+  const vertical = drag.target.vertical ? traceGroupSnap(drag.geometry, drag.target.vertical, x, drag.grabOffsetX) : null;
+  if (vertical?.chosen) {
+    x = vertical.chosen.delta;
+    guides.push(fullWorkspaceSnapGuide(drag.geometry, drag.target.vertical, vertical.chosen.center));
+  }
+  const horizontal = drag.target.horizontal ? traceGroupSnap(drag.geometry, drag.target.horizontal, y, drag.grabOffsetY) : null;
+  if (horizontal?.chosen) {
+    y = horizontal.chosen.delta;
+    guides.push(fullWorkspaceSnapGuide(drag.geometry, drag.target.horizontal, horizontal.chosen.center));
+  }
+  return { snapped: { x, y, guides }, disabled: false, vertical, horizontal };
+}
+
+function snapResizeDelta(drag: ResizeDragState, delta: { x: number; y: number }): { x: number; y: number; guides: ResizeSnapGuide[] } {
+  return traceResizeSnap(drag, delta, false).snapped;
+}
+
+function snapGroupDelta(
+  geometry: CanonicalLayoutGeometry,
+  group: EdgeGroup,
+  delta: number,
+  grabOffset: number
+): { delta: number; guide: ResizeSnapGuide | null } {
+  const trace = traceGroupSnap(geometry, group, delta, grabOffset);
+  if (!trace.chosen) {
+    return { delta, guide: null };
+  }
+  return {
+    delta: trace.chosen.delta,
+    guide: fullWorkspaceSnapGuide(geometry, group, trace.chosen.center)
+  };
+}
+
+function traceGroupSnap(
+  geometry: CanonicalLayoutGeometry,
+  group: EdgeGroup,
+  delta: number,
+  grabOffset: number
+): AxisSnapTrace {
+  const currentCenter = group.center + delta;
+  const pointerCoordinate = currentCenter + grabOffset;
+  const candidates = snapCandidates(geometry, group)
+    .map((candidate) => {
+      return {
+        center: candidate.center,
+        start: candidate.start,
+        end: candidate.end,
+        edgeCount: candidate.edgeCount,
+        distance: Math.abs(candidate.center - currentCenter)
+      };
+    })
+    .sort(
+      (left, right) =>
+        left.distance - right.distance ||
+        left.center - right.center ||
+        left.start - right.start ||
+        left.end - right.end
+    );
+  const nearest = candidates.slice(0, 8);
+  const best = candidates[0];
+  return {
+    axis: group.axis,
+    groupCenter: group.center,
+    delta,
+    currentCenter,
+    pointerCoordinate,
+    grabOffset,
+    radius: RESIZE_SNAP_RADIUS,
+    chosen:
+      best && best.distance <= RESIZE_SNAP_RADIUS
+        ? { center: best.center, start: best.start, end: best.end, distance: best.distance, delta: best.center - group.center }
+        : null,
+    nearest
+  };
+}
+
+function fullWorkspaceSnapGuide(geometry: CanonicalLayoutGeometry, group: EdgeGroup, center: number): ResizeSnapGuide {
+  return {
+    axis: group.axis,
+    center,
+    start: group.axis === "vertical" ? geometry.rect.top : geometry.rect.left,
+    end: group.axis === "vertical" ? geometry.rect.bottom : geometry.rect.right
+  };
+}
+
+function snapCandidates(geometry: CanonicalLayoutGeometry, group: EdgeGroup): SnapCandidate[] {
+  const candidates = new Map<string, SnapCandidate>();
+  for (const candidate of completedEdgeGroups(geometry.primitiveEdges, geometry.leaves)) {
+    if (candidate.axis !== group.axis || edgeGroupsOverlap(candidate, group)) {
+      continue;
+    }
+    candidates.set(edgeGroupIdentity(candidate), {
+      center: candidate.center,
+      start: candidate.start,
+      end: candidate.end,
+      edgeCount: candidate.edges.length,
+      key: edgeGroupIdentity(candidate)
+    });
+  }
+  return [...candidates.values()];
+}
+
+function summarizeSnapCandidates(geometry: CanonicalLayoutGeometry, target: ResizeTarget): unknown {
+  return {
+    vertical: target.vertical
+      ? {
+          groupCenter: target.vertical.center,
+          candidates: snapCandidates(geometry, target.vertical)
+            .sort((left, right) => left.center - right.center || left.start - right.start || left.end - right.end)
+            .map(({ center, start, end, edgeCount }) => ({ center, start, end, edgeCount }))
+        }
+      : null,
+    horizontal: target.horizontal
+      ? {
+          groupCenter: target.horizontal.center,
+          candidates: snapCandidates(geometry, target.horizontal)
+            .sort((left, right) => left.center - right.center || left.start - right.start || left.end - right.end)
+            .map(({ center, start, end, edgeCount }) => ({ center, start, end, edgeCount }))
+        }
+      : null
+  };
+}
+
+function activeSnapGuides(
+  target: ResizeTarget,
+  guides: ResizeSnapGuide[],
+  dx: number,
+  dy: number,
+  snapped: { x: number; y: number }
+): ResizeSnapGuide[] {
+  return guides.filter(
+    (guide) =>
+      (guide.axis === "vertical" && target.vertical && dx === snapped.x) ||
+      (guide.axis === "horizontal" && target.horizontal && dy === snapped.y)
+  );
 }
 
 function compensatedResizeRatios(
@@ -1416,6 +1705,10 @@ function clampStructuralAxis(
 }
 
 function validStructuralResize(drag: ResizeDragState, dx: number, dy: number): boolean {
+  return structuralResizeInvalidReason(drag, dx, dy) === null;
+}
+
+function structuralResizeInvalidReason(drag: ResizeDragState, dx: number, dy: number): unknown {
   try {
     const leaves = resizeLeafRectsForTarget(drag.geometry, drag.target, dx, dy);
     const affectedLeafIds = affectedResizeLeafIds(drag.target);
@@ -1424,18 +1717,41 @@ function validStructuralResize(drag: ResizeDragState, dx: number, dy: number): b
         (leaf) => !affectedLeafIds.has(leaf.id) || resizeTargetLeafMeetsMinimum(drag.target, leaf.rect)
       )
     ) {
-      return false;
+      return {
+        reason: "minimum-size",
+        affectedLeafIds: [...affectedLeafIds],
+        leaves: leaves.map((leaf) => ({ id: leaf.id, appletInstanceId: leaf.appletInstanceId, rect: leaf.rect }))
+      };
     }
     const layout = rebuildLayoutFromLeafRects(drag.layout, leaves, drag.geometry.rect);
     const geometry = computeCanonicalLayout(layout, {
       width: drag.geometry.rect.right - drag.geometry.rect.left,
       height: drag.geometry.rect.bottom - drag.geometry.rect.top
     });
-    return geometry.leaves.every(
-      (leaf) => !affectedLeafIds.has(leaf.id) || resizeTargetLeafMeetsMinimum(drag.target, leaf.rect)
-    );
-  } catch {
-    return false;
+    if (
+      !geometry.leaves.every(
+        (leaf) => !affectedLeafIds.has(leaf.id) || resizeTargetLeafMeetsMinimum(drag.target, leaf.rect)
+      )
+    ) {
+      return {
+        reason: "rebuilt-minimum-size",
+        affectedLeafIds: [...affectedLeafIds],
+        leaves: geometry.leaves.map((leaf) => ({ id: leaf.id, appletInstanceId: leaf.appletInstanceId, rect: leaf.rect })),
+        layout: summarizeLayout(layout)
+      };
+    }
+    return null;
+  } catch (error) {
+    return {
+      reason: "rebuild-error",
+      message: errorMessage(error),
+      target: summarizeResizeTarget(drag.target),
+      movedLeaves: resizeLeafRectsForTarget(drag.geometry, drag.target, dx, dy).map((leaf) => ({
+        id: leaf.id,
+        appletInstanceId: leaf.appletInstanceId,
+        rect: leaf.rect
+      }))
+    };
   }
 }
 
@@ -1529,10 +1845,12 @@ function addBranchCompensation(
 function SplitterOverlay({
   completedGroups,
   activeGroups,
+  snapGuides,
   onBeginResizeDrag
 }: {
   completedGroups: EdgeGroup[];
   activeGroups: EdgeGroup[];
+  snapGuides: ResizeSnapGuide[];
   onBeginResizeDrag: (event: ReactPointerEvent<HTMLElement>, target: ResizeTarget) => void;
 }) {
   const activeKeys = new Set(activeGroups.map(edgeGroupKey));
@@ -1547,6 +1865,14 @@ function SplitterOverlay({
           data-testid={`layout-splitter-highlight-${group.axis}`}
           key={`highlight-${edgeGroupKey(group)}`}
           style={groupStyle(group)}
+        />
+      ))}
+      {snapGuides.map((guide) => (
+        <div
+          className={`splitter-snap-target splitter-snap-target-${guide.axis}`}
+          data-testid={`layout-splitter-snap-${guide.axis}`}
+          key={`snap-${guide.axis}-${guide.center}-${guide.start}-${guide.end}`}
+          style={snapGuideStyle(guide)}
         />
       ))}
       {completedGroups.map((group) => (
@@ -1638,6 +1964,18 @@ function liveGroupForSnapshot(snapshot: EdgeGroup, liveGroups: EdgeGroup[]): Edg
   return combineDisplayGroups(matches);
 }
 
+function edgeGroupsOverlap(left: EdgeGroup, right: EdgeGroup): boolean {
+  if (left.axis !== right.axis) {
+    return false;
+  }
+  const rightEdges = new Set(right.edges.map(edgeSignature));
+  return left.edges.some((edge) => rightEdges.has(edgeSignature(edge)));
+}
+
+function edgeGroupIdentity(group: EdgeGroup): string {
+  return `${group.axis}:${group.edges.map(edgeSignature).sort().join("|")}`;
+}
+
 function edgeSignature(edge: EdgeGroup["edges"][number]): string {
   return `${edge.beforeLeafId}:${edge.afterLeafId}`;
 }
@@ -1675,6 +2013,23 @@ function groupStyle(group: EdgeGroup): { left: number; top: number; width: numbe
     top: group.center - TILE_GUTTER_SIZE / 2,
     width: group.end - group.start,
     height: TILE_GUTTER_SIZE
+  };
+}
+
+function snapGuideStyle(guide: ResizeSnapGuide): { left: number; top: number; width: number; height: number } {
+  if (guide.axis === "vertical") {
+    return {
+      left: guide.center - 1,
+      top: guide.start,
+      width: 2,
+      height: guide.end - guide.start
+    };
+  }
+  return {
+    left: guide.start,
+    top: guide.center - 1,
+    width: guide.end - guide.start,
+    height: 2
   };
 }
 
@@ -1911,22 +2266,120 @@ function AppletFrame({
           </button>
         </div>
       </header>
-      <div className="applet-body">{renderAppletBody(session.kind)}</div>
+      <div className="applet-body">{renderAppletBody(session)}</div>
     </section>
   );
 }
 
-function renderAppletBody(kind: AppletKind) {
-  if (kind === "terminal") {
-    return (
-      <pre className="terminal-surface">
-        <span className="prompt">dev@unit-0</span> ~/projects/unit-0 (main) $ npm run dev{"\n"}
-        <span className="muted">vite</span> ready in 418 ms{"\n\n"}
-        <span className="prompt">dev@unit-0</span> ~/projects/unit-0 (main) $ git status{"\n"}
-        On branch main{"\n"}
-        nothing to commit, working tree clean
-      </pre>
-    );
+function TerminalSurface({ session }: { session: AppletSession }) {
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const terminalRef = useRef<XTerm | null>(null);
+  const fitRef = useRef<FitAddon | null>(null);
+
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container || (session.kind !== "terminal" && session.kind !== "wslTerminal")) {
+      return;
+    }
+    const terminalKind = session.kind;
+
+    const terminal = new XTerm({
+      cursorBlink: true,
+      convertEol: true,
+      fontFamily: '"Cascadia Mono", Consolas, "Liberation Mono", monospace',
+      fontSize: 13,
+      lineHeight: 1.35,
+      scrollback: 5000,
+      theme: {
+        background: "#080c12",
+        foreground: "#e8eef7",
+        cursor: "#e8eef7",
+        selectionBackground: "#29415f"
+      }
+    });
+    const fit = new FitAddon();
+    terminal.loadAddon(fit);
+    terminal.open(container);
+    terminalRef.current = terminal;
+    fitRef.current = fit;
+
+    let terminalDimensions = fitTerminal(container, fit, terminal);
+    let resizeFrame: number | null = null;
+    const publishResize = () => {
+      resizeFrame = null;
+      const nextDimensions = fitTerminal(container, fit, terminal);
+      if (nextDimensions.cols === terminalDimensions.cols && nextDimensions.rows === terminalDimensions.rows) {
+        return;
+      }
+      terminalDimensions = nextDimensions;
+      void window.unitApi.terminal.resize({
+        sessionId: session.id,
+        cols: nextDimensions.cols,
+        rows: nextDimensions.rows
+      });
+    };
+    const scheduleResize = () => {
+      if (resizeFrame !== null) {
+        return;
+      }
+      resizeFrame = window.requestAnimationFrame(publishResize);
+    };
+    const dataSubscription = terminal.onData((data) => {
+      window.unitApi.terminal.input({ sessionId: session.id, data });
+    });
+    const removeDataListener = window.unitApi.terminal.onData((payload) => {
+      if (payload.sessionId === session.id) {
+        terminal.write(payload.data);
+      }
+    });
+    void window.unitApi.terminal
+      .start({
+        sessionId: session.id,
+        kind: terminalKind,
+        cols: terminalDimensions.cols,
+        rows: terminalDimensions.rows
+      })
+      .then((result) => {
+        if (result.output) {
+          terminal.write(result.output);
+        }
+      })
+      .catch((error: unknown) => {
+        terminal.write(`\r\nFailed to start ${session.title}: ${errorMessage(error)}\r\n`);
+      });
+
+    const resizeObserver = new ResizeObserver(() => {
+      scheduleResize();
+    });
+    resizeObserver.observe(container);
+
+    return () => {
+      resizeObserver.disconnect();
+      if (resizeFrame !== null) {
+        window.cancelAnimationFrame(resizeFrame);
+      }
+      removeDataListener();
+      dataSubscription.dispose();
+      terminal.dispose();
+      terminalRef.current = null;
+      fitRef.current = null;
+    };
+  }, [session.id, session.kind, session.title]);
+
+  return <div className="terminal-surface" ref={containerRef} />;
+}
+
+function fitTerminal(container: HTMLElement, fit: FitAddon, terminal: XTerm): { cols: number; rows: number } {
+  if (container.clientWidth > 0 && container.clientHeight > 0) {
+    fit.fit();
+  }
+  return { cols: Math.max(2, terminal.cols), rows: Math.max(1, terminal.rows) };
+}
+
+function renderAppletBody(session: AppletSession) {
+  const { kind } = session;
+  if (kind === "terminal" || kind === "wslTerminal") {
+    return <TerminalSurface session={session} />;
   }
   if (kind === "fileViewer") {
     return (

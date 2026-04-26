@@ -1,4 +1,5 @@
 import { app, BrowserWindow, Menu, ipcMain, screen } from "electron";
+import fs from "node:fs";
 import path from "node:path";
 import type {
   AppletSession,
@@ -56,6 +57,16 @@ function logResizeDebug(event: string, payload: unknown): void {
     return;
   }
   console.log(`[unit0:resize] ${event}`, JSON.stringify(payload));
+}
+
+function writeRendererResizeDebug(payload: unknown): void {
+  const line = `[unit0:resize:renderer] ${JSON.stringify(payload)}`;
+  console.log(line);
+  try {
+    fs.appendFileSync(path.join(app.getPath("userData"), "resize-debug.jsonl"), `${line}\n`);
+  } catch (error) {
+    console.warn(`[unit0:resize] failed to write resize-debug.jsonl: ${error instanceof Error ? error.message : String(error)}`);
+  }
 }
 
 function uniqueWindowIds(windowIds: number[]): number[] {
@@ -1269,6 +1280,9 @@ app.whenReady().then(() => {
   });
   ipcMain.handle("terminal:resize", (_event, payload: TerminalResizePayload) => {
     terminalManager.resize(payload);
+  });
+  ipcMain.on("debug:resizeLog", (_event, payload: unknown) => {
+    writeRendererResizeDebug(payload);
   });
   createWindow({ primary: true });
 });
