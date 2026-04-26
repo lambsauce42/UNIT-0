@@ -270,6 +270,12 @@ button {
   color: var(--text-primary);
 }
 
+.icon-button:disabled {
+  background: transparent;
+  color: var(--text-muted);
+  opacity: 0.38;
+}
+
 .workspace-surface {
   position: relative;
   height: 100%;

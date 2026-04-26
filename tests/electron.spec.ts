@@ -499,22 +499,36 @@ test("splits a pane right, persists the new terminal, then closes and collapses 
 test("splits a pane down with stacked geometry", async () => {
   const app = await launchApp();
   const page = await firstWindow(app);
-  await page.getByTestId("workspace-tab-atlas").click();
+  await page.getByLabel("New workspace").click();
+  await page.getByLabel("Workspace name").fill("Stacked Split Workspace");
+  await page.getByRole("button", { name: "Create" }).click();
+  await page.getByRole("button", { name: "New terminal" }).last().click();
   const beforeLeaves = await layoutLeafOrder(page);
 
-  await page.locator('[data-applet-instance-id="atlas-browser"]').getByLabel("Browser split down").click();
+  const instanceId = beforeLeaves[0];
+  await page.locator(`[data-applet-instance-id="${instanceId}"]`).getByLabel("Terminal split down").click();
   await expect(async () => {
     expect(await layoutLeafOrder(page)).toHaveLength(beforeLeaves.length + 1);
   }).toPass();
   const afterLeaves = await layoutLeafOrder(page);
   const spawnedId = afterLeaves.find((leafId) => !beforeLeaves.includes(leafId));
   expect(spawnedId).toBeTruthy();
-  const browserBox = await page.getByTestId("layout-leaf-atlas-browser").boundingBox();
+  const browserBox = await page.getByTestId(`layout-leaf-${instanceId}`).boundingBox();
   const spawnedBox = await page.getByTestId(`layout-leaf-${spawnedId}`).boundingBox();
   expect(browserBox).not.toBeNull();
   expect(spawnedBox).not.toBeNull();
   expect(spawnedBox!.y).toBeGreaterThan(browserBox!.y + browserBox!.height / 2);
   expect(Math.abs(spawnedBox!.x - browserBox!.x)).toBeLessThanOrEqual(4);
+
+  await app.close();
+});
+
+test("disables split controls when the pane cannot fit two minimum applets", async () => {
+  const app = await launchApp();
+  const page = await firstWindow(app);
+  await page.getByTestId("workspace-tab-atlas").click();
+
+  await expect(page.locator('[data-applet-instance-id="atlas-browser"]').getByLabel("Browser split down")).toBeDisabled();
 
   await app.close();
 });

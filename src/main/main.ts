@@ -45,6 +45,14 @@ if (process.env.NODE_ENV === "test" && process.env.UNIT0_DATA_DIR) {
 }
 const TEST_WINDOW_MODE = process.env.UNIT0_E2E_WINDOW_MODE;
 const HIDE_TEST_WINDOWS = process.env.NODE_ENV === "test" && TEST_WINDOW_MODE !== "visible";
+const RESIZE_DEBUG = process.env.UNIT0_RESIZE_DEBUG === "1";
+
+function logResizeDebug(event: string, payload: unknown): void {
+  if (!RESIZE_DEBUG) {
+    return;
+  }
+  console.log(`[unit0:resize] ${event}`, JSON.stringify(payload));
+}
 
 function uniqueWindowIds(windowIds: number[]): number[] {
   return [...new Set(windowIds)];
@@ -318,6 +326,10 @@ class TabRegistry {
     if (!workspace || this.dragSession) {
       throw new Error(`Cannot update layout ratios for workspace ${payload.workspaceId}`);
     }
+    logResizeDebug("main-update-ratios", {
+      workspaceId: payload.workspaceId,
+      ratios: payload.ratios
+    });
     this.workspaces[payload.workspaceId] = this.store.updateLayoutRatios(payload);
   }
 
@@ -326,6 +338,10 @@ class TabRegistry {
     if (!workspace || this.dragSession) {
       throw new Error(`Cannot replace layout for workspace ${payload.workspaceId}`);
     }
+    logResizeDebug("main-replace-layout", {
+      workspaceId: payload.workspaceId,
+      layoutRootId: payload.layout.id
+    });
     this.workspaces[payload.workspaceId] = this.store.replaceWorkspaceLayout(payload);
   }
 

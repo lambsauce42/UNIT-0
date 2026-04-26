@@ -29,6 +29,7 @@ import type {
   WorkspaceTab
 } from "../shared/types";
 import {
+  MIN_APPLET_SIZE,
   TILE_GUTTER_SIZE,
   applyRatioOverrides,
   completedEdgeGroups,
@@ -109,6 +110,21 @@ type ResizeDragState = {
 };
 
 const WORKSPACE_SURFACE_PADDING = 10;
+
+function resizeDebugEnabled(): boolean {
+  try {
+    return localStorage.getItem("unit0.resizeDebug") === "1" || window.location.search.includes("resizeDebug=1");
+  } catch {
+    return false;
+  }
+}
+
+function logResizeDebug(event: string, payload: unknown): void {
+  if (!resizeDebugEnabled()) {
+    return;
+  }
+  console.debug(`[unit0:resize] ${event}`, payload);
+}
 
 export function App() {
   const [payload, setPayload] = useState<BootstrapPayload | null>(null);
@@ -742,6 +758,7 @@ function WorkspaceSurface({ state, workspace }: { state: UnitState; workspace: W
   const resizePublishRafRef = useRef<number | null>(null);
   const pendingResizeRatiosRef = useRef<Record<string, number> | null>(null);
   const pendingResizeLayoutRef = useRef<WorkspaceLayoutNode | null>(null);
+  const lastResizeDebugKeyRef = useRef("");
   const [layoutSize, setLayoutSize] = useState<LayoutSize>({ width: 0, height: 0 });
   const [ratioOverrides, setRatioOverrides] = useState<Record<string, number>>({});
   const [layoutOverride, setLayoutOverride] = useState<WorkspaceLayoutNode | null>(null);
@@ -835,7 +852,10 @@ function WorkspaceSurface({ state, workspace }: { state: UnitState; workspace: W
         const nextRatios = pendingResizeRatiosRef.current;
         pendingResizeRatiosRef.current = null;
         if (nextRatios && Object.keys(nextRatios).length > 0) {
-          void window.unitApi.workspaces.updateLayoutRatios({ workspaceId: workspace.id, ratios: nextRatios });
+          logResizeDebug("persist-ratios", { workspaceId: workspace.id, ratios: nextRatios });
+          void window.unitApi.workspaces
+            .updateLayoutRatios({ workspaceId: workspace.id, ratios: nextRatios })
+            .catch((error) => logResizeDebug("persist-ratios-error", errorMessage(error)));
         }
       });
     },
@@ -853,7 +873,10 @@ function WorkspaceSurface({ state, workspace }: { state: UnitState; workspace: W
         const nextLayout = pendingResizeLayoutRef.current;
         pendingResizeLayoutRef.current = null;
         if (nextLayout) {
-          void window.unitApi.workspaces.replaceLayout({ workspaceId: workspace.id, layout: nextLayout });
+          logResizeDebug("persist-layout", { workspaceId: workspace.id, layout: summarizeLayout(nextLayout) });
+          void window.unitApi.workspaces
+            .replaceLayout({ workspaceId: workspace.id, layout: nextLayout })
+            .catch((error) => logResizeDebug("persist-layout-error", errorMessage(error)));
         }
       });
     },
@@ -869,11 +892,17 @@ function WorkspaceSurface({ state, workspace }: { state: UnitState; workspace: W
     pendingResizeRatiosRef.current = null;
     pendingResizeLayoutRef.current = null;
     if (nextLayout) {
-      void window.unitApi.workspaces.replaceLayout({ workspaceId: workspace.id, layout: nextLayout });
+      logResizeDebug("flush-layout", { workspaceId: workspace.id, layout: summarizeLayout(nextLayout) });
+      void window.unitApi.workspaces
+        .replaceLayout({ workspaceId: workspace.id, layout: nextLayout })
+        .catch((error) => logResizeDebug("flush-layout-error", errorMessage(error)));
       return;
     }
     if (nextRatios && Object.keys(nextRatios).length > 0) {
-      void window.unitApi.workspaces.updateLayoutRatios({ workspaceId: workspace.id, ratios: nextRatios });
+      logResizeDebug("flush-ratios", { workspaceId: workspace.id, ratios: nextRatios });
+      void window.unitApi.workspaces
+        .updateLayoutRatios({ workspaceId: workspace.id, ratios: nextRatios })
+        .catch((error) => logResizeDebug("flush-ratios-error", errorMessage(error)));
     }
   }, [workspace.id]);
   const beginResizeDrag = useCallback(
@@ -897,10 +926,22 @@ function WorkspaceSurface({ state, workspace }: { state: UnitState; workspace: W
         layout: effectiveLayout
       };
       resizeDragRef.current = nextDrag;
+      lastResizeDebugKeyRef.current = "";
       setResizeDrag(nextDrag);
       setHoverResizeTarget(target);
+      logResizeDebug("begin", {
+        workspaceId: workspace.id,
+        point,
+        target: summarizeResizeTarget(target),
+        layoutSize,
+        leaves: layoutGeometry.leaves.map((leaf) => ({
+          id: leaf.id,
+          appletInstanceId: leaf.appletInstanceId,
+          rect: leaf.rect
+        }))
+      });
     },
-    [effectiveLayout, layoutGeometry, localTilingPoint]
+    [effectiveLayout, layoutGeometry, layoutSize, localTilingPoint, workspace.id]
   );
   useEffect(() => {
     const onPointerMove = (event: PointerEvent) => {
@@ -916,9 +957,28 @@ function WorkspaceSurface({ state, workspace }: { state: UnitState; workspace: W
         x: point.x - drag.startX,
         y: point.y - drag.startY
       });
-      if (requiresStructuralResize(drag.geometry, drag.target)) {
-        const resizedLeaves = resizeLeafRectsForTarget(drag.geometry, drag.target, projected.dx, projected.dy);
+      const structural = requiresStructuralResize(drag.geometry, drag.target);
+      const debugKey = `${point.x - drag.startX}:${point.y - drag.startY}:${projected.dx}:${projected.dy}:${structural}`;
+      if (debugKey !== lastResizeDebugKeyRef.current) {
+        lastResizeDebugKeyRef.current = debugKey;
+        logResizeDebug("project", {
+          rawDelta: { x: point.x - drag.startX, y: point.y - drag.startY },
+          clampedDelta: { x: projected.dx, y: projected.dy },
+          structural,
+          ratios: projected.ratios,
+          target: summarizeResizeTarget(drag.target)
+        });
+      }
+      if (structural) {
+        const structuralDelta = clampStructuralResize(drag, projected.dx, projected.dy);
+        const resizedLeaves = resizeLeafRectsForTarget(drag.geometry, drag.target, structuralDelta.dx, structuralDelta.dy);
         const nextLayout = rebuildLayoutFromLeafRects(drag.layout, resizedLeaves, drag.geometry.rect);
+        logResizeDebug("structural-layout", {
+          requestedDelta: { dx: projected.dx, dy: projected.dy },
+          structuralDelta,
+          leaves: resizedLeaves.map((leaf) => ({ id: leaf.id, appletInstanceId: leaf.appletInstanceId, rect: leaf.rect })),
+          layout: summarizeLayout(nextLayout)
+        });
         setLayoutOverride(nextLayout);
         setRatioOverrides({});
         publishResizeLayout(nextLayout);
@@ -936,6 +996,7 @@ function WorkspaceSurface({ state, workspace }: { state: UnitState; workspace: W
       }
       resizeDragRef.current = null;
       setResizeDrag(null);
+      logResizeDebug("end", { workspaceId: workspace.id });
       flushResizeRatios();
     };
     document.addEventListener("pointermove", onPointerMove);
@@ -1182,6 +1243,8 @@ function WorkspaceLayout({
               instanceId={applet.instance.id}
               leafId={leaf.id}
               workspaceId={workspaceId}
+              canSplitRow={leaf.rect.right - leaf.rect.left >= MIN_APPLET_SIZE * 2 + TILE_GUTTER_SIZE}
+              canSplitColumn={leaf.rect.bottom - leaf.rect.top >= MIN_APPLET_SIZE * 2 + TILE_GUTTER_SIZE}
               onBeginAppletDrag={onBeginAppletDrag}
               onUpdateAppletDrag={onUpdateAppletDrag}
               onFinishAppletDrag={onFinishAppletDrag}
@@ -1197,6 +1260,48 @@ function WorkspaceLayout({
       />
     </div>
   );
+}
+
+function summarizeResizeTarget(target: ResizeTarget) {
+  return {
+    type: target.type,
+    vertical: target.vertical ? summarizeGroup(target.vertical) : null,
+    horizontal: target.horizontal ? summarizeGroup(target.horizontal) : null
+  };
+}
+
+function summarizeGroup(group: EdgeGroup) {
+  return {
+    axis: group.axis,
+    center: group.center,
+    start: group.start,
+    end: group.end,
+    edges: group.edges.map((edge) => ({
+      splitId: edge.splitId,
+      beforeLeafId: edge.beforeLeafId,
+      afterLeafId: edge.afterLeafId,
+      start: edge.start,
+      end: edge.end
+    }))
+  };
+}
+
+function summarizeLayout(node: WorkspaceLayoutNode): unknown {
+  if (node.type === "leaf") {
+    return { id: node.id, type: node.type, appletInstanceId: node.appletInstanceId };
+  }
+  return {
+    id: node.id,
+    type: node.type,
+    direction: node.direction,
+    ratio: node.ratio,
+    first: summarizeLayout(node.first),
+    second: summarizeLayout(node.second)
+  };
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function compensatedResizeRatios(
@@ -1252,6 +1357,70 @@ function sameSet(left: Set<string>, right: Set<string>): boolean {
     }
   }
   return true;
+}
+
+function clampStructuralResize(drag: ResizeDragState, dx: number, dy: number): { dx: number; dy: number } {
+  let nextDx = dx;
+  let nextDy = dy;
+  if (!validStructuralResize(drag, nextDx, nextDy)) {
+    nextDx = clampStructuralAxis(drag, nextDx, nextDy, "x");
+  }
+  if (!validStructuralResize(drag, nextDx, nextDy)) {
+    nextDy = clampStructuralAxis(drag, nextDx, nextDy, "y");
+  }
+  if (!validStructuralResize(drag, nextDx, nextDy)) {
+    return { dx: 0, dy: 0 };
+  }
+  return { dx: nextDx, dy: nextDy };
+}
+
+function clampStructuralAxis(
+  drag: ResizeDragState,
+  dx: number,
+  dy: number,
+  axis: "x" | "y"
+): number {
+  const value = axis === "x" ? dx : dy;
+  if (value === 0) {
+    return 0;
+  }
+  let low = 0;
+  let high = Math.abs(value);
+  let best = 0;
+  while (low <= high) {
+    const mid = Math.floor((low + high) / 2);
+    const candidate = Math.sign(value) * mid;
+    const candidateDx = axis === "x" ? candidate : dx;
+    const candidateDy = axis === "y" ? candidate : dy;
+    if (validStructuralResize(drag, candidateDx, candidateDy)) {
+      best = candidate;
+      low = mid + 1;
+    } else {
+      high = mid - 1;
+    }
+  }
+  return best;
+}
+
+function validStructuralResize(drag: ResizeDragState, dx: number, dy: number): boolean {
+  try {
+    const leaves = resizeLeafRectsForTarget(drag.geometry, drag.target, dx, dy);
+    if (!leaves.every((leaf) => rectMeetsMinSize(leaf.rect))) {
+      return false;
+    }
+    const layout = rebuildLayoutFromLeafRects(drag.layout, leaves, drag.geometry.rect);
+    const geometry = computeCanonicalLayout(layout, {
+      width: drag.geometry.rect.right - drag.geometry.rect.left,
+      height: drag.geometry.rect.bottom - drag.geometry.rect.top
+    });
+    return geometry.leaves.every((leaf) => rectMeetsMinSize(leaf.rect));
+  } catch {
+    return false;
+  }
+}
+
+function rectMeetsMinSize(rect: { left: number; top: number; right: number; bottom: number }): boolean {
+  return rect.right - rect.left >= MIN_APPLET_SIZE && rect.bottom - rect.top >= MIN_APPLET_SIZE;
 }
 
 function addBranchCompensation(
@@ -1450,6 +1619,8 @@ function AppletFrame({
   instanceId,
   leafId,
   workspaceId,
+  canSplitRow,
+  canSplitColumn,
   onBeginAppletDrag,
   onUpdateAppletDrag,
   onFinishAppletDrag,
@@ -1459,6 +1630,8 @@ function AppletFrame({
   instanceId: string;
   leafId: string;
   workspaceId: string;
+  canSplitRow: boolean;
+  canSplitColumn: boolean;
   onBeginAppletDrag: (drag: Omit<AppletDragState, "target">) => void;
   onUpdateAppletDrag: (clientX: number, clientY: number) => void;
   onFinishAppletDrag: () => void;
@@ -1474,7 +1647,12 @@ function AppletFrame({
     offsetY: number;
     dragging: boolean;
   } | null>(null);
+  const canSplitAnyDirection = canSplitRow || canSplitColumn;
+  const pickerSplitDirection = canSplitRow ? "row" : "column";
   const createApplet = (kind: AppletKind, splitDirection: "row" | "column") => {
+    if ((splitDirection === "row" && !canSplitRow) || (splitDirection === "column" && !canSplitColumn)) {
+      return;
+    }
     void window.unitApi.applets.createApplet({
       workspaceId,
       kind,
@@ -1600,6 +1778,7 @@ function AppletFrame({
               aria-haspopup="menu"
               aria-expanded={menuOpen}
               aria-label={`${session.title} add applet`}
+              disabled={!canSplitAnyDirection}
               onClick={() => setMenuOpen((open) => !open)}
             >
               <Plus size={16} />
@@ -1614,7 +1793,7 @@ function AppletFrame({
                       role="menuitem"
                       type="button"
                       onClick={() => {
-                        createApplet(item.kind, "row");
+                        createApplet(item.kind, pickerSplitDirection);
                         setMenuOpen(false);
                       }}
                     >
@@ -1630,6 +1809,7 @@ function AppletFrame({
             className="icon-button"
             type="button"
             aria-label={`${session.title} split right`}
+            disabled={!canSplitRow}
             onClick={() => createApplet("terminal", "row")}
           >
             <PanelRight size={16} />
@@ -1638,6 +1818,7 @@ function AppletFrame({
             className="icon-button"
             type="button"
             aria-label={`${session.title} split down`}
+            disabled={!canSplitColumn}
             onClick={() => createApplet("terminal", "column")}
           >
             <PanelTop size={16} />
