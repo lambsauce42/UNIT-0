@@ -306,6 +306,101 @@ test("creates a named workspace tab, renames it from tab context menu, closes it
   await app.close();
 });
 
+test("applies a template to a blank workspace and persists created applets", async () => {
+  const dataDir = makeDataDir();
+  let app = await launchApp(dataDir);
+  let page = await firstWindow(app);
+
+  await page.getByLabel("New workspace").click();
+  await page.getByLabel("Workspace name").fill("Template Blank");
+  await page.getByRole("button", { name: "Create" }).click();
+  const workspace = await workspaceByTitle(page, "Template Blank");
+
+  await page.getByLabel("Templates").click();
+  await expect(page.getByTestId("template-drawer")).toBeVisible();
+  await expect(page.getByTestId("template-option-grid-2x2")).toContainText("2 x 2 Grid");
+  await expect(page.getByText("Web App Debugging")).toHaveCount(0);
+  const drawerBox = await page.locator(".template-drawer").boundingBox();
+  const viewportHeight = await page.evaluate(() => window.innerHeight);
+  expect(drawerBox).not.toBeNull();
+  expect(drawerBox!.height / viewportHeight).toBeGreaterThan(0.64);
+  await page.getByTestId("template-option-grid-2x2").click();
+  await page.getByTestId("template-apply").click();
+
+  await expect(page.getByTestId("applet-terminal")).toHaveCount(4);
+  let state = await appState(page);
+  expect(state.workspaces[workspace.id].shelfAppletIds).toEqual([]);
+
+  await app.close();
+  app = await launchApp(dataDir);
+  page = await firstWindow(app);
+  await page.getByTestId(`workspace-tab-${workspace.id}`).click();
+  await expect(page.getByTestId("applet-terminal")).toHaveCount(4);
+
+  state = await appState(page);
+  expect(state.workspaces[workspace.id].shelfAppletIds).toEqual([]);
+  await app.close();
+});
+
+test("applies a template to an existing workspace, supports reassignment, and persists shelf", async () => {
+  const dataDir = makeDataDir();
+  let app = await launchApp(dataDir);
+  let page = await firstWindow(app);
+  await page.getByTestId("workspace-tab-atlas").click();
+
+  await page.getByLabel("Templates").click();
+  await page.getByTestId("template-option-grid-2x2").click();
+  await page.getByTestId("template-cell-grid-2x2-4").locator("select").selectOption("create:wslTerminal");
+  await page.getByTestId("template-apply").click();
+
+  await expect(page.getByTestId("applet-wslTerminal")).toBeVisible();
+  await expect(page.getByTestId("layout-leaf-atlas-chat")).toHaveCount(0);
+  await expect(page.getByTestId("workspace-shelf")).toBeVisible();
+  let state = await appState(page);
+  expect(state.workspaces.atlas.shelfAppletIds.sort()).toEqual(["atlas-chat", "atlas-sandbox"]);
+
+  await app.close();
+  app = await launchApp(dataDir);
+  page = await firstWindow(app);
+  await page.getByTestId("workspace-tab-atlas").click();
+  await expect(page.getByTestId("applet-wslTerminal")).toBeVisible();
+  await expect(page.getByTestId("workspace-shelf")).toBeVisible();
+  state = await appState(page);
+  expect(state.workspaces.atlas.shelfAppletIds.sort()).toEqual(["atlas-chat", "atlas-sandbox"]);
+  await app.close();
+});
+
+test("rejects duplicate template reuse assignments atomically", async () => {
+  const app = await launchApp();
+  const page = await firstWindow(app);
+
+  await expect(
+    page.evaluate(() =>
+      window.unitApi.workspaces.applyTemplate({
+        workspaceId: "atlas",
+        templateId: "grid-2x2",
+        assignments: {
+          "grid-2x2-1": { mode: "reuse", appletInstanceId: "atlas-file-viewer" },
+          "grid-2x2-2": { mode: "reuse", appletInstanceId: "atlas-browser" },
+          "grid-2x2-3": { mode: "reuse", appletInstanceId: "atlas-terminal" },
+          "grid-2x2-4": { mode: "reuse", appletInstanceId: "atlas-terminal" }
+        }
+      })
+    )
+  ).rejects.toThrow(/more than one template cell/);
+  const state = await appState(page);
+  expect(state.workspaces.atlas.shelfAppletIds).toEqual([]);
+  expect(state.workspaces.atlas.applets.map((instance) => instance.id).sort()).toEqual([
+    "atlas-browser",
+    "atlas-chat",
+    "atlas-file-viewer",
+    "atlas-sandbox",
+    "atlas-terminal"
+  ]);
+
+  await app.close();
+});
+
 test("spawns a terminal in an empty workspace and persists it across restart", async () => {
   const dataDir = makeDataDir();
   let app = await launchApp(dataDir);

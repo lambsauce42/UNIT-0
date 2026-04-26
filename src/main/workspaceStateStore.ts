@@ -3,6 +3,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import type {
+  ApplyWorkspaceTemplatePayload,
   AppletKind,
   AppletInstance,
   AppletSession,
@@ -12,6 +13,8 @@ import type {
   WorkspaceLayoutNode,
   WorkspaceTab
 } from "../shared/types.js";
+import { templateLayoutToWorkspaceLayout } from "../shared/templatePlanner.js";
+import { workspaceTemplateById } from "../shared/workspaceTemplates.js";
 
 export type WorkspaceStateModel = {
   appletSessions: Record<string, AppletSession>;
@@ -60,6 +63,11 @@ export type ReplaceWorkspaceLayoutOptions = {
   layout: WorkspaceLayoutNode;
 };
 
+export type ApplyTemplateResult = {
+  workspace: Workspace;
+  appletSessions: Record<string, AppletSession>;
+};
+
 const DEFAULT_APPLET_SESSIONS: Record<string, AppletSession> = {
   "session-terminal": { id: "session-terminal", kind: "terminal", title: "Terminal" },
   "session-file-viewer": { id: "session-file-viewer", kind: "fileViewer", title: "File Viewer" },
@@ -68,7 +76,7 @@ const DEFAULT_APPLET_SESSIONS: Record<string, AppletSession> = {
   "session-sandbox": { id: "session-sandbox", kind: "sandbox", title: "Sandbox" }
 };
 
-type SeedWorkspace = Omit<Workspace, "applets"> & {
+type SeedWorkspace = Omit<Workspace, "applets" | "shelfAppletIds"> & {
   applets: Array<{ id: string; sessionId: string; area: string }>;
 };
 
@@ -172,6 +180,11 @@ type WorkspaceLayoutRow = {
   layout_json: string;
 };
 
+type WorkspaceShelfAppletRow = {
+  workspace_id: string;
+  applet_instance_id: string;
+};
+
 export class WorkspaceStateStore {
   private readonly db: DatabaseSync;
 
@@ -200,7 +213,7 @@ export class WorkspaceStateStore {
         .all()
         .map((row) => {
           const workspace = row as WorkspaceRow;
-          return [workspace.id, { id: workspace.id, title: workspace.title, applets: [], layout: null }];
+          return [workspace.id, { id: workspace.id, title: workspace.title, applets: [], layout: null, shelfAppletIds: [] }];
         })
     );
     for (const row of this.db
@@ -211,6 +224,15 @@ export class WorkspaceStateStore {
         throw new Error(`Applet instance ${row.id} references missing workspace ${row.workspace_id}`);
       }
       workspace.applets.push({ id: row.id, sessionId: row.session_id });
+    }
+    for (const row of this.db
+      .prepare("SELECT workspace_id, applet_instance_id FROM workspace_shelf_applets ORDER BY workspace_id, sort_order")
+      .all() as WorkspaceShelfAppletRow[]) {
+      const workspace = workspaces[row.workspace_id];
+      if (!workspace) {
+        throw new Error(`Workspace shelf references missing workspace ${row.workspace_id}`);
+      }
+      workspace.shelfAppletIds.push(row.applet_instance_id);
     }
     for (const row of this.db
       .prepare("SELECT workspace_id, layout_json FROM workspace_layouts ORDER BY workspace_id")
@@ -275,7 +297,7 @@ export class WorkspaceStateStore {
       throw error;
     }
     return {
-      workspace: { id: workspaceId, title: resolvedTitle, applets: [], layout: null },
+      workspace: { id: workspaceId, title: resolvedTitle, applets: [], layout: null, shelfAppletIds: [] },
       tab: { id: tabId, title: resolvedTitle, workspaceId, pinned: false, closable: true }
     };
   }
@@ -343,7 +365,7 @@ export class WorkspaceStateStore {
     if (!workspace) {
       throw new Error(`Workspace ${workspaceId} does not exist`);
     }
-    return { id: workspace.id, title: workspace.title, applets: [], layout: null };
+    return { id: workspace.id, title: workspace.title, applets: [], layout: null, shelfAppletIds: [] };
   }
 
   createApplet(options: CreateAppletOptions): AppletMutationResult {
@@ -401,11 +423,17 @@ export class WorkspaceStateStore {
     if (!instance) {
       throw new Error(`Applet instance ${appletInstanceId} does not exist in workspace ${workspaceId}`);
     }
-    const nextLayout = removeAppletLeaf(workspace.layout, appletInstanceId);
+    const isMounted = workspace.layout ? collectLayoutAppletIds(workspace.layout).has(appletInstanceId) : false;
+    const isShelved = workspace.shelfAppletIds.includes(appletInstanceId);
+    if (!isMounted && !isShelved) {
+      throw new Error(`Applet instance ${appletInstanceId} is not mounted or shelved in workspace ${workspaceId}`);
+    }
+    const nextLayout = isMounted ? removeAppletLeaf(workspace.layout, appletInstanceId) : workspace.layout;
     const nextWorkspace = {
       ...workspace,
       applets: workspace.applets.filter((item) => item.id !== appletInstanceId),
-      layout: nextLayout
+      layout: nextLayout,
+      shelfAppletIds: workspace.shelfAppletIds.filter((item) => item !== appletInstanceId)
     };
     let deletedSessionId: string | undefined;
 
@@ -413,6 +441,7 @@ export class WorkspaceStateStore {
     try {
       this.db.prepare("DELETE FROM applet_instances WHERE id = ? AND workspace_id = ?").run(appletInstanceId, workspaceId);
       this.saveWorkspaceLayoutInTransaction(workspaceId, nextLayout);
+      this.saveWorkspaceShelfInTransaction(workspaceId, nextWorkspace.shelfAppletIds);
       const referenceCount = this.db
         .prepare("SELECT COUNT(*) AS count FROM applet_instances WHERE session_id = ?")
         .get(instance.sessionId) as { count: number };
@@ -544,6 +573,102 @@ export class WorkspaceStateStore {
     return nextWorkspace;
   }
 
+  applyTemplate(options: ApplyWorkspaceTemplatePayload): ApplyTemplateResult {
+    const model = this.load();
+    const workspace = model.workspaces[options.workspaceId];
+    if (!workspace) {
+      throw new Error(`Workspace ${options.workspaceId} does not exist`);
+    }
+    const template = workspaceTemplateById(options.templateId);
+    const cellIds = new Set(template.cells.map((cell) => cell.id));
+    const unknownAssignmentIds = Object.keys(options.assignments).filter((cellId) => !cellIds.has(cellId));
+    if (unknownAssignmentIds.length > 0) {
+      throw new Error(`Template assignment references missing cell(s): ${unknownAssignmentIds.join(", ")}`);
+    }
+
+    const instancesById = new Map(workspace.applets.map((instance) => [instance.id, instance]));
+    const reusedAppletIds = new Set<string>();
+    const cellAppletIds: Record<string, string> = {};
+    const createdSessions: Record<string, AppletSession> = {};
+    const createdInstances: AppletInstance[] = [];
+
+    for (const cell of template.cells) {
+      const assignment = options.assignments[cell.id];
+      if (!assignment) {
+        throw new Error(`Template cell ${cell.id} is missing an assignment`);
+      }
+      if (assignment.mode === "reuse") {
+        if (reusedAppletIds.has(assignment.appletInstanceId)) {
+          throw new Error(`Applet instance ${assignment.appletInstanceId} is assigned to more than one template cell`);
+        }
+        const instance = instancesById.get(assignment.appletInstanceId);
+        if (!instance) {
+          throw new Error(`Template assignment references missing applet instance ${assignment.appletInstanceId}`);
+        }
+        const session = model.appletSessions[instance.sessionId];
+        if (!session) {
+          throw new Error(`Applet instance ${assignment.appletInstanceId} references missing session ${instance.sessionId}`);
+        }
+        if (!cell.acceptedKinds.includes(session.kind)) {
+          throw new Error(`Template cell ${cell.id} cannot reuse ${session.kind}`);
+        }
+        reusedAppletIds.add(instance.id);
+        cellAppletIds[cell.id] = instance.id;
+        continue;
+      }
+      if (!cell.acceptedKinds.includes(assignment.kind)) {
+        throw new Error(`Template cell ${cell.id} cannot create ${assignment.kind}`);
+      }
+      const session: AppletSession = {
+        id: `session-${assignment.kind}-${randomUUID()}`,
+        kind: assignment.kind,
+        title: titleForAppletKind(assignment.kind)
+      };
+      const instance: AppletInstance = {
+        id: `${workspace.id}-${assignment.kind}-${randomUUID()}`,
+        sessionId: session.id
+      };
+      createdSessions[session.id] = session;
+      createdInstances.push(instance);
+      cellAppletIds[cell.id] = instance.id;
+    }
+
+    const nextLayout = templateLayoutToWorkspaceLayout(template.layout, cellAppletIds);
+    const nextWorkspace: Workspace = {
+      ...workspace,
+      applets: [...workspace.applets, ...createdInstances],
+      layout: nextLayout,
+      shelfAppletIds: workspace.applets.map((instance) => instance.id).filter((appletId) => !reusedAppletIds.has(appletId))
+    };
+    validateWorkspaceLayoutForWorkspace(nextLayout, nextWorkspace);
+
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const insertSession = this.db.prepare("INSERT INTO applet_sessions (id, kind, title) VALUES (?, ?, ?)");
+      const insertInstance = this.db.prepare(
+        "INSERT INTO applet_instances (id, workspace_id, session_id, area, sort_order) VALUES (?, ?, ?, ?, ?)"
+      );
+      let nextSortOrder = this.nextAppletSortOrder(workspace.id);
+      for (const instance of createdInstances) {
+        const session = createdSessions[instance.sessionId];
+        insertSession.run(session.id, session.kind, session.title);
+        insertInstance.run(instance.id, workspace.id, instance.sessionId, session.kind, nextSortOrder);
+        nextSortOrder += 1;
+      }
+      this.saveWorkspaceLayoutInTransaction(workspace.id, nextLayout);
+      this.saveWorkspaceShelfInTransaction(workspace.id, nextWorkspace.shelfAppletIds);
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+
+    return {
+      workspace: nextWorkspace,
+      appletSessions: { ...model.appletSessions, ...createdSessions }
+    };
+  }
+
   close(): void {
     this.db.close();
   }
@@ -595,8 +720,15 @@ export class WorkspaceStateStore {
         layout_json TEXT NOT NULL
       );
 
+      CREATE TABLE IF NOT EXISTS workspace_shelf_applets (
+        workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+        applet_instance_id TEXT NOT NULL REFERENCES applet_instances(id) ON DELETE CASCADE,
+        sort_order INTEGER NOT NULL,
+        PRIMARY KEY (workspace_id, applet_instance_id)
+      );
+
       INSERT INTO unit_metadata (key, value)
-      VALUES ('schema_version', '1')
+      VALUES ('schema_version', '2')
       ON CONFLICT(key) DO NOTHING;
     `);
     this.backfillMissingWorkspaceLayouts();
@@ -677,7 +809,7 @@ export class WorkspaceStateStore {
           id: instance.id,
           sessionId: instance.session_id
         }));
-        insertLayout.run(workspace.id, JSON.stringify(defaultLayoutForWorkspace({ ...workspace, applets, layout: null })));
+        insertLayout.run(workspace.id, JSON.stringify(defaultLayoutForWorkspace({ ...workspace, applets })));
       }
       this.db.exec("COMMIT");
     } catch (error) {
@@ -727,6 +859,16 @@ export class WorkspaceStateStore {
       .run(workspaceId, JSON.stringify(layout));
   }
 
+  private saveWorkspaceShelfInTransaction(workspaceId: string, appletInstanceIds: string[]): void {
+    this.db.prepare("DELETE FROM workspace_shelf_applets WHERE workspace_id = ?").run(workspaceId);
+    const insertShelfApplet = this.db.prepare(
+      "INSERT INTO workspace_shelf_applets (workspace_id, applet_instance_id, sort_order) VALUES (?, ?, ?)"
+    );
+    appletInstanceIds.forEach((appletInstanceId, index) => {
+      insertShelfApplet.run(workspaceId, appletInstanceId, index);
+    });
+  }
+
   private nextUntitledWorkspaceTitle(): string {
     const rows = this.db.prepare("SELECT title FROM workspaces WHERE title LIKE 'Untitled Workspace%'").all() as Array<{
       title: string;
@@ -740,7 +882,7 @@ export class WorkspaceStateStore {
   }
 }
 
-function defaultLayoutForWorkspace(workspace: Workspace): WorkspaceLayoutNode | null {
+function defaultLayoutForWorkspace(workspace: Pick<Workspace, "id" | "applets">): WorkspaceLayoutNode | null {
   const byArea = new Map(
     workspace.applets.map((instance) => {
       const area = instance.id.startsWith(`${workspace.id}-`) ? instance.id.slice(workspace.id.length + 1) : instance.id;
@@ -1020,9 +1162,12 @@ function leaf(area: string, byArea: Map<string, string>): WorkspaceLayoutNode | 
 function parseWorkspaceLayout(layoutJson: string, workspace: Workspace): WorkspaceLayoutNode | null {
   const parsed = JSON.parse(layoutJson) as unknown;
   if (parsed === null) {
-    if (workspace.applets.length > 0) {
-      throw new Error(`Workspace ${workspace.id} layout does not mount applet instance(s): ${workspace.applets.map((instance) => instance.id).join(", ")}`);
+    const shelfAppletIds = new Set(workspace.shelfAppletIds);
+    const unshelvedAppletIds = workspace.applets.map((instance) => instance.id).filter((appletId) => !shelfAppletIds.has(appletId));
+    if (unshelvedAppletIds.length > 0) {
+      throw new Error(`Workspace ${workspace.id} layout does not mount applet instance(s): ${unshelvedAppletIds.join(", ")}`);
     }
+    validateWorkspaceShelf(workspace);
     return null;
   }
   const graphLayout = layoutFromRemovedGraphFormat(parsed, workspace);
@@ -1111,6 +1256,7 @@ function collectLayoutAppletIds(layout: WorkspaceLayoutNode): Set<string> {
 
 function validateWorkspaceLayoutForWorkspace(layout: WorkspaceLayoutNode, workspace: Workspace): void {
   const mountedAppletIds = new Set(workspace.applets.map((instance) => instance.id));
+  const shelfAppletIds = validateWorkspaceShelf(workspace);
   const nodeIds = new Set<string>();
   const leafAppletIds = new Set<string>();
   const visit = (node: WorkspaceLayoutNode) => {
@@ -1138,8 +1284,29 @@ function validateWorkspaceLayoutForWorkspace(layout: WorkspaceLayoutNode, worksp
     visit(node.second);
   };
   visit(layout);
-  if (leafAppletIds.size !== mountedAppletIds.size) {
-    const missing = [...mountedAppletIds].filter((appletId) => !leafAppletIds.has(appletId));
+  for (const appletId of leafAppletIds) {
+    if (shelfAppletIds.has(appletId)) {
+      throw new Error(`Workspace ${workspace.id} applet instance ${appletId} is both mounted and shelved`);
+    }
+  }
+  const placedAppletIds = new Set([...leafAppletIds, ...shelfAppletIds]);
+  if (placedAppletIds.size !== mountedAppletIds.size) {
+    const missing = [...mountedAppletIds].filter((appletId) => !placedAppletIds.has(appletId));
     throw new Error(`Workspace ${workspace.id} layout does not mount applet instance(s): ${missing.join(", ")}`);
   }
+}
+
+function validateWorkspaceShelf(workspace: Workspace): Set<string> {
+  const mountedAppletIds = new Set(workspace.applets.map((instance) => instance.id));
+  const shelfAppletIds = new Set<string>();
+  for (const appletId of workspace.shelfAppletIds) {
+    if (!mountedAppletIds.has(appletId)) {
+      throw new Error(`Workspace ${workspace.id} shelf references missing applet instance ${appletId}`);
+    }
+    if (shelfAppletIds.has(appletId)) {
+      throw new Error(`Workspace ${workspace.id} shelf contains duplicate applet instance ${appletId}`);
+    }
+    shelfAppletIds.add(appletId);
+  }
+  return shelfAppletIds;
 }

@@ -1,6 +1,7 @@
 import { contextBridge, ipcRenderer } from "electron";
 import type {
   ActivateTabPayload,
+  ApplyWorkspaceTemplatePayload,
   BeginTabDragPayload,
   BootstrapPayload,
   ChangeAppletInstanceKindPayload,
@@ -55,7 +56,8 @@ const api: UnitApi = {
     renameWorkspace: (payload: RenameWorkspacePayload) => ipcRenderer.invoke("workspaces:renameWorkspace", payload),
     updateLayoutRatios: (payload: UpdateLayoutRatiosPayload) =>
       ipcRenderer.invoke("workspaces:updateLayoutRatios", payload),
-    replaceLayout: (payload: ReplaceWorkspaceLayoutPayload) => ipcRenderer.invoke("workspaces:replaceLayout", payload)
+    replaceLayout: (payload: ReplaceWorkspaceLayoutPayload) => ipcRenderer.invoke("workspaces:replaceLayout", payload),
+    applyTemplate: (payload: ApplyWorkspaceTemplatePayload) => ipcRenderer.invoke("workspaces:applyTemplate", payload)
   },
   applets: {
     createApplet: (payload: CreateAppletPayload) => ipcRenderer.invoke("applets:createApplet", payload),

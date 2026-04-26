@@ -3,6 +3,7 @@ import path from "node:path";
 import type {
   AppletKind,
   AppletSession,
+  ApplyWorkspaceTemplatePayload,
   BeginTabDragPayload,
   BootstrapPayload,
   ChangeAppletInstanceKindPayload,
@@ -334,6 +335,19 @@ class TabRegistry {
       throw new Error(`Cannot replace layout for workspace ${payload.workspaceId}`);
     }
     this.workspaces[payload.workspaceId] = this.store.replaceWorkspaceLayout(payload);
+  }
+
+  applyTemplate(payload: ApplyWorkspaceTemplatePayload): Workspace {
+    const workspace = this.workspaces[payload.workspaceId];
+    if (!workspace || this.dragSession) {
+      throw new Error(`Cannot apply template to workspace ${payload.workspaceId}`);
+    }
+    const result = this.store.applyTemplate(payload);
+    this.workspaces[payload.workspaceId] = result.workspace;
+    for (const [sessionId, session] of Object.entries(result.appletSessions)) {
+      this.appletSessions[sessionId] = session;
+    }
+    return structuredClone(result.workspace);
   }
 
   createApplet(payload: CreateAppletPayload): AppletInstance {
@@ -731,6 +745,7 @@ function workspaceAppletCloseSummary(workspace: Workspace | undefined): object {
     workspaceId: workspace.id,
     appletIds: workspace.applets.map((instance) => instance.id),
     sessionIds: workspace.applets.map((instance) => instance.sessionId),
+    shelfAppletIds: workspace.shelfAppletIds,
     layoutAppletIds: workspace.layout ? collectLayoutAppletIds(workspace.layout) : [],
     layout: workspace.layout
   };
@@ -1262,6 +1277,11 @@ app.whenReady().then(() => {
   ipcMain.handle("workspaces:replaceLayout", (_event, payload: ReplaceWorkspaceLayoutPayload) => {
     registry.replaceLayout(payload);
     broadcastState();
+  });
+  ipcMain.handle("workspaces:applyTemplate", (_event, payload: ApplyWorkspaceTemplatePayload) => {
+    const workspace = registry.applyTemplate(payload);
+    broadcastState();
+    return workspace;
   });
   ipcMain.handle("applets:createApplet", (_event, payload: CreateAppletPayload) => {
     const applet = registry.createApplet(payload);

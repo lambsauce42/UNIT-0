@@ -34,6 +34,7 @@ export interface Workspace {
   title: string;
   applets: AppletInstance[];
   layout: WorkspaceLayoutNode | null;
+  shelfAppletIds: string[];
 }
 
 export interface WorkspaceTab {
@@ -166,6 +167,57 @@ export interface ReplaceWorkspaceLayoutPayload {
   layout: WorkspaceLayoutNode;
 }
 
+export type WorkspaceTemplateId =
+  | "grid-2x2"
+  | "grid-3x3"
+  | "grid-4x4"
+  | "left-sidebar-3x3"
+  | "right-sidebar-3x3"
+  | "top-row-3x3"
+  | "bottom-row-3x3";
+
+export type WorkspaceTemplateLayoutNode = WorkspaceTemplateLayoutSplit | WorkspaceTemplateLayoutLeaf;
+
+export interface WorkspaceTemplateLayoutSplit {
+  id: string;
+  type: "split";
+  direction: "row" | "column";
+  ratio: number;
+  first: WorkspaceTemplateLayoutNode;
+  second: WorkspaceTemplateLayoutNode;
+}
+
+export interface WorkspaceTemplateLayoutLeaf {
+  id: string;
+  type: "leaf";
+  cellId: string;
+}
+
+export interface WorkspaceTemplateCell {
+  id: string;
+  label: string;
+  preferredKind: AppletKind;
+  acceptedKinds: AppletKind[];
+}
+
+export interface WorkspaceTemplate {
+  id: WorkspaceTemplateId;
+  name: string;
+  description: string;
+  cells: WorkspaceTemplateCell[];
+  layout: WorkspaceTemplateLayoutNode;
+}
+
+export type TemplateCellAssignment =
+  | { mode: "reuse"; appletInstanceId: string }
+  | { mode: "create"; kind: AppletKind };
+
+export interface ApplyWorkspaceTemplatePayload {
+  workspaceId: string;
+  templateId: WorkspaceTemplateId;
+  assignments: Record<string, TemplateCellAssignment>;
+}
+
 export interface CreateAppletPayload {
   workspaceId: string;
   kind: AppletKind;
@@ -243,6 +295,7 @@ export interface UnitApi {
     renameWorkspace: (payload: RenameWorkspacePayload) => Promise<void>;
     updateLayoutRatios: (payload: UpdateLayoutRatiosPayload) => Promise<void>;
     replaceLayout: (payload: ReplaceWorkspaceLayoutPayload) => Promise<void>;
+    applyTemplate: (payload: ApplyWorkspaceTemplatePayload) => Promise<Workspace>;
   };
   applets: {
     createApplet: (payload: CreateAppletPayload) => Promise<AppletInstance>;

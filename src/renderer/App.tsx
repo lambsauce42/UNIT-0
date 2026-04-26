@@ -2,7 +2,6 @@ import {
   Activity,
   Bot,
   Code2,
-  Columns2,
   Database,
   FolderOpen,
   Globe,
@@ -10,6 +9,7 @@ import {
   Grid2X2,
   Layers3,
   LayoutDashboard,
+  LayoutTemplate,
   Monitor,
   PanelRight,
   PanelTop,
@@ -22,7 +22,8 @@ import {
   Server,
   Settings,
   SquareTerminal,
-  Trash2
+  Trash2,
+  X
 } from "lucide-react";
 import { FitAddon } from "@xterm/addon-fit";
 import { Terminal as XTerm } from "@xterm/xterm";
@@ -34,18 +35,23 @@ import {
   useMemo,
   useRef,
   useState,
+  type CSSProperties,
   type PointerEvent as ReactPointerEvent,
   type SVGProps
 } from "react";
 import type {
   AppletKind,
   AppletSession,
+  ApplyWorkspaceTemplatePayload,
   BootstrapPayload,
   RectLike,
   TabHostState,
+  TemplateCellAssignment,
   UnitState,
   Workspace,
   WorkspaceLayoutNode,
+  WorkspaceTemplateLayoutNode,
+  WorkspaceTemplateId,
   WorkspaceTab
 } from "../shared/types";
 import {
@@ -63,6 +69,8 @@ import {
   type ResizeTarget
 } from "../shared/layoutGeometry";
 import { WORKSPACE_TAB_SIZE } from "../shared/tabMetrics";
+import { planWorkspaceTemplate } from "../shared/templatePlanner";
+import { workspaceTemplateById, workspaceTemplates } from "../shared/workspaceTemplates";
 import { closeHitRectForTab } from "./tabGeometry";
 
 type PendingDrag = {
@@ -154,6 +162,8 @@ function TabCloseIcon(props: SVGProps<SVGSVGElement>) {
 
 export function App() {
   const [payload, setPayload] = useState<BootstrapPayload | null>(null);
+  const [templateDrawerOpen, setTemplateDrawerOpen] = useState(false);
+  const openTemplateDrawer = useCallback(() => setTemplateDrawerOpen(true), []);
 
   useEffect(() => {
     let mounted = true;
@@ -187,14 +197,28 @@ export function App() {
   const host = payload.state.hosts[payload.windowId];
   const activeTab = host ? payload.state.tabs[host.activeTabId] : null;
   const activeWorkspace = activeTab ? payload.state.workspaces[activeTab.workspaceId] : null;
+  const initialTemplateWorkspaceId = activeWorkspace?.id !== "manager" ? activeWorkspace?.id : firstNonManagerWorkspaceId(payload.state);
 
   return (
     <main className="app-shell">
       <header className="workspace-bar">
         {host ? <WorkspaceTabStrip host={host} state={payload.state} windowId={payload.windowId} /> : <div />}
         <div className="window-tools">
-          <button className="icon-button active" type="button" aria-label="Workspace grid">
-            <Columns2 size={18} />
+          <button
+            className="template-toolbar-button"
+            type="button"
+            aria-label="Templates"
+            aria-pressed={templateDrawerOpen}
+            onClick={() => {
+              if (templateDrawerOpen) {
+                setTemplateDrawerOpen(false);
+              } else {
+                openTemplateDrawer();
+              }
+            }}
+          >
+            <LayoutTemplate size={16} />
+            <span>Templates</span>
           </button>
           <button className="icon-button" type="button" aria-label="Settings">
             <Settings size={18} />
@@ -202,12 +226,19 @@ export function App() {
         </div>
       </header>
       {activeWorkspace?.id === "manager" ? (
-        <WorkspaceManagerSurface state={payload.state} />
+        <WorkspaceManagerSurface state={payload.state} onOpenTemplates={openTemplateDrawer} />
       ) : activeWorkspace ? (
-        <WorkspaceSurface state={payload.state} workspace={activeWorkspace} />
+        <WorkspaceSurface state={payload.state} windowId={payload.windowId} workspace={activeWorkspace} />
       ) : (
         <div />
       )}
+      {templateDrawerOpen ? (
+        <TemplateDrawer
+          activeWorkspaceId={initialTemplateWorkspaceId}
+          state={payload.state}
+          onClose={() => setTemplateDrawerOpen(false)}
+        />
+      ) : null}
     </main>
   );
 }
@@ -748,7 +779,7 @@ function WorkspaceNameDialog({
   );
 }
 
-function WorkspaceManagerSurface({ state }: { state: UnitState }) {
+function WorkspaceManagerSurface({ state, onOpenTemplates }: { state: UnitState; onOpenTemplates: () => void }) {
   const workspaces = Object.values(state.workspaces).filter((workspace) => workspace.id !== "manager");
   const primaryHost = state.hosts[state.primaryWindowId];
   const sessions = Object.values(state.appletSessions);
@@ -793,7 +824,7 @@ function WorkspaceManagerSurface({ state }: { state: UnitState }) {
             <Plus size={16} />
             <span>Workspace</span>
           </button>
-          <button className="manager-action-button" type="button">
+          <button className="manager-action-button" type="button" onClick={onOpenTemplates}>
             <LayoutDashboard size={16} />
             <span>Template</span>
           </button>
@@ -928,17 +959,17 @@ function WorkspaceManagerSurface({ state }: { state: UnitState }) {
               <Layers3 size={17} />
             </div>
             <div className="manager-template-list">
-              <button type="button">
+              <button type="button" onClick={onOpenTemplates}>
                 <Code2 size={16} />
-                <span>Web App Debugging</span>
+                <span>2 x 2 Grid</span>
               </button>
-              <button type="button">
+              <button type="button" onClick={onOpenTemplates}>
                 <Bot size={16} />
-                <span>Research + Chat</span>
+                <span>3 x 3 Grid</span>
               </button>
-              <button type="button">
+              <button type="button" onClick={onOpenTemplates}>
                 <Server size={16} />
-                <span>Sandbox Lab</span>
+                <span>Sidebar + Grid</span>
               </button>
             </div>
           </section>
@@ -975,7 +1006,266 @@ function WorkspaceManagerSurface({ state }: { state: UnitState }) {
   );
 }
 
-function WorkspaceSurface({ state, workspace }: { state: UnitState; workspace: Workspace }) {
+function TemplateDrawer({
+  activeWorkspaceId,
+  state,
+  onClose
+}: {
+  activeWorkspaceId: string | undefined;
+  state: UnitState;
+  onClose: () => void;
+}) {
+  const workspaceOptions = useMemo(
+    () => Object.values(state.workspaces).filter((workspace) => workspace.id !== "manager"),
+    [state.workspaces]
+  );
+  const [selectedWorkspaceId, setSelectedWorkspaceId] = useState(activeWorkspaceId ?? workspaceOptions[0]?.id ?? "");
+  const [selectedTemplateId, setSelectedTemplateId] = useState<WorkspaceTemplateId>("grid-2x2");
+  const [assignments, setAssignments] = useState<Record<string, TemplateCellAssignment>>({});
+  const [applyError, setApplyError] = useState<string | null>(null);
+  const selectedWorkspace = state.workspaces[selectedWorkspaceId];
+  const selectedTemplate = workspaceTemplateById(selectedTemplateId);
+
+  useEffect(() => {
+    if (selectedWorkspaceId && state.workspaces[selectedWorkspaceId]) {
+      return;
+    }
+    setSelectedWorkspaceId(activeWorkspaceId ?? workspaceOptions[0]?.id ?? "");
+  }, [activeWorkspaceId, selectedWorkspaceId, state.workspaces, workspaceOptions]);
+
+  useEffect(() => {
+    if (!selectedWorkspace) {
+      setAssignments({});
+      return;
+    }
+    setAssignments(planWorkspaceTemplate(selectedWorkspace, state.appletSessions, selectedTemplate).assignments);
+    setApplyError(null);
+  }, [selectedTemplate, selectedWorkspace, state.appletSessions]);
+
+  const assignmentStats = useMemo(() => {
+    if (!selectedWorkspace) {
+      return { reused: 0, created: 0, shelved: 0, invalid: true };
+    }
+    const usedAppletIds = new Set<string>();
+    let reused = 0;
+    let created = 0;
+    let invalid = false;
+    for (const cell of selectedTemplate.cells) {
+      const assignment = assignments[cell.id];
+      if (!assignment) {
+        invalid = true;
+        continue;
+      }
+      if (assignment.mode === "create") {
+        created += 1;
+        if (!cell.acceptedKinds.includes(assignment.kind)) {
+          invalid = true;
+        }
+        continue;
+      }
+      const instance = selectedWorkspace.applets.find((item) => item.id === assignment.appletInstanceId);
+      const session = instance ? state.appletSessions[instance.sessionId] : null;
+      if (!instance || !session || usedAppletIds.has(instance.id) || !cell.acceptedKinds.includes(session.kind)) {
+        invalid = true;
+        continue;
+      }
+      reused += 1;
+      usedAppletIds.add(instance.id);
+    }
+    return {
+      reused,
+      created,
+      shelved: selectedWorkspace.applets.filter((instance) => !usedAppletIds.has(instance.id)).length,
+      invalid
+    };
+  }, [assignments, selectedTemplate, selectedWorkspace, state.appletSessions]);
+
+  const orderedAppletOptions = useMemo(() => {
+    if (!selectedWorkspace) {
+      return [];
+    }
+    const visualIds = selectedWorkspace.layout ? collectLayoutAppletIds(selectedWorkspace.layout) : [];
+    const byId = new Map(selectedWorkspace.applets.map((instance) => [instance.id, instance]));
+    const orderedIds = [...visualIds, ...selectedWorkspace.shelfAppletIds, ...selectedWorkspace.applets.map((instance) => instance.id)];
+    const seen = new Set<string>();
+    return orderedIds
+      .map((id) => byId.get(id))
+      .filter((instance): instance is Workspace["applets"][number] => {
+        if (!instance || seen.has(instance.id)) {
+          return false;
+        }
+        seen.add(instance.id);
+        return true;
+      });
+  }, [selectedWorkspace]);
+
+  const applyTemplate = () => {
+    if (!selectedWorkspace || assignmentStats.invalid) {
+      return;
+    }
+    const payload: ApplyWorkspaceTemplatePayload = {
+      workspaceId: selectedWorkspace.id,
+      templateId: selectedTemplate.id,
+      assignments
+    };
+    setApplyError(null);
+    void window.unitApi.workspaces
+      .applyTemplate(payload)
+      .then(() => onClose())
+      .catch((error: unknown) => setApplyError(errorMessage(error)));
+  };
+
+  return (
+    <div className="template-drawer-backdrop" data-testid="template-drawer" role="presentation">
+      <section className="template-drawer" aria-label="Workspace templates">
+        <header className="template-drawer-header">
+          <div>
+            <span className="manager-kicker">Templates</span>
+            <h2>Apply Workspace Template</h2>
+          </div>
+          <button className="icon-button" type="button" aria-label="Close templates" onClick={onClose}>
+            <X size={17} />
+          </button>
+        </header>
+
+        <div className="template-drawer-body">
+          <aside className="template-catalog" aria-label="Template catalog">
+            {workspaceTemplates.map((template) => (
+              <button
+                className={template.id === selectedTemplateId ? "template-option active" : "template-option"}
+                data-testid={`template-option-${template.id}`}
+                key={template.id}
+                type="button"
+                onClick={() => setSelectedTemplateId(template.id)}
+              >
+                <TemplateMiniPreview layout={template.layout} />
+                <span>
+                  <strong>{template.name}</strong>
+                  <small>{template.description}</small>
+                </span>
+              </button>
+            ))}
+          </aside>
+
+          <section className="template-preview-panel">
+            <div className="template-target-row">
+              <label>
+                <span>Workspace</span>
+                <select
+                  data-testid="template-workspace-select"
+                  value={selectedWorkspaceId}
+                  onChange={(event) => setSelectedWorkspaceId(event.target.value)}
+                >
+                  {workspaceOptions.map((workspace) => (
+                    <option key={workspace.id} value={workspace.id}>
+                      {workspace.title}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <div className="template-impact">
+                <span>{assignmentStats.reused} reused</span>
+                <span>{assignmentStats.created} created</span>
+                <span>{assignmentStats.shelved} shelved</span>
+              </div>
+            </div>
+            <div className="template-large-preview">
+              <TemplateCellPreview layout={selectedTemplate.layout} assignments={assignments} state={state} />
+            </div>
+          </section>
+
+          <aside className="template-assignment-panel">
+            <h3>Cells</h3>
+            {selectedTemplate.cells.map((cell) => {
+              const assignment = assignments[cell.id];
+              const usedElsewhere = assignedReuseIds(assignments, cell.id);
+              const reusedInstance =
+                assignment?.mode === "reuse" ? selectedWorkspace?.applets.find((instance) => instance.id === assignment.appletInstanceId) : null;
+              const reusedSession = reusedInstance ? state.appletSessions[reusedInstance.sessionId] : null;
+              const mismatched = Boolean(reusedSession && reusedSession.kind !== cell.preferredKind);
+              return (
+                <label className={mismatched ? "template-cell-row mismatched" : "template-cell-row"} data-testid={`template-cell-${cell.id}`} key={cell.id}>
+                  <span className="template-cell-title">
+                    {(() => {
+                      const Icon = iconByKind[cell.preferredKind];
+                      return <Icon size={15} />;
+                    })()}
+                    <strong>{cell.label}</strong>
+                  </span>
+                  <select
+                    value={assignmentValue(assignment)}
+                    onChange={(event) =>
+                      setAssignments((current) => ({ ...current, [cell.id]: parseAssignmentValue(event.target.value) }))
+                    }
+                  >
+                    {cell.acceptedKinds.map((kind) => (
+                      <option key={`create-${kind}`} value={`create:${kind}`}>
+                        Create {labelForAppletKind(kind)}
+                      </option>
+                    ))}
+                    {orderedAppletOptions
+                      .filter((instance) => {
+                        const session = state.appletSessions[instance.sessionId];
+                        return Boolean(session && cell.acceptedKinds.includes(session.kind));
+                      })
+                      .map((instance) => {
+                        const session = state.appletSessions[instance.sessionId];
+                        return (
+                          <option
+                            disabled={usedElsewhere.has(instance.id)}
+                            key={`reuse-${instance.id}`}
+                            value={`reuse:${instance.id}`}
+                          >
+                            Reuse {session?.title ?? instance.id}
+                          </option>
+                        );
+                      })}
+                  </select>
+                  {mismatched ? <small>Compatible {labelForAppletKind(reusedSession!.kind)}</small> : null}
+                </label>
+              );
+            })}
+            <div className="template-overflow-preview">
+              <span>Overflow shelf</span>
+              <div>
+                {selectedWorkspace?.applets
+                  .filter((instance) => !assignedReuseIds(assignments).has(instance.id))
+                  .map((instance) => {
+                    const session = state.appletSessions[instance.sessionId];
+                    const Icon = session ? iconByKind[session.kind] : SquareTerminal;
+                    return (
+                      <span className="template-overflow-item" key={instance.id}>
+                        <Icon size={14} />
+                        {session?.title ?? instance.id}
+                      </span>
+                    );
+                  })}
+              </div>
+            </div>
+          </aside>
+        </div>
+
+        <footer className="template-drawer-footer">
+          {applyError ? <span className="template-error">{applyError}</span> : <span />}
+          <button className="manager-action-button" type="button" onClick={onClose}>
+            Cancel
+          </button>
+          <button
+            className="manager-action-button primary"
+            data-testid="template-apply"
+            disabled={!selectedWorkspace || assignmentStats.invalid}
+            type="button"
+            onClick={applyTemplate}
+          >
+            Apply template: {assignmentStats.reused} reused, {assignmentStats.created} created, {assignmentStats.shelved} shelved
+          </button>
+        </footer>
+      </section>
+    </div>
+  );
+}
+
+function WorkspaceSurface({ state, windowId, workspace }: { state: UnitState; windowId: number; workspace: Workspace }) {
   const surfaceRef = useRef<HTMLElement | null>(null);
   const [appletDrag, setAppletDrag] = useState<AppletDragState | null>(null);
   const appletDragRef = useRef<AppletDragState | null>(null);
@@ -990,6 +1280,7 @@ function WorkspaceSurface({ state, workspace }: { state: UnitState; workspace: W
   const [resizeDrag, setResizeDrag] = useState<ResizeDragState | null>(null);
   const [resizeSnapGuides, setResizeSnapGuides] = useState<ResizeSnapGuide[]>([]);
   const [switchSourceInstanceId, setSwitchSourceInstanceId] = useState<string | null>(null);
+  const [shelfOpen, setShelfOpen] = useState(false);
   const appletsById = useMemo(
     () =>
       new Map(
@@ -1015,17 +1306,24 @@ function WorkspaceSurface({ state, workspace }: { state: UnitState; workspace: W
   );
   const ratioOverrideKey = JSON.stringify(ratioOverrides);
   const workspaceAppletIdList = useMemo(() => workspace.applets.map((instance) => instance.id), [workspace.applets]);
+  const workspaceShelfAppletIds = useMemo(() => new Set(workspace.shelfAppletIds), [workspace.shelfAppletIds]);
+  const visibleWorkspaceAppletIdList = useMemo(
+    () => workspace.applets.map((instance) => instance.id).filter((appletId) => !workspaceShelfAppletIds.has(appletId)),
+    [workspace.applets, workspaceShelfAppletIds]
+  );
   const workspaceAppletIds = useMemo(() => new Set(workspaceAppletIdList), [workspaceAppletIdList]);
   const layoutOverrideAppletIds = useMemo(
     () => (layoutOverride ? collectLayoutAppletIds(layoutOverride) : []),
     [layoutOverride]
   );
   const layoutOverrideMatchesWorkspace =
-    layoutOverride !== null && sameStringMembers(layoutOverrideAppletIds, workspaceAppletIdList);
+    layoutOverride !== null && sameStringMembers(layoutOverrideAppletIds, visibleWorkspaceAppletIdList);
   if (layoutOverride && !layoutOverrideMatchesWorkspace) {
     console.error("[unit0:layout-integrity] stale layout override ignored", {
       workspaceId: workspace.id,
       workspaceAppletIds: workspaceAppletIdList,
+      visibleWorkspaceAppletIds: visibleWorkspaceAppletIdList,
+      shelfAppletIds: workspace.shelfAppletIds,
       workspaceLayoutAppletIds: workspace.layout ? collectLayoutAppletIds(workspace.layout) : [],
       overrideLayoutAppletIds: layoutOverrideAppletIds,
       ratioOverrideIds: Object.keys(ratioOverrides)
@@ -1402,6 +1700,7 @@ function WorkspaceSurface({ state, workspace }: { state: UnitState; workspace: W
         <WorkspaceLayout
           geometry={layoutGeometry}
           appletsById={appletsById}
+          windowId={windowId}
           workspaceId={workspace.id}
           onBeginAppletDrag={beginAppletDrag}
           onUpdateAppletDrag={updateAppletDrag}
@@ -1466,6 +1765,28 @@ function WorkspaceSurface({ state, workspace }: { state: UnitState; workspace: W
           <span>{appletDrag.title}</span>
         </div>
       ) : null}
+      {workspace.shelfAppletIds.length > 0 ? (
+        <div className={shelfOpen ? "workspace-shelf open" : "workspace-shelf"} data-testid="workspace-shelf">
+          <button className="workspace-shelf-toggle" type="button" onClick={() => setShelfOpen((open) => !open)}>
+            <Layers3 size={15} />
+            <span>{workspace.shelfAppletIds.length} shelved</span>
+          </button>
+          {shelfOpen ? (
+            <div className="workspace-shelf-items">
+              {workspace.shelfAppletIds.map((appletId) => {
+                const applet = appletByInstanceId.get(appletId);
+                const Icon = applet?.session ? iconByKind[applet.session.kind] : Grid2X2;
+                return (
+                  <div className="workspace-shelf-item" key={appletId}>
+                    <Icon size={14} />
+                    <span>{applet?.session?.title ?? appletId}</span>
+                  </div>
+                );
+              })}
+            </div>
+          ) : null}
+        </div>
+      ) : null}
     </section>
   );
 }
@@ -1473,6 +1794,7 @@ function WorkspaceSurface({ state, workspace }: { state: UnitState; workspace: W
 function WorkspaceLayout({
   geometry,
   appletsById,
+  windowId,
   workspaceId,
   onBeginAppletDrag,
   onUpdateAppletDrag,
@@ -1490,6 +1812,7 @@ function WorkspaceLayout({
 }: {
   geometry: CanonicalLayoutGeometry;
   appletsById: Map<string, { instance: Workspace["applets"][number]; session: AppletSession | undefined }>;
+  windowId: number;
   workspaceId: string;
   onBeginAppletDrag: (drag: Omit<AppletDragState, "target">) => void;
   onUpdateAppletDrag: (clientX: number, clientY: number) => void;
@@ -1547,6 +1870,7 @@ function WorkspaceLayout({
               session={applet.session}
               instanceId={applet.instance.id}
               leafId={leaf.id}
+              windowId={windowId}
               workspaceId={workspaceId}
               canSplitRow={leaf.rect.right - leaf.rect.left >= MIN_APPLET_SIZE * 2 + TILE_GUTTER_SIZE}
               canSplitColumn={leaf.rect.bottom - leaf.rect.top >= MIN_APPLET_SIZE * 2 + TILE_GUTTER_SIZE}
@@ -1573,6 +1897,97 @@ function WorkspaceLayout({
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function firstNonManagerWorkspaceId(state: UnitState): string | undefined {
+  const openWorkspaceId = Object.values(state.hosts)
+    .flatMap((host) => host.tabIds)
+    .map((tabId) => state.tabs[tabId]?.workspaceId)
+    .find((workspaceId) => workspaceId && workspaceId !== "manager");
+  return openWorkspaceId ?? Object.values(state.workspaces).find((workspace) => workspace.id !== "manager")?.id;
+}
+
+function labelForAppletKind(kind: AppletKind): string {
+  return appletCatalog.find((item) => item.kind === kind)?.label ?? kind;
+}
+
+function assignmentValue(assignment: TemplateCellAssignment | undefined): string {
+  if (!assignment) {
+    return "";
+  }
+  return assignment.mode === "reuse" ? `reuse:${assignment.appletInstanceId}` : `create:${assignment.kind}`;
+}
+
+function parseAssignmentValue(value: string): TemplateCellAssignment {
+  const [mode, id] = value.split(":", 2);
+  if (mode === "reuse") {
+    return { mode: "reuse", appletInstanceId: id };
+  }
+  return { mode: "create", kind: id as AppletKind };
+}
+
+function assignedReuseIds(assignments: Record<string, TemplateCellAssignment>, exceptCellId?: string): Set<string> {
+  const appletIds = new Set<string>();
+  for (const [cellId, assignment] of Object.entries(assignments)) {
+    if (cellId === exceptCellId || assignment.mode !== "reuse") {
+      continue;
+    }
+    appletIds.add(assignment.appletInstanceId);
+  }
+  return appletIds;
+}
+
+function TemplateMiniPreview({ layout }: { layout: WorkspaceTemplateLayoutNode }) {
+  return <div className="template-mini-preview">{renderTemplatePreviewNode(layout)}</div>;
+}
+
+function TemplateCellPreview({
+  layout,
+  assignments,
+  state
+}: {
+  layout: WorkspaceTemplateLayoutNode;
+  assignments: Record<string, TemplateCellAssignment>;
+  state: UnitState;
+}) {
+  return <div className="template-cell-preview-root">{renderTemplatePreviewNode(layout, assignments, state)}</div>;
+}
+
+function renderTemplatePreviewNode(
+  node: WorkspaceTemplateLayoutNode,
+  assignments?: Record<string, TemplateCellAssignment>,
+  state?: UnitState
+) {
+  if (node.type === "leaf") {
+    const assignment = assignments?.[node.cellId];
+    let label = node.cellId;
+    let kind: AppletKind | null = null;
+    if (assignment?.mode === "create") {
+      kind = assignment.kind;
+      label = `Create ${labelForAppletKind(assignment.kind)}`;
+    }
+    if (assignment?.mode === "reuse" && state) {
+      const instance = Object.values(state.workspaces)
+        .flatMap((workspace) => workspace.applets)
+        .find((item) => item.id === assignment.appletInstanceId);
+      const session = instance ? state.appletSessions[instance.sessionId] : null;
+      kind = session?.kind ?? null;
+      label = session ? `Reuse ${session.title}` : assignment.appletInstanceId;
+    }
+    const Icon = kind ? iconByKind[kind] : Grid2X2;
+    return (
+      <div className="template-preview-leaf">
+        <Icon size={15} />
+        <span>{label}</span>
+      </div>
+    );
+  }
+  return (
+    <div className={`template-preview-split ${node.direction}`} style={{ "--template-ratio": node.ratio } as CSSProperties}>
+      {renderTemplatePreviewNode(node.first, assignments, state)}
+      {renderTemplatePreviewNode(node.second, assignments, state)}
+    </div>
+  );
 }
 
 function swapLayoutAppletInstances(
@@ -1650,15 +2065,17 @@ function traceResizeSnap(drag: ResizeDragState, delta: { x: number; y: number },
   let x = Math.round(delta.x);
   let y = Math.round(delta.y);
   const guides: ResizeSnapGuide[] = [];
-  const vertical = drag.target.vertical ? traceGroupSnap(drag.geometry, drag.target.vertical, x, drag.grabOffsetX) : null;
-  if (vertical?.chosen) {
+  const verticalGroup = drag.target.vertical;
+  const vertical = verticalGroup ? traceGroupSnap(drag.geometry, verticalGroup, x, drag.grabOffsetX) : null;
+  if (verticalGroup && vertical?.chosen) {
     x = vertical.chosen.delta;
-    guides.push(fullWorkspaceSnapGuide(drag.geometry, drag.target.vertical, vertical.chosen.center));
+    guides.push(fullWorkspaceSnapGuide(drag.geometry, verticalGroup, vertical.chosen.center));
   }
-  const horizontal = drag.target.horizontal ? traceGroupSnap(drag.geometry, drag.target.horizontal, y, drag.grabOffsetY) : null;
-  if (horizontal?.chosen) {
+  const horizontalGroup = drag.target.horizontal;
+  const horizontal = horizontalGroup ? traceGroupSnap(drag.geometry, horizontalGroup, y, drag.grabOffsetY) : null;
+  if (horizontalGroup && horizontal?.chosen) {
     y = horizontal.chosen.delta;
-    guides.push(fullWorkspaceSnapGuide(drag.geometry, drag.target.horizontal, horizontal.chosen.center));
+    guides.push(fullWorkspaceSnapGuide(drag.geometry, horizontalGroup, horizontal.chosen.center));
   }
   return { snapped: { x, y, guides }, disabled: false, vertical, horizontal };
 }
@@ -2179,6 +2596,7 @@ function AppletFrame({
   session,
   instanceId,
   leafId,
+  windowId,
   workspaceId,
   canSplitRow,
   canSplitColumn,
@@ -2193,6 +2611,7 @@ function AppletFrame({
   session: AppletSession;
   instanceId: string;
   leafId: string;
+  windowId: number;
   workspaceId: string;
   canSplitRow: boolean;
   canSplitColumn: boolean;
@@ -2236,6 +2655,15 @@ function AppletFrame({
       targetLeafId: leafId,
       splitDirection
     });
+  };
+  const toggleAppletMenu = (targetMenu: "add" | "change") => {
+    if ((targetMenu === "add" && addMenuOpen) || (targetMenu === "change" && changeMenuOpen)) {
+      setAddMenuOpen(false);
+      setChangeMenuOpen(false);
+      return;
+    }
+    setAddMenuOpen(targetMenu === "add");
+    setChangeMenuOpen(targetMenu === "change");
   };
   useEffect(() => {
     if (!addMenuOpen && !changeMenuOpen) {
@@ -2380,10 +2808,7 @@ function AppletFrame({
               aria-expanded={addMenuOpen}
               aria-label={`${session.title} add applet`}
               disabled={!canSplitAnyDirection}
-              onClick={() => {
-                setAddMenuOpen((open) => !open);
-                setChangeMenuOpen(false);
-              }}
+              onClick={() => toggleAppletMenu("add")}
             >
               <Plus size={16} />
             </button>
@@ -2436,10 +2861,7 @@ function AppletFrame({
               aria-haspopup="menu"
               aria-expanded={changeMenuOpen}
               aria-label={`${session.title} change applet type`}
-              onClick={() => {
-                setChangeMenuOpen((open) => !open);
-                setAddMenuOpen(false);
-              }}
+              onClick={() => toggleAppletMenu("change")}
             >
               <RefreshCw size={16} />
             </button>
