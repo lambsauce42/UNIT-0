@@ -141,30 +141,36 @@ export function resizeTargetAt(
   const groups = completedEdgeGroups(geometry.primitiveEdges, geometry.leaves);
   const verticalGroups = groups.filter((group) => group.axis === "vertical");
   const horizontalGroups = groups.filter((group) => group.axis === "horizontal");
-  const verticalIncidents = nearestCenterGroups(
-    verticalGroups.filter(
-      (group) =>
-        Math.abs(localPoint.x - group.center) <= halfJunctionHandle &&
-        localPoint.y >= group.start - halfJunctionHandle &&
-        localPoint.y <= group.end + halfJunctionHandle
-    ),
+  const verticalCenterGroups = nearestCenterGroups(
+    verticalGroups.filter((group) => Math.abs(localPoint.x - group.center) <= halfJunctionHandle),
     localPoint.x
   );
-  const horizontalIncidents = nearestCenterGroups(
-    horizontalGroups.filter(
-      (group) =>
-        Math.abs(localPoint.y - group.center) <= halfJunctionHandle &&
-        localPoint.x >= group.start - halfJunctionHandle &&
-        localPoint.x <= group.end + halfJunctionHandle
-    ),
+  const horizontalCenterGroups = nearestCenterGroups(
+    horizontalGroups.filter((group) => Math.abs(localPoint.y - group.center) <= halfJunctionHandle),
     localPoint.y
   );
-  if (verticalIncidents.length > 0 && horizontalIncidents.length > 0) {
-    return {
-      type: "junction",
-      vertical: combineGroups(verticalIncidents),
-      horizontal: combineGroups(horizontalIncidents)
-    };
+  for (const verticalCenterGroup of verticalCenterGroups) {
+    for (const horizontalCenterGroup of horizontalCenterGroups) {
+      const incidentVertical = verticalGroups.filter(
+        (group) =>
+          group.center === verticalCenterGroup.center &&
+          group.start <= horizontalCenterGroup.center + halfJunctionHandle &&
+          group.end >= horizontalCenterGroup.center - halfJunctionHandle
+      );
+      const incidentHorizontal = horizontalGroups.filter(
+        (group) =>
+          group.center === horizontalCenterGroup.center &&
+          group.start <= verticalCenterGroup.center + halfJunctionHandle &&
+          group.end >= verticalCenterGroup.center - halfJunctionHandle
+      );
+      if (incidentVertical.length > 0 && incidentHorizontal.length > 0) {
+        return {
+          type: "junction",
+          vertical: combineGroups(incidentVertical),
+          horizontal: combineGroups(incidentHorizontal)
+        };
+      }
+    }
   }
   const vertical = verticalGroups.find(
     (group) =>
