@@ -29,7 +29,7 @@ import { PDFParse } from "pdf-parse";
 import { codexItemToTimelineBlock, type CodexRuntime } from "./codexRuntime.js";
 import { ChatStore, DEFAULT_CODEX_MODELS, type ChatDocumentSearchEntry } from "./chatStore.js";
 import { LocalLlamaRuntime } from "./localLlamaRuntime.js";
-import { RemoteHostRuntime } from "./remoteHostRuntime.js";
+import { RemoteHostRuntime, type RemoteStreamMetrics } from "./remoteHostRuntime.js";
 
 const execFileAsync = promisify(execFile);
 const CODEX_ATTACHMENT_TEMP_PREFIX = "unit0-codex-attachments-";
@@ -186,7 +186,11 @@ export class ChatService {
       codexApprovalMode: payload.codexApprovalMode,
       planModeEnabled: payload.planModeEnabled,
       documentIndexId: payload.documentIndexId,
-      codexLastSessionId: payload.codexLastSessionId
+      codexLastSessionId: payload.codexLastSessionId,
+      remoteSessionId: payload.remoteSessionId,
+      remoteSlotId: payload.remoteSlotId,
+      remoteSettingsSignature: payload.remoteSettingsSignature,
+      remoteHostIdentity: payload.remoteHostIdentity
     });
     this.clearError();
     this.broadcast();
@@ -499,11 +503,15 @@ export class ChatService {
       if (!options.thread) {
         throw new Error("Selected chat thread could not be loaded.");
       }
-      await this.remoteRuntime.streamChat({
+      const resume = remoteResumeState(options.thread, options.model, state.appSettings);
+      const metrics = await this.remoteRuntime.streamChat({
         settings: state.appSettings,
         model: options.model,
         runtimeSettings: options.thread.runtimeSettings,
         messages: options.messages,
+        remoteSessionId: resume.remoteSessionId,
+        runtimeSlotId: resume.remoteSlotId,
+        runtimeSettingsSignature: resume.remoteSettingsSignature,
         onToken: (token) => {
           this.store.appendToMessage(options.assistantMessageId, token);
           this.broadcast();
@@ -513,6 +521,8 @@ export class ChatService {
           this.broadcast();
         }
       });
+      this.store.updateThreadSettings(options.thread.id, remoteMetricsToThreadSettings(options.thread, options.model, state.appSettings, metrics));
+      this.store.mergeMessageMetadata(options.assistantMessageId, { remoteMetrics: metrics.metrics });
       this.store.updateMessageStatus(options.assistantMessageId, this.cancelRequested ? "interrupted" : "complete");
       this.generation = { status: "idle" };
     } catch (error) {
@@ -544,9 +554,15 @@ export class ChatService {
       if (documentIndex.state !== "ready") {
         throw new Error("Selected document index is not ready yet.");
       }
+      const appSettings = this.store.loadState().appSettings;
+      if (options.model.providerId === "remote" && documentIndex.id.startsWith("remote-doc::") && appSettings.documentToolExecutionLocation === "remote") {
+        await this.runRemoteHostedDocumentAnalysisGeneration({ ...options, documentIndex });
+        this.store.updateMessageStatus(options.assistantMessageId, this.cancelRequested ? "interrupted" : "complete");
+        this.generation = { status: "idle" };
+        return;
+      }
       const workingMessages = [...options.messages];
       const timelineBlocks: ChatTimelineBlock[] = [];
-      const appSettings = this.store.loadState().appSettings;
       const useRemoteDocumentTools = documentIndex.id.startsWith("remote-doc::") || appSettings.documentToolExecutionLocation === "remote";
       if (useRemoteDocumentTools && !documentIndex.id.startsWith("remote-doc::")) {
         throw new Error("Remote document tool execution requires a remote document index.");
@@ -598,32 +614,49 @@ export class ChatService {
         const toolBlockId = `document-tool-${randomUUID()}`;
         if (parsed.tool === "search") {
           if (useRemoteDocumentTools) {
+            const budgetTokens = await this.documentEvidenceBudgetForRemoteTools(options.model, options.thread, workingMessages, documentIndex.title);
+            if (budgetTokens <= 0) {
+              throw new Error("Document analysis ran out of safe evidence budget. Start a new thread, reset local context, or use a larger context window.");
+            }
             latestRemoteResult = await this.remoteRuntime.searchDocumentIndex({
               settings: appSettings,
               documentIndexId: documentIndex.id,
               query: parsed.query,
               topK: parsed.topK,
-              budgetTokens: documentEvidenceBudget(options.thread.runtimeSettings)
+              budgetTokens
             });
             latestResults = remoteSearchEntriesToChat(latestRemoteResult);
           } else {
-            latestResults = this.store.searchDocumentIndex(documentIndex.id, parsed.query, parsed.topK, documentEvidenceBudget(options.thread.runtimeSettings));
+            const budgetTokens = documentEvidenceBudget(options.thread.runtimeSettings, workingMessages, documentIndex.title);
+            if (budgetTokens <= 0) {
+              throw new Error("Document analysis ran out of safe evidence budget. Start a new thread, reset local context, or use a larger context window.");
+            }
+            latestResults = this.store.searchDocumentIndex(documentIndex.id, parsed.query, parsed.topK, budgetTokens);
           }
         } else if (parsed.tool === "modify_results") {
           if (useRemoteDocumentTools) {
             if (!latestRemoteResult) {
               throw new Error("Document search results must exist before modify_results can run.");
             }
+            const budgetTokens = await this.documentEvidenceBudgetForRemoteTools(options.model, options.thread, workingMessages, documentIndex.title);
+            if (budgetTokens <= 0) {
+              throw new Error("Document analysis ran out of safe evidence budget. Start a new thread, reset local context, or use a larger context window.");
+            }
             latestRemoteResult = await this.remoteRuntime.modifyDocumentSearchResults({
               settings: appSettings,
               documentIndexId: documentIndex.id,
               result: latestRemoteResult,
               dropResultIds: parsed.dropResultIds,
-              expand: parsed.expand
+              expand: parsed.expand,
+              budgetTokens
             });
             latestResults = remoteSearchEntriesToChat(latestRemoteResult);
           } else {
-            latestResults = this.store.modifyDocumentSearchResults(documentIndex.id, latestResults, parsed.dropResultIds, parsed.expand, documentEvidenceBudget(options.thread.runtimeSettings));
+            const budgetTokens = documentEvidenceBudget(options.thread.runtimeSettings, workingMessages, documentIndex.title);
+            if (budgetTokens <= 0) {
+              throw new Error("Document analysis ran out of safe evidence budget. Start a new thread, reset local context, or use a larger context window.");
+            }
+            latestResults = this.store.modifyDocumentSearchResults(documentIndex.id, latestResults, parsed.dropResultIds, parsed.expand, budgetTokens);
           }
         } else {
           throw new Error("Unsupported document-analysis tool call.");
@@ -689,6 +722,70 @@ export class ChatService {
     return { content: contentParts.join(""), reasoning: reasoningParts.join("") };
   }
 
+  private async runRemoteHostedDocumentAnalysisGeneration(options: {
+    thread: ChatState["threads"][number];
+    messages: ChatState["messages"];
+    assistantMessageId: string;
+    model: ChatModel;
+    documentIndex: NonNullable<ReturnType<ChatStore["documentIndex"]>>;
+  }): Promise<void> {
+    const timelineBlocks: ChatTimelineBlock[] = [];
+    const state = this.store.loadState();
+    const resume = remoteResumeState(options.thread, options.model, state.appSettings, options.documentIndex.id);
+    const metrics = await this.remoteRuntime.streamDocumentAnalysis({
+      settings: state.appSettings,
+      model: options.model,
+      runtimeSettings: options.thread.runtimeSettings,
+      messages: options.messages,
+      documentIndexId: options.documentIndex.id,
+      remoteSessionId: resume.remoteSessionId,
+      runtimeSlotId: resume.remoteSlotId,
+      runtimeSettingsSignature: resume.remoteSettingsSignature,
+      onToken: (token) => {
+        this.store.appendToMessage(options.assistantMessageId, token);
+        this.broadcast();
+      },
+      onReasoning: (token) => {
+        this.store.appendToMessageReasoning(options.assistantMessageId, token);
+        this.broadcast();
+      },
+      onAgentEvents: (events) => {
+        for (const event of events) {
+          const block = remoteAgentEventToTimelineBlock(event);
+          if (!block) {
+            continue;
+          }
+          const existing = timelineBlocks.findIndex((item) => item.id === block.id);
+          if (existing >= 0) {
+            timelineBlocks[existing] = block;
+          } else {
+            timelineBlocks.push(block);
+          }
+        }
+        this.store.updateMessageTimelineBlocks(options.assistantMessageId, timelineBlocks);
+        this.broadcast();
+      }
+    });
+    this.store.updateThreadSettings(options.thread.id, remoteMetricsToThreadSettings(options.thread, options.model, state.appSettings, metrics, options.documentIndex.id));
+    this.store.mergeMessageMetadata(options.assistantMessageId, { remoteMetrics: metrics.metrics });
+  }
+
+  private async documentEvidenceBudgetForRemoteTools(
+    model: ChatModel,
+    thread: ChatState["threads"][number],
+    messages: ChatState["messages"],
+    documentTitle: string
+  ): Promise<number> {
+    const budget = await this.remoteRuntime.documentAnalysisEvidenceBudget({
+      settings: this.store.loadState().appSettings,
+      model,
+      runtimeSettings: thread.runtimeSettings,
+      messages,
+      documentTitle
+    });
+    return Math.max(0, budget);
+  }
+
   private async runCodexGeneration(options: { threadId: string; assistantMessageId: string }): Promise<void> {
     const state = this.store.loadState();
     const thread = state.threads.find((item) => item.id === options.threadId);
@@ -715,6 +812,7 @@ export class ChatService {
         cwd: project.directory,
         prompt: lastUserMessage.content,
         imagePaths: preparedImages.imagePaths,
+        baseInstructions: thread.runtimeSettings.systemPrompt,
         resumeThreadId: thread.codexLastSessionId,
         model: thread.codexModelId,
         reasoningEffort: thread.codexReasoningEffort,
@@ -748,6 +846,8 @@ export class ChatService {
           this.broadcast();
         } else if (event.type === "turn.failed" || event.type === "error") {
           throw new Error(event.type === "turn.failed" ? event.error?.message ?? "Codex turn failed." : event.message ?? "Codex reported an error.");
+        } else if (event.type === "turn.completed" && event.usage) {
+          this.store.mergeMessageMetadata(options.assistantMessageId, { codexUsage: event.usage });
         }
       }
       this.store.updateMessageStatus(options.assistantMessageId, this.cancelRequested ? "interrupted" : "complete");
@@ -1246,7 +1346,15 @@ function formatDocumentSearchResults(evidence: ChatDocumentSearchEntry[]): strin
     return "No matching document evidence was found.";
   }
   return evidence.map((entry) => [
-    `[${entry.resultId}] ${entry.sourceTitle}, page ${entry.pageStart}`,
+    [
+      `[${entry.resultId}]`,
+      entry.sourceId ? `source_id=${entry.sourceId}` : "",
+      `source_path=${path.basename(entry.sourcePath) || entry.sourcePath || "(remote)"}`,
+      `title=${entry.sourceTitle}`,
+      `section=${entry.sectionLabel ?? `page ${entry.pageStart}${entry.pageEnd !== entry.pageStart ? `-${entry.pageEnd}` : ""}`}`,
+      entry.candidateCount !== undefined ? `candidate_count=${entry.candidateCount}` : "",
+      entry.truncated ? "truncated=true" : "truncated=false"
+    ].filter(Boolean).join(" "),
     entry.text
   ].join("\n")).join("\n\n");
 }
@@ -1258,8 +1366,12 @@ function remoteSearchEntriesToChat(result: RemoteDocumentSearchResult): ChatDocu
     .map((entry, index) => ({
       chunkId: String(entry.chunk_id ?? entry.id ?? `remote-chunk-${index + 1}`),
       resultId: String(entry.result_id ?? `r${index + 1}`),
+      sourceId: String(entry.source_id ?? entry.sourceId ?? entry.document_id ?? result.document_id ?? ""),
       sourceTitle: String(entry.source_title ?? entry.sourceTitle ?? "Remote document"),
       sourcePath: String(entry.source_path ?? entry.sourcePath ?? ""),
+      sectionLabel: String(entry.section_label ?? entry.sectionLabel ?? ""),
+      candidateCount: boundedInteger(entry.candidate_count ?? entry.candidateCount, 1, 0, 999999),
+      truncated: Boolean(entry.truncated),
       pageStart: boundedInteger(entry.page_start ?? entry.pageStart, 1, 1, 999999),
       pageEnd: boundedInteger(entry.page_end ?? entry.pageEnd, Number(entry.page_start ?? entry.pageStart ?? 1) || 1, 1, 999999),
       text: String(entry.text ?? ""),
@@ -1269,6 +1381,85 @@ function remoteSearchEntriesToChat(result: RemoteDocumentSearchResult): ChatDocu
       ordinalEnd: boundedInteger(entry.ordinal_end ?? entry.ordinalEnd, index, 0, 999999)
     }))
     .filter((entry) => entry.text.trim());
+}
+
+function remoteResumeState(thread: ChatState["threads"][number], model: ChatModel, appSettings: ChatState["appSettings"], documentIndexId = ""): {
+  remoteSessionId: string;
+  remoteSlotId: number;
+  remoteSettingsSignature: string;
+} {
+  const signature = builtinRuntimeSettingsSignature(thread, model, appSettings, documentIndexId);
+  if (!thread.remoteSessionId || thread.remoteSettingsSignature !== signature || thread.remoteHostIdentity !== appSettings.remoteHostIdentity) {
+    return { remoteSessionId: "", remoteSlotId: 0, remoteSettingsSignature: "" };
+  }
+  return {
+    remoteSessionId: thread.remoteSessionId,
+    remoteSlotId: thread.remoteSlotId,
+    remoteSettingsSignature: signature
+  };
+}
+
+function remoteMetricsToThreadSettings(
+  thread: ChatState["threads"][number],
+  model: ChatModel,
+  appSettings: ChatState["appSettings"],
+  metrics: RemoteStreamMetrics,
+  documentIndexId = ""
+): Partial<ChatState["threads"][number]> {
+  return {
+    remoteSessionId: metrics.remoteSessionId,
+    remoteSlotId: metrics.remoteSlotId,
+    remoteHostIdentity: metrics.remoteHostIdentity,
+    remoteSettingsSignature: builtinRuntimeSettingsSignature(thread, model, appSettings, documentIndexId)
+  };
+}
+
+function builtinRuntimeSettingsSignature(thread: ChatState["threads"][number], model: ChatModel, appSettings: ChatState["appSettings"], documentIndexId = ""): string {
+  const settings = thread.runtimeSettings;
+  return JSON.stringify({
+    backend: "remote_builtin",
+    modelId: model.id,
+    modelReference: model.reference ?? "",
+    remoteHostId: appSettings.remoteHostId,
+    remoteHostIdentity: appSettings.remoteHostIdentity,
+    documentIndexId,
+    contextRevision: thread.contextRevision,
+    activeContextStartMessageIndex: thread.activeContextStartMessageIndex,
+    nCtx: settings.nCtx,
+    nGpuLayers: settings.nGpuLayers,
+    temperature: settings.temperature,
+    repeatPenalty: settings.repeatPenalty,
+    maxTokens: settings.maxTokens,
+    reasoningEffort: settings.reasoningEffort,
+    permissionMode: settings.permissionMode,
+    systemPrompt: settings.systemPrompt
+  });
+}
+
+function remoteAgentEventToTimelineBlock(value: unknown): ChatTimelineBlock | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  const event = value as Record<string, unknown>;
+  const type = String(event.type ?? event.kind ?? "").trim();
+  const id = String(event.id ?? event.event_id ?? `remote-event-${randomUUID()}`);
+  if (type.includes("tool") || type.includes("search")) {
+    return {
+      kind: "tool",
+      id,
+      toolName: String(event.tool_name ?? event.tool ?? "remote_document_analysis"),
+      status: String(event.status ?? "completed"),
+      summary: String(event.summary ?? event.command ?? ""),
+      output: typeof event.output === "string" ? event.output : typeof event.result === "string" ? event.result : undefined
+    };
+  }
+  if (type.includes("plan")) {
+    return { kind: "plan", id, status: String(event.status ?? "updated"), markdown: String(event.markdown ?? event.summary ?? "") };
+  }
+  if (type.includes("status")) {
+    return { kind: "status", id, level: String(event.level ?? "info"), message: String(event.message ?? event.summary ?? "") };
+  }
+  return null;
 }
 
 type ParsedDocumentToolCall =
@@ -1295,11 +1486,12 @@ function parseDocumentToolCall(text: string): ParsedDocumentToolCall {
     return { status: "empty" };
   }
   const match = /<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/u.exec(normalized);
-  if (!match) {
+  const jsonText = match ? match[1] : extractJsonObjectText(normalized);
+  if (!jsonText) {
     return { status: "final" };
   }
   try {
-    const payload = JSON.parse(match[1]) as Record<string, unknown>;
+    const payload = JSON.parse(jsonText) as Record<string, unknown>;
     const tool = String(payload.tool ?? "").trim();
     if (tool === "search") {
       const query = String(payload.query ?? "").trim().split(/\s+/).join(" ");
@@ -1333,6 +1525,16 @@ function parseDocumentToolCall(text: string): ParsedDocumentToolCall {
   }
 }
 
+function extractJsonObjectText(text: string): string {
+  const trimmed = text.trim();
+  if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
+    return trimmed;
+  }
+  const start = trimmed.indexOf("{");
+  const end = trimmed.lastIndexOf("}");
+  return start >= 0 && end > start ? trimmed.slice(start, end + 1) : "";
+}
+
 function documentAnalysisRequiresSearchFirst(messages: ChatState["messages"]): boolean {
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     const message = messages[index];
@@ -1347,13 +1549,39 @@ function documentAnalysisRequiresSearchFirst(messages: ChatState["messages"]): b
       continue;
     }
     const normalized = content.toLowerCase();
+    if (isDocumentAnalysisMetaQuestion(normalized)) {
+      return false;
+    }
     return Boolean(normalized && !["hi", "hello", "hey", "thanks", "thank you", "ok", "okay", "cool"].includes(normalized));
   }
   return false;
 }
 
-function documentEvidenceBudget(settings: ChatState["runtimeSettings"]): number {
-  return Math.min(6000, Math.max(1000, Math.floor(settings.nCtx * 0.35)));
+function isDocumentAnalysisMetaQuestion(text: string): boolean {
+  return [
+    "what tool",
+    "which tool",
+    "available tool",
+    "system prompt",
+    "how does this",
+    "how do you",
+    "framework",
+    "capabilit",
+    "document analysis mode",
+    "what can you do"
+  ].some((needle) => text.includes(needle));
+}
+
+function documentEvidenceBudget(settings: ChatState["runtimeSettings"], messages: ChatState["messages"] = [], documentTitle = ""): number {
+  const promptOverhead = estimatedTextTokens([
+    "Selected document:",
+    documentTitle,
+    "Use only the document evidence below when answering. Cite result ids like [r1] when they support a claim."
+  ].join("\n"));
+  const usedByMessages = messages.reduce((total, message) => total + estimatedMessageTokens(message), 0);
+  const reservedForAnswer = Math.min(settings.maxTokens || settings.nCtx, Math.max(Math.floor(settings.nCtx * 0.12), 1024));
+  const remaining = settings.nCtx - usedByMessages - promptOverhead - reservedForAnswer;
+  return Math.max(0, Math.min(12000, remaining));
 }
 
 function boundedInteger(value: unknown, fallback: number, min: number, max: number): number {

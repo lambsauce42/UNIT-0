@@ -1,6 +1,7 @@
 import { expect, test } from "@playwright/test";
 import {
   buildCodexExecCommand,
+  collaborationModePayload,
   codexItemToTimelineBlock,
   MockCodexRuntime,
   parseCodexJsonLine
@@ -99,6 +100,35 @@ test("mock Codex runtime exposes account, rate limits, and models without shelli
     expect(snapshot.account.rateLimits?.primary?.usedPercent).toBe(12);
   }
   expect(snapshot.models.some((model) => model.isDefault)).toBe(true);
+});
+
+test("builds legacy Codex collaboration mode payload without shelling out", () => {
+  expect(collaborationModePayload({
+    cwd: process.cwd(),
+    prompt: "inspect",
+    model: "gpt-5.5",
+    reasoningEffort: "medium",
+    permissionMode: "default_permissions",
+    approvalMode: "default",
+    planModeEnabled: true
+  })).toMatchObject({
+    mode: "plan",
+    settings: {
+      model: "gpt-5.5",
+      reasoning_effort: "medium"
+    }
+  });
+  const payload = collaborationModePayload({
+    cwd: process.cwd(),
+    prompt: "inspect",
+    model: "gpt-5.5",
+    reasoningEffort: "low",
+    permissionMode: "full_access",
+    approvalMode: "never",
+    planModeEnabled: false
+  });
+  expect(payload).toMatchObject({ mode: "default", settings: { reasoning_effort: "low" } });
+  expect((payload.settings as Record<string, unknown>).developer_instructions).toContain("Default mode");
 });
 
 test("builds codex exec command without executing Codex in unit tests", () => {

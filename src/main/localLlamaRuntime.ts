@@ -77,7 +77,9 @@ export class LocalLlamaRuntime {
           stream_options: { include_usage: true },
           temperature: options.settings.temperature,
           repeat_penalty: options.settings.repeatPenalty,
-          max_tokens: options.settings.maxTokens
+          max_tokens: options.settings.maxTokens,
+          cache_prompt: true,
+          id_slot: 0
         }),
         signal: abortController.signal
       });
@@ -155,7 +157,8 @@ export class LocalLlamaRuntime {
       binaryPath,
       port,
       modelPath,
-      settings
+      settings,
+      slotSavePath: this.slotSavePath(binaryPath)
     });
     const process = this.spawnImpl(command.command, command.args, {
       cwd: command.cwd,
@@ -210,6 +213,13 @@ export class LocalLlamaRuntime {
       clearTimeout(timer);
     }
   }
+
+  private slotSavePath(binaryPath: string): string {
+    const root = this.options.runtimeRoot ? path.resolve(this.options.runtimeRoot) : path.dirname(binaryPath);
+    const slotDir = path.join(root, "runtime", "llama.cpp", "slots");
+    fs.mkdirSync(slotDir, { recursive: true });
+    return slotDir;
+  }
 }
 
 export function buildLlamaServerCommand(options: {
@@ -217,6 +227,7 @@ export function buildLlamaServerCommand(options: {
   port: number;
   modelPath: string;
   settings: ChatRuntimeSettings;
+  slotSavePath?: string;
 }): LlamaServerCommand {
   return {
     command: options.binaryPath,
@@ -233,7 +244,10 @@ export function buildLlamaServerCommand(options: {
       "--n-gpu-layers",
       options.settings.nGpuLayers < 0 ? "auto" : String(options.settings.nGpuLayers),
       "-np",
-      "1"
+      "1",
+      "--slots",
+      "--slot-save-path",
+      options.slotSavePath ?? path.join(path.dirname(options.binaryPath), "slots")
     ]
   };
 }

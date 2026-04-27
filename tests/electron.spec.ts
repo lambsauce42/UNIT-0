@@ -229,7 +229,7 @@ test("chat Codex mode uses mocked events and provider-aware menus", async () => 
   });
 
   await expect(page.getByRole("button", { name: "Open model menu" })).toContainText("GPT-5.3 Codex");
-  await page.getByTestId("chat-surface").getByRole("button", { name: "Add" }).click();
+  await page.getByTestId("chat-surface").getByRole("button", { name: "More actions", exact: true }).click();
   await expect(page.getByRole("menuitemcheckbox", { name: "Plan mode" })).toBeVisible();
   await expect(page.getByRole("menuitem", { name: "Upload image..." })).toBeVisible();
   await page.keyboard.press("Escape").catch(() => undefined);

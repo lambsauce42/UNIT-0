@@ -2,6 +2,44 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import readline from "node:readline";
 import type { ChatCodexAccountState, ChatCodexApprovalMode, ChatCodexModel, ChatCodexRateLimits, ChatReasoningEffort, ChatTimelineBlock } from "../shared/types.js";
 
+const DEFAULT_COLLABORATION_INSTRUCTIONS = [
+  "# Collaboration Mode: Default",
+  "",
+  "You are now in Default mode. Any previous instructions for other modes (e.g. Plan mode) are no longer active.",
+  "",
+  "Your active mode changes only when new developer instructions with a different `<collaboration_mode>...</collaboration_mode>` change it; user requests or tool descriptions do not change mode by themselves. Known mode names are Default and Plan.",
+  "",
+  "## request_user_input availability",
+  "",
+  "The `request_user_input` tool is unavailable in Default mode. If you call it while in Default mode, it will return an error.",
+  "",
+  "In Default mode, strongly prefer making reasonable assumptions and executing the user's request rather than stopping to ask questions. If you absolutely must ask a question because the answer cannot be discovered from local context and a reasonable assumption would be risky, ask the user directly with a concise plain-text question. Never write a multiple choice question as a textual assistant message."
+].join("\n");
+
+const PLAN_COLLABORATION_INSTRUCTIONS = [
+  "# Plan Mode (Conversational)",
+  "",
+  "You work in 3 phases, and you should chat your way to a great plan before finalizing it. A great plan is very detailed-intent- and implementation-wise-so that it can be handed to another engineer or agent to be implemented right away. It must be decision complete, where the implementer does not need to make any decisions.",
+  "",
+  "## Mode rules (strict)",
+  "",
+  "You are in Plan Mode until a developer message explicitly ends it.",
+  "",
+  "Plan Mode is not changed by user intent, tone, or imperative language. If a user asks for execution while still in Plan Mode, treat it as a request to plan the execution, not perform it.",
+  "",
+  "## Plan Mode vs update_plan tool",
+  "",
+  "Plan Mode is a collaboration mode that can involve requesting user input and eventually issuing a `<proposed_plan>` block.",
+  "",
+  "Separately, `update_plan` is a checklist/progress/TODOs tool; it does not enter or exit Plan Mode. Do not confuse it with Plan mode or try to use it while in Plan mode. If you try to use `update_plan` in Plan mode, it will return an error.",
+  "",
+  "## Execution vs. mutation in Plan Mode",
+  "",
+  "You may explore and execute non-mutating actions that improve the plan. You must not perform mutating actions.",
+  "",
+  "Only output the final plan when it is decision complete and leaves no decisions to the implementer. When you present the official plan, wrap it in a `<proposed_plan>` block so the client can render it specially."
+].join("\n");
+
 export type CodexThreadItem =
   | { id?: string; type: "agent_message"; text?: string }
   | { id?: string; type: "reasoning"; text?: string }
@@ -27,6 +65,7 @@ export interface CodexRunOptions {
   cwd: string;
   prompt: string;
   imagePaths?: string[];
+  baseInstructions?: string;
   resumeThreadId?: string;
   model: string;
   reasoningEffort: ChatReasoningEffort;
@@ -39,7 +78,7 @@ export interface CodexRuntime {
   runTurn(options: CodexRunOptions): AsyncIterable<CodexThreadEvent>;
   readAccount(force?: boolean): Promise<{ account: ChatCodexAccountState; models: ChatCodexModel[] }>;
   steerCurrentTurn(options: { text: string; imagePaths?: string[] }): Promise<void>;
-  answerApproval(approvalId: string, decision: "accept" | "decline" | "cancel"): void;
+  answerApproval(approvalId: string, decision: "accept" | "acceptForSession" | "decline" | "cancel"): void;
   answerUserInput(requestId: string, answers: Record<string, string>): void;
   cancelActiveRequest(): void;
   close(): void;
@@ -127,7 +166,7 @@ export class MockCodexRuntime implements CodexRuntime {
     };
   }
 
-  answerApproval(_approvalId: string, _decision: "accept" | "decline" | "cancel"): void {
+  answerApproval(_approvalId: string, _decision: "accept" | "acceptForSession" | "decline" | "cancel"): void {
     return;
   }
 
@@ -309,11 +348,7 @@ export class CodexAppServerRuntime implements CodexRuntime {
       effort: options.reasoningEffort,
       approvalPolicy: options.approvalMode === "default" ? undefined : options.approvalMode,
       sandboxPolicy: options.permissionMode === "full_access" ? { type: "dangerFullAccess" } : undefined,
-      collaborationMode: {
-        kind: options.planModeEnabled ? "plan" : "default",
-        model: options.model,
-        reasoningEffort: options.reasoningEffort
-      }
+      collaborationMode: collaborationModePayload(options)
     });
     const turnRecord = turn.turn;
     this.activeTurnId = isRecord(turnRecord) ? String(turnRecord.id ?? "") : "";
@@ -330,7 +365,9 @@ export class CodexAppServerRuntime implements CodexRuntime {
         }
         if (mapped.completed) {
           this.activeTurnId = "";
-          yield { type: "turn.completed" };
+          if (!mapped.events.some((event) => event.type === "turn.completed")) {
+            yield { type: "turn.completed" };
+          }
         }
       }
     } finally {
@@ -367,15 +404,13 @@ export class CodexAppServerRuntime implements CodexRuntime {
     });
   }
 
-  answerApproval(approvalId: string, decision: "accept" | "decline" | "cancel"): void {
+  answerApproval(approvalId: string, decision: "accept" | "acceptForSession" | "decline" | "cancel"): void {
     const pending = this.pendingApprovals.get(approvalId);
     if (!pending || !this.connection) {
       throw new Error(`Unknown Codex approval id: ${approvalId}`);
     }
     this.pendingApprovals.delete(approvalId);
-    const payload = pending.method === "item/commandExecution/requestApproval"
-      ? { decision, execPolicyAmendment: [] }
-      : { decision };
+    const payload = { decision };
     this.connection.respond(pending.rpcId, payload);
   }
 
@@ -432,6 +467,7 @@ export class CodexAppServerRuntime implements CodexRuntime {
     const response = await connection.request("thread/start", {
       cwd: options.cwd,
       model: options.model,
+      baseInstructions: options.baseInstructions?.trim() || undefined,
       approvalPolicy: options.approvalMode === "default" ? undefined : options.approvalMode
     });
     const thread = response.thread;
@@ -447,6 +483,7 @@ export class CodexAppServerRuntime implements CodexRuntime {
       threadId: options.resumeThreadId,
       cwd: options.cwd,
       model: options.model,
+      baseInstructions: options.baseInstructions?.trim() || undefined,
       approvalPolicy: options.approvalMode === "default" ? undefined : options.approvalMode
     });
     const thread = response.thread;
@@ -469,7 +506,16 @@ export class CodexAppServerRuntime implements CodexRuntime {
       return { events: [], completed: false };
     }
     if (method === "turn/completed") {
-      return { events: [], completed: true };
+      return {
+        events: [{ type: "turn.completed", usage: isRecord(params.usage) ? params.usage : isRecord(params.tokenUsage) ? params.tokenUsage : undefined }],
+        completed: true
+      };
+    }
+    if (method === "thread/tokenUsage/updated") {
+      return {
+        events: [{ type: "turn.completed", usage: isRecord(params.usage) ? params.usage : isRecord(params.tokenUsage) ? params.tokenUsage : params }],
+        completed: false
+      };
     }
     if (method === "item/commandExecution/requestApproval" || method === "item/fileChange/requestApproval") {
       const id = String(message.id ?? "");
@@ -600,7 +646,7 @@ export class CodexCliRuntime implements CodexRuntime {
     this.activeProcess = null;
   }
 
-  answerApproval(_approvalId: string, _decision: "accept" | "decline" | "cancel"): void {
+  answerApproval(_approvalId: string, _decision: "accept" | "acceptForSession" | "decline" | "cancel"): void {
     throw new Error("Codex approval actions require the Codex app-server runtime.");
   }
 
@@ -734,6 +780,17 @@ export function codexItemToTimelineBlock(eventType: CodexThreadEvent["type"], it
 
 function codexInputItems(options: CodexRunOptions): Array<Record<string, unknown>> {
   return codexInputItemsFrom(options.prompt, options.imagePaths ?? []);
+}
+
+export function collaborationModePayload(options: CodexRunOptions): Record<string, unknown> {
+  return {
+    mode: options.planModeEnabled ? "plan" : "default",
+    settings: {
+      model: options.model,
+      developer_instructions: options.planModeEnabled ? PLAN_COLLABORATION_INSTRUCTIONS : DEFAULT_COLLABORATION_INSTRUCTIONS,
+      reasoning_effort: options.reasoningEffort ?? null
+    }
+  };
 }
 
 function codexInputItemsFrom(prompt: string, imagePaths: string[]): Array<Record<string, unknown>> {

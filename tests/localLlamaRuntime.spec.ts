@@ -40,7 +40,10 @@ test("builds a llama-server command for one local slot", () => {
     "--n-gpu-layers",
     "auto",
     "-np",
-    "1"
+    "1",
+    "--slots",
+    "--slot-save-path",
+    "C:\\runtime\\slots"
   ]);
 });
 
@@ -64,10 +67,10 @@ test("streams content from llama-server SSE responses", async () => {
     exitCode: null as number | null,
     kill: () => undefined
   });
-  const requests: string[] = [];
-  const fetchImpl = async (input: RequestInfo | URL) => {
+  const requests: Array<{ url: string; body?: Record<string, unknown> }> = [];
+  const fetchImpl = async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
-    requests.push(url);
+    requests.push({ url, body: init?.body ? JSON.parse(String(init.body)) as Record<string, unknown> : undefined });
     if (url.endsWith("/health")) {
       return Response.json({ status: "ok" });
     }
@@ -115,7 +118,8 @@ test("streams content from llama-server SSE responses", async () => {
   });
 
   expect(output).toBe("hello");
-  expect(requests.some((url) => url.endsWith("/v1/chat/completions"))).toBe(true);
+  const chatRequest = requests.find((request) => request.url.endsWith("/v1/chat/completions"));
+  expect(chatRequest?.body).toMatchObject({ cache_prompt: true, id_slot: 0 });
   runtime.close();
 });
 

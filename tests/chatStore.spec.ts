@@ -33,6 +33,113 @@ test("seeds a default global chat project and thread", () => {
   store.close();
 });
 
+test("imports legacy PySide history into a fresh SQLite chat store", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit-0-chat-legacy-"));
+  const historyPath = path.join(dir, "history.json");
+  const previousHistoryPath = process.env.UNIT_0_HISTORY_PATH;
+  process.env.UNIT_0_HISTORY_PATH = historyPath;
+  fs.writeFileSync(historyPath, JSON.stringify({
+    projects: [{
+      id: "legacy-project",
+      name: "Legacy Project",
+      created_at: "2026-01-01T00:00:00Z",
+      updated_at: "2026-01-02T00:00:00Z",
+      expanded: true,
+      settings: {
+        directory: "C:\\Legacy",
+        action_buttons: [{ label: "Dev", command: "npm run dev", directory: "C:\\Legacy" }]
+      }
+    }],
+    conversations: [{
+      id: "legacy-thread",
+      project_id: "legacy-project",
+      title: "Legacy Thread",
+      created_at: "2026-01-03T00:00:00Z",
+      updated_at: "2026-01-04T00:00:00Z",
+      messages: [
+        { id: "m-user", role: "user", content: "hello", created_at: "2026-01-03T00:00:00Z" },
+        { id: "m-assistant", role: "assistant", content: "world", reasoning: "thinking", model_label: "Qwen", provider_id: "builtin", created_at: "2026-01-03T00:01:00Z" }
+      ],
+      settings: {
+        provider_mode: "codex",
+        selected_settings_preset_id: "custom::default",
+        builtin: {
+          selected_model_id: "local::legacy",
+          inference_settings: {
+            n_ctx: 8192,
+            n_gpu_layers: -1,
+            reasoning_effort: "high",
+            permission_mode: "default_permissions",
+            system_prompt: "Legacy prompt",
+            temperature: 0.2,
+            repeat_penalty: 1.05,
+            trim_trigger_remaining_tokens: 500,
+            trim_trigger_remaining_ratio: 10,
+            trim_target_cleared_tokens: 1500,
+            trim_target_cleared_ratio: 25,
+            max_tokens: 4096
+          },
+          document_index_id: "doc-1",
+          active_context_start_message_index: 1,
+          context_revision: 2,
+          context_markers: [{ kind: "reset", boundary_message_count: 1, created_at: "2026-01-03T00:02:00Z" }]
+        },
+        codex: {
+          selected_model_id: "gpt-5.3-codex-spark",
+          selected_reasoning_effort: "high",
+          approval_mode: "on_request",
+          last_session_id: "codex-session",
+          plan_mode_enabled: true
+        }
+      }
+    }],
+    current_conversation_id: "legacy-thread",
+    selected_project_id: "legacy-project"
+  }));
+
+  try {
+    const store = new ChatStore(path.join(dir, "unit0.sqlite"));
+    const state = store.loadState();
+
+    expect(state.projects).toHaveLength(1);
+    expect(state.projects[0]).toMatchObject({
+      id: "legacy-project",
+      title: "Legacy Project",
+      directory: "C:\\Legacy"
+    });
+    expect(state.projects[0].actionButtons).toMatchObject([{ label: "Dev", command: "npm run dev", directory: "C:\\Legacy" }]);
+    expect(state.threads[0]).toMatchObject({
+      id: "legacy-thread",
+      projectId: "legacy-project",
+      providerMode: "codex",
+      builtinModelId: "local::legacy",
+      codexModelId: "gpt-5.3-codex-spark",
+      codexReasoningEffort: "high",
+      codexApprovalMode: "on-request",
+      planModeEnabled: true,
+      documentIndexId: "doc-1",
+      activeContextStartMessageIndex: 1,
+      contextRevision: 2
+    });
+    expect(state.runtimeSettings).toMatchObject({ nCtx: 8192, maxTokens: 4096, systemPrompt: "Legacy prompt" });
+    expect(state.selectedProjectId).toBe("legacy-project");
+    expect(state.selectedThreadId).toBe("legacy-thread");
+    expect(state.messages.map((message) => [message.id, message.role, message.content, message.label, message.sourceLabel])).toEqual([
+      ["m-user", "user", "hello", undefined, undefined],
+      ["m-assistant", "assistant", "world", "Qwen", "Built-in"]
+    ]);
+    expect(state.appSettings.expandedProjectIds).toEqual(["legacy-project"]);
+    store.close();
+  } finally {
+    if (previousHistoryPath === undefined) {
+      delete process.env.UNIT_0_HISTORY_PATH;
+    } else {
+      process.env.UNIT_0_HISTORY_PATH = previousHistoryPath;
+    }
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("creates and selects threads with persisted messages", () => {
   const { store, dbPath } = makeStore();
   const thread = store.createThread();
@@ -272,7 +379,11 @@ test("new threads inherit active provider and thread settings without runtime se
     codexApprovalMode: "on-request",
     planModeEnabled: true,
     documentIndexId: "old-index",
-    codexLastSessionId: "old-session"
+    codexLastSessionId: "old-session",
+    remoteSessionId: "remote-session",
+    remoteSlotId: 7,
+    remoteSettingsSignature: "old-signature",
+    remoteHostIdentity: "old-host"
   });
 
   const inherited = store.createThread();
@@ -291,8 +402,26 @@ test("new threads inherit active provider and thread settings without runtime se
     codexApprovalMode: "on-request",
     planModeEnabled: true,
     documentIndexId: "",
-    codexLastSessionId: ""
+    codexLastSessionId: "",
+    remoteSessionId: "",
+    remoteSlotId: 0,
+    remoteSettingsSignature: "",
+    remoteHostIdentity: ""
   });
   expect(state.threads.find((thread) => thread.id === inherited.id)?.runtimeSettings.nCtx).toBe(16384);
+  store.close();
+});
+
+test("normalizes invalid remote document tool settings to local execution", () => {
+  const { store } = makeStore();
+  store.updateAppSettings({
+    documentIndexLocation: "local",
+    documentToolExecutionLocation: "remote"
+  });
+
+  expect(store.loadState().appSettings).toMatchObject({
+    documentIndexLocation: "local",
+    documentToolExecutionLocation: "local"
+  });
   store.close();
 });

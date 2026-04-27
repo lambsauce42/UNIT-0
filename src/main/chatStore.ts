@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
@@ -52,6 +53,10 @@ type ChatThreadRow = ChatProjectRow & {
   plan_mode_enabled: number | null;
   document_index_id: string | null;
   codex_last_session_id: string | null;
+  remote_session_id: string | null;
+  remote_slot_id: number | null;
+  remote_settings_signature: string | null;
+  remote_host_identity: string | null;
   active_context_start_message_index: number | null;
   context_revision: number | null;
   context_markers_json: string | null;
@@ -91,11 +96,24 @@ type ChatDocumentIndexRow = {
   updated_at: string;
 };
 
+type LegacyHistoryImport = {
+  projects: Array<ChatProject & { expanded: boolean }>;
+  threads: ChatThread[];
+  messages: ChatMessage[];
+  selectedProjectId: string;
+  selectedThreadId: string;
+  sourcePath: string;
+};
+
 export type ChatDocumentSearchEntry = {
   chunkId: string;
   resultId: string;
+  sourceId?: string;
   sourceTitle: string;
   sourcePath: string;
+  sectionLabel?: string;
+  candidateCount?: number;
+  truncated?: boolean;
   pageStart: number;
   pageEnd: number;
   text: string;
@@ -218,6 +236,8 @@ export class ChatStore {
     this.db.exec("PRAGMA foreign_keys = ON");
     this.db.exec("PRAGMA journal_mode = WAL");
     this.migrate();
+    this.markStreamingMessagesInterrupted();
+    this.importLegacyHistoryIfEmpty();
     this.seedIfEmpty();
   }
 
@@ -247,6 +267,10 @@ export class ChatStore {
                 COALESCE(plan_mode_enabled, 0) AS plan_mode_enabled,
                 COALESCE(document_index_id, '') AS document_index_id,
                 COALESCE(codex_last_session_id, '') AS codex_last_session_id,
+                COALESCE(remote_session_id, '') AS remote_session_id,
+                COALESCE(remote_slot_id, 0) AS remote_slot_id,
+                COALESCE(remote_settings_signature, '') AS remote_settings_signature,
+                COALESCE(remote_host_identity, '') AS remote_host_identity,
                 COALESCE(active_context_start_message_index, 0) AS active_context_start_message_index,
                 COALESCE(context_revision, 0) AS context_revision,
                 COALESCE(context_markers_json, '[]') AS context_markers_json,
@@ -329,6 +353,10 @@ export class ChatStore {
       planModeEnabled: false,
       documentIndexId: "",
       codexLastSessionId: "",
+      remoteSessionId: "",
+      remoteSlotId: 0,
+      remoteSettingsSignature: "",
+      remoteHostIdentity: "",
       activeContextStartMessageIndex: 0,
       contextRevision: 0,
       contextMarkers: [],
@@ -402,6 +430,10 @@ export class ChatStore {
       planModeEnabled: templateThread?.planModeEnabled ?? false,
       documentIndexId: "",
       codexLastSessionId: "",
+      remoteSessionId: "",
+      remoteSlotId: 0,
+      remoteSettingsSignature: "",
+      remoteHostIdentity: "",
       activeContextStartMessageIndex: 0,
       contextRevision: 0,
       contextMarkers: [],
@@ -414,8 +446,8 @@ export class ChatStore {
         .prepare(`INSERT INTO chat_threads
           (id, project_id, title, provider_mode, selected_settings_preset_id, builtin_model_id, runtime_settings_json, builtin_agentic_framework,
            document_analysis_embedding_model_path, codex_model_id, codex_reasoning_effort, permission_mode, codex_approval_mode, plan_mode_enabled,
-           document_index_id, codex_last_session_id, created_at, updated_at, sort_order)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+           document_index_id, codex_last_session_id, remote_session_id, remote_slot_id, remote_settings_signature, remote_host_identity, created_at, updated_at, sort_order)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
         .run(
           thread.id,
           thread.projectId,
@@ -433,6 +465,10 @@ export class ChatStore {
           thread.planModeEnabled ? 1 : 0,
           thread.documentIndexId,
           thread.codexLastSessionId,
+          thread.remoteSessionId,
+          thread.remoteSlotId,
+          thread.remoteSettingsSignature,
+          thread.remoteHostIdentity,
           thread.createdAt,
           thread.updatedAt,
           this.nextSortOrder("chat_threads")
@@ -834,7 +870,7 @@ export class ChatStore {
 
   updateThreadSettings(
     threadId: string,
-    settings: Partial<Omit<Pick<ChatThread, "providerMode" | "selectedSettingsPresetId" | "builtinModelId" | "builtinAgenticFramework" | "documentAnalysisEmbeddingModelPath" | "codexModelId" | "codexReasoningEffort" | "permissionMode" | "codexApprovalMode" | "planModeEnabled" | "documentIndexId" | "codexLastSessionId">, never>> & { runtimeSettings?: Partial<ChatRuntimeSettings> }
+    settings: Partial<Omit<Pick<ChatThread, "providerMode" | "selectedSettingsPresetId" | "builtinModelId" | "builtinAgenticFramework" | "documentAnalysisEmbeddingModelPath" | "codexModelId" | "codexReasoningEffort" | "permissionMode" | "codexApprovalMode" | "planModeEnabled" | "documentIndexId" | "codexLastSessionId" | "remoteSessionId" | "remoteSlotId" | "remoteSettingsSignature" | "remoteHostIdentity">, never>> & { runtimeSettings?: Partial<ChatRuntimeSettings> }
   ): void {
     const row = this.db.prepare("SELECT id, project_id, runtime_settings_json FROM chat_threads WHERE id = ?").get(threadId) as
       | { id: string; project_id: string; runtime_settings_json: string | null }
@@ -860,6 +896,10 @@ export class ChatStore {
     const planModeEnabled = settings.planModeEnabled === undefined ? undefined : (settings.planModeEnabled ? 1 : 0);
     const documentIndexId = settings.documentIndexId === undefined ? undefined : settings.documentIndexId.trim();
     const codexLastSessionId = settings.codexLastSessionId === undefined ? undefined : settings.codexLastSessionId.trim();
+    const remoteSessionId = settings.remoteSessionId === undefined ? undefined : settings.remoteSessionId.trim();
+    const remoteSlotId = settings.remoteSlotId === undefined ? undefined : nonNegativeInteger(settings.remoteSlotId, 0);
+    const remoteSettingsSignature = settings.remoteSettingsSignature === undefined ? undefined : settings.remoteSettingsSignature.trim();
+    const remoteHostIdentity = settings.remoteHostIdentity === undefined ? undefined : settings.remoteHostIdentity.trim();
     const now = timestamp();
     this.db.exec("BEGIN IMMEDIATE");
     try {
@@ -879,10 +919,14 @@ export class ChatStore {
                plan_mode_enabled = COALESCE(?, plan_mode_enabled),
                document_index_id = COALESCE(?, document_index_id),
                codex_last_session_id = COALESCE(?, codex_last_session_id),
+               remote_session_id = COALESCE(?, remote_session_id),
+               remote_slot_id = COALESCE(?, remote_slot_id),
+               remote_settings_signature = COALESCE(?, remote_settings_signature),
+               remote_host_identity = COALESCE(?, remote_host_identity),
                updated_at = ?
            WHERE id = ?`
         )
-        .run(providerMode ?? null, selectedSettingsPresetId ?? null, builtinModelId ?? null, runtimeSettings ?? null, builtinAgenticFramework ?? null, documentAnalysisEmbeddingModelPath ?? null, codexModelId ?? null, codexReasoningEffort ?? null, permissionMode ?? null, codexApprovalMode ?? null, planModeEnabled ?? null, documentIndexId ?? null, codexLastSessionId ?? null, now, row.id);
+        .run(providerMode ?? null, selectedSettingsPresetId ?? null, builtinModelId ?? null, runtimeSettings ?? null, builtinAgenticFramework ?? null, documentAnalysisEmbeddingModelPath ?? null, codexModelId ?? null, codexReasoningEffort ?? null, permissionMode ?? null, codexApprovalMode ?? null, planModeEnabled ?? null, documentIndexId ?? null, codexLastSessionId ?? null, remoteSessionId ?? null, remoteSlotId ?? null, remoteSettingsSignature ?? null, remoteHostIdentity ?? null, now, row.id);
       this.db.prepare("UPDATE chat_projects SET updated_at = ? WHERE id = ?").run(now, row.project_id);
       this.db.exec("COMMIT");
     } catch (error) {
@@ -1119,8 +1163,12 @@ export class ChatStore {
       .map((item, index) => ({
         chunkId: item.row.chunkId,
         resultId: `r${index + 1}`,
+        sourceId: (item.row.sourceId ?? path.basename(item.row.sourcePath)) || item.row.sourcePath,
         sourceTitle: item.row.sourceTitle,
         sourcePath: item.row.sourcePath,
+        sectionLabel: item.row.sectionLabel ?? `page ${item.row.pageStart}${item.row.pageEnd !== item.row.pageStart ? `-${item.row.pageEnd}` : ""}`,
+        candidateCount: Math.max(1, Math.floor(item.score)),
+        truncated: usedTokens >= budgetTokens,
         pageStart: item.row.pageStart,
         pageEnd: item.row.pageEnd,
         text: item.row.text,
@@ -1158,6 +1206,10 @@ export class ChatStore {
       usedTokens += tokenCount;
       expanded.push({
         ...result,
+        sourceId: (result.sourceId ?? path.basename(result.sourcePath)) || result.sourcePath,
+        sectionLabel: result.sectionLabel ?? `page ${Math.min(...group.map((row) => row.pageStart))}${Math.max(...group.map((row) => row.pageEnd)) !== Math.min(...group.map((row) => row.pageStart)) ? `-${Math.max(...group.map((row) => row.pageEnd))}` : ""}`,
+        candidateCount: result.candidateCount ?? group.length,
+        truncated: usedTokens >= budgetTokens,
         pageStart: Math.min(...group.map((row) => row.pageStart)),
         pageEnd: Math.max(...group.map((row) => row.pageEnd)),
         text: group.map((row) => row.text).join("\n\n"),
@@ -1186,8 +1238,12 @@ export class ChatStore {
     return rows.map((row) => ({
       chunkId: row.id,
       resultId: "",
+      sourceId: path.basename(row.source_path) || row.source_path,
       sourceTitle: row.source_title,
       sourcePath: row.source_path,
+      sectionLabel: `page ${row.page_start}${row.page_end !== row.page_start ? `-${row.page_end}` : ""}`,
+      candidateCount: 1,
+      truncated: false,
       pageStart: row.page_start,
       pageEnd: row.page_end,
       text: row.text,
@@ -1281,6 +1337,28 @@ export class ChatStore {
       this.db
         .prepare("UPDATE chat_messages SET metadata_json = ?, updated_at = ? WHERE id = ?")
         .run(JSON.stringify({ ...metadata, timelineBlocks }), now, messageId);
+      this.touchThreadInTransaction(row.thread_id, now);
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  mergeMessageMetadata(messageId: string, patch: Record<string, unknown>): void {
+    const row = this.db.prepare("SELECT thread_id, metadata_json FROM chat_messages WHERE id = ?").get(messageId) as
+      | { thread_id: string; metadata_json: string | null }
+      | undefined;
+    if (!row) {
+      throw new Error(`Chat message does not exist: ${messageId}`);
+    }
+    const metadata = parseJsonObject(row.metadata_json) ?? {};
+    const now = timestamp();
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db
+        .prepare("UPDATE chat_messages SET metadata_json = ?, updated_at = ? WHERE id = ?")
+        .run(JSON.stringify({ ...metadata, ...patch }), now, messageId);
       this.touchThreadInTransaction(row.thread_id, now);
       this.db.exec("COMMIT");
     } catch (error) {
@@ -1435,6 +1513,10 @@ export class ChatStore {
     ensureThreadColumn("plan_mode_enabled", "plan_mode_enabled INTEGER NOT NULL DEFAULT 0");
     ensureThreadColumn("document_index_id", "document_index_id TEXT NOT NULL DEFAULT ''");
     ensureThreadColumn("codex_last_session_id", "codex_last_session_id TEXT NOT NULL DEFAULT ''");
+    ensureThreadColumn("remote_session_id", "remote_session_id TEXT NOT NULL DEFAULT ''");
+    ensureThreadColumn("remote_slot_id", "remote_slot_id INTEGER NOT NULL DEFAULT 0");
+    ensureThreadColumn("remote_settings_signature", "remote_settings_signature TEXT NOT NULL DEFAULT ''");
+    ensureThreadColumn("remote_host_identity", "remote_host_identity TEXT NOT NULL DEFAULT ''");
     ensureThreadColumn("active_context_start_message_index", "active_context_start_message_index INTEGER NOT NULL DEFAULT 0");
     ensureThreadColumn("context_revision", "context_revision INTEGER NOT NULL DEFAULT 0");
     ensureThreadColumn("context_markers_json", "context_markers_json TEXT NOT NULL DEFAULT '[]'");
@@ -1449,6 +1531,113 @@ export class ChatStore {
     ensureMessageColumn("source_label", "source_label TEXT");
     ensureMessageColumn("reasoning", "reasoning TEXT");
     ensureMessageColumn("metadata_json", "metadata_json TEXT");
+  }
+
+  private importLegacyHistoryIfEmpty(): void {
+    const existing = this.db.prepare("SELECT COUNT(*) AS count FROM chat_projects").get() as { count: number };
+    if (existing.count > 0) {
+      return;
+    }
+    const sourcePath = legacyHistoryPath(this.dbPath);
+    if (!sourcePath) {
+      return;
+    }
+    const imported = loadLegacyHistory(sourcePath);
+    if (!imported) {
+      return;
+    }
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const insertProject = this.db.prepare(
+        "INSERT INTO chat_projects (id, title, directory, action_buttons_json, created_at, updated_at, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?)"
+      );
+      imported.projects.forEach((project, index) => {
+        insertProject.run(
+          project.id,
+          project.title,
+          project.directory,
+          JSON.stringify(project.actionButtons),
+          project.createdAt,
+          project.updatedAt,
+          index
+        );
+      });
+      const insertThread = this.db.prepare(
+        `INSERT INTO chat_threads
+          (id, project_id, title, provider_mode, selected_settings_preset_id, builtin_model_id, runtime_settings_json, builtin_agentic_framework,
+           document_analysis_embedding_model_path, codex_model_id, codex_reasoning_effort, permission_mode, codex_approval_mode, plan_mode_enabled,
+           document_index_id, codex_last_session_id, remote_session_id, remote_slot_id, remote_settings_signature, remote_host_identity,
+           active_context_start_message_index, context_revision, context_markers_json, created_at, updated_at, sort_order)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      );
+      imported.threads.forEach((thread, index) => {
+        insertThread.run(
+          thread.id,
+          thread.projectId,
+          thread.title,
+          thread.providerMode,
+          thread.selectedSettingsPresetId,
+          thread.builtinModelId,
+          JSON.stringify(thread.runtimeSettings),
+          thread.builtinAgenticFramework,
+          thread.documentAnalysisEmbeddingModelPath,
+          thread.codexModelId,
+          thread.codexReasoningEffort,
+          thread.permissionMode,
+          thread.codexApprovalMode,
+          thread.planModeEnabled ? 1 : 0,
+          thread.documentIndexId,
+          thread.codexLastSessionId,
+          thread.remoteSessionId,
+          thread.remoteSlotId,
+          thread.remoteSettingsSignature,
+          thread.remoteHostIdentity,
+          thread.activeContextStartMessageIndex,
+          thread.contextRevision,
+          JSON.stringify(thread.contextMarkers),
+          thread.createdAt,
+          thread.updatedAt,
+          index
+        );
+      });
+      const insertMessage = this.db.prepare(
+        `INSERT INTO chat_messages
+          (id, thread_id, role, content, attachments_json, label, source_label, reasoning, metadata_json, status, created_at, updated_at, sort_order)
+         VALUES (?, ?, ?, ?, '[]', ?, ?, ?, ?, ?, ?, ?, ?)`
+      );
+      imported.messages.forEach((message, index) => {
+        insertMessage.run(
+          message.id,
+          message.threadId,
+          message.role,
+          message.content,
+          message.label ?? null,
+          message.sourceLabel ?? null,
+          message.reasoning ?? null,
+          message.metadata ? JSON.stringify(message.metadata) : null,
+          message.status,
+          message.createdAt,
+          message.updatedAt,
+          index
+        );
+      });
+      this.setSettingInTransaction("selected_project_id", imported.selectedProjectId);
+      this.setSettingInTransaction("selected_thread_id", imported.selectedThreadId);
+      this.setSettingInTransaction("runtime_settings_json", JSON.stringify(DEFAULT_RUNTIME_SETTINGS));
+      this.setSettingInTransaction(
+        "app_settings_json",
+        JSON.stringify(normalizeAppSettings({
+          ...DEFAULT_APP_SETTINGS,
+          expandedProjectIds: imported.projects.filter((project) => project.expanded).map((project) => project.id)
+        }))
+      );
+      this.setSettingInTransaction("settings_presets_json", JSON.stringify(DEFAULT_SETTINGS_PRESETS));
+      this.setSettingInTransaction("legacy_history_imported_path", imported.sourcePath);
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   private seedIfEmpty(): void {
@@ -1503,6 +1692,11 @@ export class ChatStore {
     } catch {
       return DEFAULT_APP_SETTINGS;
     }
+  }
+
+  private markStreamingMessagesInterrupted(): void {
+    const now = timestamp();
+    this.db.prepare("UPDATE chat_messages SET status = 'interrupted', updated_at = ? WHERE status = 'streaming'").run(now);
   }
 
   private settingsPresets(): ChatSettingsPreset[] {
@@ -1623,6 +1817,316 @@ export class ChatStore {
   }
 }
 
+function legacyHistoryPath(dbPath: string): string | null {
+  const explicit = process.env.UNIT_0_HISTORY_PATH?.trim();
+  if (explicit) {
+    return path.resolve(explicit);
+  }
+  const resolvedDbPath = path.resolve(dbPath).toLowerCase();
+  const resolvedTempPath = path.resolve(os.tmpdir()).toLowerCase();
+  if (process.env.NODE_ENV === "test" || resolvedDbPath.startsWith(resolvedTempPath)) {
+    return null;
+  }
+  const stateDir = process.env.UNIT_0_STATE_DIR?.trim();
+  const candidates = [
+    stateDir ? path.join(path.resolve(stateDir), "history.json") : "",
+    path.join(os.homedir(), "Documents", "UNIT-0", "history.json"),
+    process.env.APPDATA ? path.join(process.env.APPDATA, "UNIT-0", "history.json") : ""
+  ].filter(Boolean);
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) {
+      return candidate;
+    }
+  }
+  return null;
+}
+
+function loadLegacyHistory(sourcePath: string): LegacyHistoryImport | null {
+  if (!fs.existsSync(sourcePath)) {
+    if (process.env.UNIT_0_HISTORY_PATH?.trim()) {
+      throw new Error(`Legacy UNIT-0 chat history file does not exist: ${sourcePath}`);
+    }
+    return null;
+  }
+  let payload: unknown;
+  try {
+    payload = JSON.parse(fs.readFileSync(sourcePath, "utf-8"));
+  } catch (error) {
+    throw new Error(`Legacy UNIT-0 chat history could not be parsed: ${sourcePath}. ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (!isRecord(payload)) {
+    throw new Error(`Legacy UNIT-0 chat history has an invalid root payload: ${sourcePath}`);
+  }
+  const rawProjects = Array.isArray(payload.projects) ? payload.projects : [];
+  const rawConversations = Array.isArray(payload.conversations) ? payload.conversations : [];
+  if (rawProjects.length === 0 && rawConversations.length === 0) {
+    return null;
+  }
+  const projectIds = new Set<string>();
+  const projectIdMap = new Map<string, string>();
+  const projects = rawProjects.map((item, index): ChatProject & { expanded: boolean } | null => {
+    if (!isRecord(item)) {
+      return null;
+    }
+    const createdAt = legacyTimestamp(item.created_at);
+    const originalId = legacyText(item.id);
+    const id = uniqueLegacyId(originalId, "chat-project", projectIds);
+    if (originalId) {
+      projectIdMap.set(originalId, id);
+    }
+    const settings = isRecord(item.settings) ? item.settings : {};
+    return {
+      id,
+      title: normalizeTitle(legacyText(item.name) || `Project ${index + 1}`, 80) || `Project ${index + 1}`,
+      directory: legacyText(settings.directory),
+      actionButtons: normalizeLegacyActionButtons(settings.action_buttons),
+      expanded: item.expanded !== false,
+      createdAt,
+      updatedAt: legacyTimestamp(item.updated_at, createdAt)
+    };
+  }).filter((project): project is ChatProject & { expanded: boolean } => Boolean(project));
+  if (projects.length === 0) {
+    const now = timestamp();
+    const id = uniqueLegacyId("", "chat-project", projectIds);
+    projects.push({ id, title: "Project 1", directory: "", actionButtons: [], expanded: true, createdAt: now, updatedAt: now });
+  }
+  const defaultProjectId = projects[0].id;
+  const threadIds = new Set<string>();
+  const threadIdMap = new Map<string, string>();
+  const messageIds = new Set<string>();
+  const threads: ChatThread[] = [];
+  const messages: ChatMessage[] = [];
+  rawConversations.forEach((item, index) => {
+    if (!isRecord(item)) {
+      return;
+    }
+    const createdAt = legacyTimestamp(item.created_at);
+    const originalThreadId = legacyText(item.id);
+    const threadId = uniqueLegacyId(originalThreadId, "chat-thread", threadIds);
+    if (originalThreadId) {
+      threadIdMap.set(originalThreadId, threadId);
+    }
+    const settings = legacyThreadSettings(item.settings);
+    const legacyProjectId = legacyText(item.project_id);
+    const projectId = projectIdMap.get(legacyProjectId) ?? (projectIds.has(legacyProjectId) ? legacyProjectId : defaultProjectId);
+    threads.push({
+      id: threadId,
+      projectId,
+      title: normalizeTitle(legacyText(item.title) || `Thread ${index + 1}`, 80) || `Thread ${index + 1}`,
+      ...settings,
+      createdAt,
+      updatedAt: legacyTimestamp(item.updated_at, createdAt)
+    });
+    const rawMessages = Array.isArray(item.messages) ? item.messages : [];
+    rawMessages.forEach((rawMessage) => {
+      if (!isRecord(rawMessage)) {
+        return;
+      }
+      const role = legacyText(rawMessage.role) === "user" ? "user" : "assistant";
+      const messageCreatedAt = legacyTimestamp(rawMessage.created_at, createdAt);
+      messages.push({
+        id: uniqueLegacyId(legacyText(rawMessage.id), "chat-message", messageIds),
+        threadId,
+        role,
+        content: legacyText(rawMessage.content),
+        attachments: [],
+        label: legacyText(rawMessage.model_label) || undefined,
+        sourceLabel: legacyProviderLabel(rawMessage.provider_id),
+        reasoning: legacyText(rawMessage.reasoning) || undefined,
+        metadata: legacyMessageMetadata(rawMessage),
+        status: "complete",
+        createdAt: messageCreatedAt,
+        updatedAt: messageCreatedAt
+      });
+    });
+  });
+  if (threads.length === 0) {
+    const now = timestamp();
+    threads.push({
+      id: uniqueLegacyId("", "chat-thread", threadIds),
+      projectId: defaultProjectId,
+      title: "Thread 1",
+      ...legacyThreadSettings(undefined),
+      createdAt: now,
+      updatedAt: now
+    });
+  }
+  const selectedThreadId = threadIdMap.get(legacyText(payload.current_conversation_id))
+    ?? [...threads].sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))[0]?.id
+    ?? threads[0].id;
+  const selectedThread = threads.find((thread) => thread.id === selectedThreadId) ?? threads[0];
+  const selectedProjectId = projectIdMap.get(legacyText(payload.selected_project_id))
+    ?? selectedThread.projectId
+    ?? projects[0].id;
+  return {
+    projects,
+    threads,
+    messages,
+    selectedProjectId,
+    selectedThreadId: selectedThread.id,
+    sourcePath
+  };
+}
+
+function legacyThreadSettings(value: unknown): Omit<ChatThread, "id" | "projectId" | "title" | "createdAt" | "updatedAt"> {
+  const payload = isRecord(value) ? value : {};
+  const builtin = isRecord(payload.builtin) ? payload.builtin : {};
+  const codex = isRecord(payload.codex) ? payload.codex : {};
+  const runtimeSettings = legacyRuntimeSettings(isRecord(builtin.inference_settings) ? builtin.inference_settings : {});
+  const providerMode = normalizeProviderMode(payload.provider_mode, "builtin");
+  return {
+    providerMode,
+    selectedSettingsPresetId: typeof payload.selected_settings_preset_id === "string" && payload.selected_settings_preset_id.trim()
+      ? payload.selected_settings_preset_id.trim()
+      : DEFAULT_SETTINGS_PRESET_ID,
+    builtinModelId: legacyText(builtin.selected_model_id),
+    runtimeSettings,
+    builtinAgenticFramework: legacyText(builtin.document_index_id) ? "document_analysis" : "chat",
+    documentAnalysisEmbeddingModelPath: legacyText(builtin.document_analysis_embedding_model_path),
+    codexModelId: normalizeCodexModelId(codex.selected_model_id),
+    codexReasoningEffort: normalizeReasoningEffort(codex.selected_reasoning_effort, "medium"),
+    permissionMode: normalizePermissionMode(runtimeSettings.permissionMode, DEFAULT_RUNTIME_SETTINGS.permissionMode),
+    codexApprovalMode: normalizeCodexApprovalMode(codex.approval_mode, "default"),
+    planModeEnabled: Boolean(codex.plan_mode_enabled),
+    documentIndexId: legacyText(builtin.document_index_id),
+    codexLastSessionId: legacyText(codex.last_session_id),
+    remoteSessionId: legacyText(builtin.runtime_backend) === "remote_llama_host" ? legacyText(builtin.runtime_session_id) : "",
+    remoteSlotId: legacyText(builtin.runtime_backend) === "remote_llama_host" ? legacyNonNegativeInteger(builtin.runtime_slot_id, 0) : 0,
+    remoteSettingsSignature: legacyText(builtin.runtime_backend) === "remote_llama_host" ? legacyText(builtin.runtime_settings_signature) : "",
+    remoteHostIdentity: legacyText(builtin.remote_host_identity),
+    activeContextStartMessageIndex: legacyNonNegativeInteger(builtin.active_context_start_message_index, 0),
+    contextRevision: legacyNonNegativeInteger(builtin.context_revision, 0),
+    contextMarkers: legacyContextMarkers(builtin.context_markers)
+  };
+}
+
+function legacyRuntimeSettings(value: Record<string, unknown>): ChatRuntimeSettings {
+  return normalizeRuntimeSettings({
+    nCtx: legacyPositiveInteger(value.n_ctx, DEFAULT_RUNTIME_SETTINGS.nCtx),
+    nGpuLayers: legacyInteger(value.n_gpu_layers, DEFAULT_RUNTIME_SETTINGS.nGpuLayers),
+    temperature: legacyFiniteNumber(value.temperature, DEFAULT_RUNTIME_SETTINGS.temperature),
+    repeatPenalty: legacyFiniteNumber(value.repeat_penalty, DEFAULT_RUNTIME_SETTINGS.repeatPenalty),
+    maxTokens: legacyPositiveInteger(value.max_tokens, DEFAULT_RUNTIME_SETTINGS.maxTokens),
+    reasoningEffort: normalizeBuiltinReasoningEffort(value.reasoning_effort, DEFAULT_RUNTIME_SETTINGS.reasoningEffort),
+    permissionMode: normalizePermissionMode(value.permission_mode, DEFAULT_RUNTIME_SETTINGS.permissionMode),
+    trimReserveTokens: legacyPositiveInteger(value.trim_trigger_remaining_tokens, DEFAULT_RUNTIME_SETTINGS.trimReserveTokens),
+    trimReservePercent: legacyFiniteNumber(value.trim_trigger_remaining_ratio, DEFAULT_RUNTIME_SETTINGS.trimReservePercent),
+    trimAmountTokens: legacyPositiveInteger(value.trim_target_cleared_tokens, DEFAULT_RUNTIME_SETTINGS.trimAmountTokens),
+    trimAmountPercent: legacyFiniteNumber(value.trim_target_cleared_ratio, DEFAULT_RUNTIME_SETTINGS.trimAmountPercent),
+    systemPrompt: typeof value.system_prompt === "string" ? value.system_prompt : DEFAULT_RUNTIME_SETTINGS.systemPrompt
+  });
+}
+
+function legacyContextMarkers(value: unknown): ChatContextMarker[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return normalizeContextMarkers(value.map((item): ChatContextMarker | null => {
+    if (!isRecord(item)) {
+      return null;
+    }
+    return {
+      kind: legacyText(item.kind) === "reset" ? "reset" : "trim",
+      boundaryMessageCount: legacyNonNegativeInteger(item.boundary_message_count, 0),
+      timestamp: legacyTimestamp(item.created_at)
+    };
+  }).filter((item): item is ChatContextMarker => Boolean(item)));
+}
+
+function normalizeLegacyActionButtons(value: unknown): ChatActionButton[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return normalizeActionButtons(value.map((item, index) => {
+    const row = isRecord(item) ? item : {};
+    return {
+      id: legacyText(row.id) || `action-${index + 1}`,
+      label: legacyText(row.label),
+      command: legacyText(row.command),
+      directory: legacyText(row.directory)
+    };
+  }));
+}
+
+function legacyMessageMetadata(value: Record<string, unknown>): Record<string, unknown> | undefined {
+  const metadata: Record<string, unknown> = {};
+  if (typeof value.reasoning_initially_expanded === "boolean") {
+    metadata.reasoningInitiallyExpanded = value.reasoning_initially_expanded;
+  }
+  const providerId = legacyText(value.provider_id);
+  if (providerId) {
+    metadata.providerId = providerId;
+  }
+  return Object.keys(metadata).length > 0 ? metadata : undefined;
+}
+
+function legacyProviderLabel(value: unknown): string | undefined {
+  const providerId = legacyText(value);
+  if (!providerId) {
+    return undefined;
+  }
+  if (providerId === "codex") {
+    return "Codex";
+  }
+  if (providerId === "builtin" || providerId === "local") {
+    return "Built-in";
+  }
+  return providerId;
+}
+
+function uniqueLegacyId(value: string, prefix: string, seen: Set<string>): string {
+  const trimmed = value.trim();
+  const candidate = trimmed || `${prefix}-${randomUUID()}`;
+  if (!seen.has(candidate)) {
+    seen.add(candidate);
+    return candidate;
+  }
+  let next = `${prefix}-${randomUUID()}`;
+  while (seen.has(next)) {
+    next = `${prefix}-${randomUUID()}`;
+  }
+  seen.add(next);
+  return next;
+}
+
+function legacyText(value: unknown): string {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function legacyTimestamp(value: unknown, fallback?: string): string {
+  if (typeof value === "string" && value.trim()) {
+    const parsed = Date.parse(value);
+    if (Number.isFinite(parsed)) {
+      return value;
+    }
+  }
+  return fallback ?? timestamp();
+}
+
+function legacyInteger(value: unknown, fallback: number): number {
+  const parsed = typeof value === "number" ? value : Number(value);
+  return Number.isInteger(parsed) ? parsed : fallback;
+}
+
+function legacyPositiveInteger(value: unknown, fallback: number): number {
+  const parsed = legacyInteger(value, fallback);
+  return parsed > 0 ? parsed : fallback;
+}
+
+function legacyNonNegativeInteger(value: unknown, fallback: number): number {
+  const parsed = legacyInteger(value, fallback);
+  return parsed >= 0 ? parsed : fallback;
+}
+
+function legacyFiniteNumber(value: unknown, fallback: number): number {
+  const parsed = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 function projectFromRow(row: ChatProjectRow): ChatProject {
   return {
     id: row.id,
@@ -1652,6 +2156,10 @@ function threadFromRow(row: ChatThreadRow): ChatThread {
     planModeEnabled: row.plan_mode_enabled === 1,
     documentIndexId: row.document_index_id ?? "",
     codexLastSessionId: row.codex_last_session_id ?? "",
+    remoteSessionId: row.remote_session_id ?? "",
+    remoteSlotId: nonNegativeInteger(row.remote_slot_id, 0),
+    remoteSettingsSignature: row.remote_settings_signature ?? "",
+    remoteHostIdentity: row.remote_host_identity ?? "",
     activeContextStartMessageIndex: nonNegativeInteger(row.active_context_start_message_index, 0),
     contextRevision: nonNegativeInteger(row.context_revision, 0),
     contextMarkers: normalizeContextMarkers(parseJsonArray<ChatContextMarker>(row.context_markers_json, [])),
@@ -1717,6 +2225,8 @@ function normalizeRuntimeSettings(value: Partial<ChatRuntimeSettings>): ChatRunt
 }
 
 function normalizeAppSettings(value: Partial<ChatAppSettings>): ChatAppSettings {
+  const documentIndexLocation = value.documentIndexLocation === "remote" ? "remote" : "local";
+  const requestedDocumentToolLocation = value.documentToolExecutionLocation === "remote" ? "remote" : "local";
   return {
     usageIndicatorPlacement: value.usageIndicatorPlacement === "composer" ? "composer" : "footer",
     usageIndicatorOrder: Array.isArray(value.usageIndicatorOrder) && value.usageIndicatorOrder.every((item) => typeof item === "string")
@@ -1729,8 +2239,8 @@ function normalizeAppSettings(value: Partial<ChatAppSettings>): ChatAppSettings 
     autoExpandCodexDisclosures: typeof value.autoExpandCodexDisclosures === "boolean"
       ? value.autoExpandCodexDisclosures
       : DEFAULT_APP_SETTINGS.autoExpandCodexDisclosures,
-    documentIndexLocation: value.documentIndexLocation === "remote" ? "remote" : "local",
-    documentToolExecutionLocation: value.documentToolExecutionLocation === "remote" ? "remote" : "local",
+    documentIndexLocation,
+    documentToolExecutionLocation: documentIndexLocation === "local" && requestedDocumentToolLocation === "remote" ? "local" : requestedDocumentToolLocation,
     tokenizerModelPath: typeof value.tokenizerModelPath === "string" ? value.tokenizerModelPath : "",
     remoteHostAddress: typeof value.remoteHostAddress === "string" ? value.remoteHostAddress : "",
     remoteHostPort: positiveInteger(value.remoteHostPort, DEFAULT_APP_SETTINGS.remoteHostPort),

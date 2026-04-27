@@ -4,6 +4,7 @@ import path from "node:path";
 import type { ChatAppSettings, ChatDocumentIndex, ChatMessage, ChatModel, ChatRuntimeSettings } from "../shared/types.js";
 
 const PROTOCOL_VERSION = "1";
+export const DEFAULT_SYSTEM_PROMPT = "When writing math, keep explanatory prose outside display-math environments; use normal sentences for labels or setup text, and reserve display math for the equations themselves. Do not put headings, captions, or narrative text inside aligned/align/gathered math blocks unless the user explicitly asks for raw LaTeX structure. If a line contains only an equation, format it as display math rather than inline math so it renders as a centered equation block.";
 const REQUIRED_CAPABILITIES = new Set([
   "model_catalog",
   "chat_stream",
@@ -19,6 +20,14 @@ type RemoteHostConfig = Pick<ChatAppSettings, "remoteHostAddress" | "remoteHostP
 type RemoteSearchResult = {
   document_id?: string;
   entries?: unknown[];
+};
+export type RemoteStreamMetrics = {
+  remoteSessionId: string;
+  remoteSlotId: number;
+  remoteHostId: string;
+  remoteHostIdentity: string;
+  remoteSessionStatus: string;
+  metrics: Record<string, unknown>;
 };
 
 export class RemoteHostRuntime {
@@ -76,9 +85,12 @@ export class RemoteHostRuntime {
     model: ChatModel;
     runtimeSettings: ChatRuntimeSettings;
     messages: ChatMessage[];
+    remoteSessionId?: string;
+    runtimeSlotId?: number;
+    runtimeSettingsSignature?: string;
     onToken: (token: string) => void;
     onReasoning?: (token: string) => void;
-  }): Promise<void> {
+  }): Promise<RemoteStreamMetrics> {
     const config = remoteConfig(options.settings);
     if (!config.remoteHostIdentity || !config.remoteHostId) {
       throw new Error("Remote host is not configured or trusted.");
@@ -95,9 +107,9 @@ export class RemoteHostRuntime {
         provider_id: message.sourceLabel === "Remote Built-in" ? "remote" : "local"
       })),
       settings: remoteRuntimeSettings(options.runtimeSettings),
-      remote_session_id: "",
-      runtime_slot_id: 0,
-      runtime_settings_signature: "",
+      remote_session_id: options.remoteSessionId ?? "",
+      runtime_slot_id: Math.max(0, options.runtimeSlotId ?? 0),
+      runtime_settings_signature: options.runtimeSettingsSignature ?? "",
       request_id: randomUUID(),
       builtin_agentic_framework: "chat",
       document_title: ""
@@ -114,7 +126,7 @@ export class RemoteHostRuntime {
       if (!response.ok || !response.body) {
         throw new Error(`Remote host request failed (${response.status}): ${await response.text().catch(() => response.statusText)}`);
       }
-      this.validateStreamOpen(config, response, nonce, "/v1/chat");
+      const metrics = this.validateStreamOpen(config, response, nonce, "/v1/chat");
       let completed = false;
       await readNdjson(response.body, (event, sequence) => {
         this.validateStreamEvent(config, nonce, sequence, event);
@@ -125,6 +137,9 @@ export class RemoteHostRuntime {
         }
         if (type === "complete") {
           completed = true;
+          if (isRecord(event.metrics)) {
+            metrics.metrics = { ...metrics.metrics, ...event.metrics };
+          }
         }
         if (type === "error") {
           throw new Error(stringField(event.message) || "Remote host request failed.");
@@ -133,6 +148,79 @@ export class RemoteHostRuntime {
       if (!completed && !abortController.signal.aborted) {
         throw new Error("Remote host stream ended unexpectedly.");
       }
+      return metrics;
+    } finally {
+      if (this.activeAbortController === abortController) {
+        this.activeAbortController = null;
+      }
+    }
+  }
+
+  async streamDocumentAnalysis(options: {
+    settings: ChatAppSettings;
+    model: ChatModel;
+    runtimeSettings: ChatRuntimeSettings;
+    messages: ChatMessage[];
+    documentIndexId: string;
+    remoteSessionId?: string;
+    runtimeSlotId?: number;
+    runtimeSettingsSignature?: string;
+    onToken: (token: string) => void;
+    onReasoning?: (token: string) => void;
+    onAgentEvents?: (events: unknown[], sessionState: unknown) => void;
+  }): Promise<RemoteStreamMetrics> {
+    const config = remoteConfig(options.settings);
+    const remoteDocumentId = unwrapRemoteDocumentId(config, options.documentIndexId);
+    const body = JSON.stringify({
+      model_id: options.model.id,
+      messages: remoteMessages(options.messages),
+      settings: remoteRuntimeSettings(options.runtimeSettings),
+      document_index_id: remoteDocumentId,
+      remote_session_id: options.remoteSessionId ?? "",
+      runtime_slot_id: Math.max(0, options.runtimeSlotId ?? 0),
+      runtime_settings_signature: options.runtimeSettingsSignature ?? "",
+      request_id: randomUUID()
+    });
+    const abortController = new AbortController();
+    this.activeAbortController = abortController;
+    try {
+      const { response, nonce } = await this.signedFetch(config, "/v1/document-analysis", {
+        method: "POST",
+        body,
+        headers: { "Accept": "application/x-ndjson", "Content-Type": "application/json" },
+        signal: abortController.signal
+      });
+      if (!response.ok || !response.body) {
+        throw new Error(`Remote host request failed (${response.status}): ${await response.text().catch(() => response.statusText)}`);
+      }
+      const metrics = this.validateStreamOpen(config, response, nonce, "/v1/document-analysis");
+      let completed = false;
+      await readNdjson(response.body, (event, sequence) => {
+        this.validateStreamEvent(config, nonce, sequence, event);
+        const type = stringField(event.type);
+        if (type === "chunk") {
+          options.onToken(stringField(event.content));
+          options.onReasoning?.(stringField(event.reasoning));
+        }
+        if (type === "agent_events") {
+          options.onAgentEvents?.(Array.isArray(event.events) ? event.events : [], event.session_state);
+        }
+        if (type === "complete") {
+          completed = true;
+          if (isRecord(event.metrics)) {
+            metrics.metrics = { ...metrics.metrics, ...event.metrics };
+          }
+          options.onToken(stringField(event.content));
+          options.onReasoning?.(stringField(event.reasoning));
+        }
+        if (type === "error") {
+          throw new Error(stringField(event.message) || "Remote host request failed.");
+        }
+      });
+      if (!completed && !abortController.signal.aborted) {
+        throw new Error("Remote document-analysis stream ended unexpectedly.");
+      }
+      return metrics;
     } finally {
       if (this.activeAbortController === abortController) {
         this.activeAbortController = null;
@@ -203,6 +291,45 @@ export class RemoteHostRuntime {
     };
   }
 
+  async documentIndexStatus(options: {
+    settings: ChatAppSettings;
+    projectId: string;
+    documentIndexId: string;
+  }): Promise<ChatDocumentIndex | null> {
+    const config = remoteConfig(options.settings);
+    const remoteDocumentId = unwrapRemoteDocumentId(config, options.documentIndexId);
+    const payload = await this.fetchJson(config, `/v1/documents/${encodeURIComponent(remoteDocumentId)}`);
+    const document = isRecord(payload.document) ? remoteDocumentIndexFromPayload(options.settings, payload.document) : null;
+    return document ? { ...document, projectId: options.projectId } : null;
+  }
+
+  async cancelDocumentIndex(options: {
+    settings: ChatAppSettings;
+    documentIndexId: string;
+  }): Promise<boolean> {
+    const config = remoteConfig(options.settings);
+    const remoteDocumentId = unwrapRemoteDocumentId(config, options.documentIndexId);
+    const payload = await this.postJson(config, `/v1/documents/${encodeURIComponent(remoteDocumentId)}/cancel`, {});
+    return Boolean(payload.cancelled);
+  }
+
+  async documentAnalysisEvidenceBudget(options: {
+    settings: ChatAppSettings;
+    model: ChatModel;
+    runtimeSettings: ChatRuntimeSettings;
+    messages: ChatMessage[];
+    documentTitle: string;
+  }): Promise<number> {
+    const payload = await this.postJson(remoteConfig(options.settings), "/v1/document-analysis/evidence-budget", {
+      model_id: options.model.id,
+      messages: remoteMessages(options.messages),
+      settings: remoteRuntimeSettings(options.runtimeSettings),
+      document_title: options.documentTitle.trim()
+    });
+    const budgetTokens = Number.parseInt(String(payload.budget_tokens ?? ""), 10);
+    return Number.isFinite(budgetTokens) ? Math.max(0, budgetTokens) : 0;
+  }
+
   async searchDocumentIndex(options: {
     settings: ChatAppSettings;
     documentIndexId: string;
@@ -226,6 +353,7 @@ export class RemoteHostRuntime {
     result: RemoteSearchResult;
     dropResultIds: string[];
     expand: Array<{ resultId: string; before: number; after: number }>;
+    budgetTokens?: number;
   }): Promise<RemoteSearchResult> {
     const config = remoteConfig(options.settings);
     const remoteDocumentId = unwrapRemoteDocumentId(config, options.documentIndexId);
@@ -236,7 +364,8 @@ export class RemoteHostRuntime {
         result_id: item.resultId,
         before: Math.max(0, item.before),
         after: Math.max(0, item.after)
-      }))
+      })),
+      budget_tokens: Math.max(0, options.budgetTokens ?? 0)
     });
     return isRecord(payload.result) ? payload.result as RemoteSearchResult : {};
   }
@@ -305,7 +434,7 @@ export class RemoteHostRuntime {
     }
   }
 
-  private validateStreamOpen(config: RemoteHostConfig, response: Response, requestNonce: string, requestPath: string): void {
+  private validateStreamOpen(config: RemoteHostConfig, response: Response, requestNonce: string, requestPath: string): RemoteStreamMetrics {
     const hostIdentity = response.headers.get("X-Unit0-Host-Identity")?.trim() ?? "";
     if (!hostIdentity) {
       throw new Error("Remote host did not report a host identity.");
@@ -326,6 +455,14 @@ export class RemoteHostRuntime {
     if (!signature || signature !== expectedSignature) {
       throw new Error("Remote host response signature was invalid.");
     }
+    return {
+      remoteSessionId: signedHeaders["X-Unit0-Remote-Session-Id"],
+      remoteSlotId: Number.parseInt(signedHeaders["X-Unit0-Remote-Slot-Id"], 10) || 0,
+      remoteHostId: signedHeaders["X-Unit0-Remote-Host-Id"] || config.remoteHostId,
+      remoteHostIdentity: hostIdentity,
+      remoteSessionStatus: signedHeaders["X-Unit0-Remote-Session-Status"],
+      metrics: {}
+    };
   }
 
   private validateStreamEvent(config: RemoteHostConfig, requestNonce: string, sequence: number, event: Record<string, unknown>): void {
@@ -339,18 +476,48 @@ export class RemoteHostRuntime {
 }
 
 function remoteConfig(settings: ChatAppSettings): RemoteHostConfig {
-  if (!settings.remoteHostAddress.trim()) {
+  const normalizedAddress = normalizeRemoteAddress(settings.remoteHostAddress);
+  if (!normalizedAddress.address) {
     throw new Error("Remote host address is not configured.");
   }
   if (!settings.remotePairingCode.trim()) {
     throw new Error("Remote host pairing code is required.");
   }
-  return settings;
+  return { ...settings, remoteHostAddress: normalizedAddress.address, remoteHostPort: normalizedAddress.port ?? settings.remoteHostPort };
 }
 
 function remoteBaseUrl(config: RemoteHostConfig): string {
   const address = config.remoteHostAddress.includes(":") && !config.remoteHostAddress.startsWith("[") ? `[${config.remoteHostAddress}]` : config.remoteHostAddress;
   return `http://${address}:${config.remoteHostPort}`;
+}
+
+function normalizeRemoteAddress(value: string): { address: string; port?: number } {
+  const raw = value.trim();
+  if (!raw) {
+    return { address: "" };
+  }
+  try {
+    const parsed = new URL(raw.includes("://") ? raw : `http://${raw}`);
+    return {
+      address: parsed.hostname,
+      port: parsed.port ? Number.parseInt(parsed.port, 10) : undefined
+    };
+  } catch {
+    return { address: raw };
+  }
+}
+
+function remoteMessages(messages: ChatMessage[]): Array<Record<string, unknown>> {
+  return messages.map((message) => ({
+    id: message.id,
+    role: message.role,
+    content: message.content,
+    created_at: message.createdAt,
+    reasoning: message.reasoning ?? "",
+    reasoning_initially_expanded: false,
+    model_label: message.label ?? "",
+    provider_id: message.sourceLabel === "Remote Built-in" ? "remote" : "local"
+  }));
 }
 
 function remoteRequestSignature(secret: string, method: string, path: string, timestamp: string, nonce: string, body: string): string {
@@ -397,7 +564,7 @@ function remoteRuntimeSettings(settings: ChatRuntimeSettings): Record<string, un
     reasoning_effort: settings.reasoningEffort,
     permission_mode: settings.permissionMode,
     system_prompt: settings.systemPrompt,
-    system_prompt_customized: Boolean(settings.systemPrompt),
+    system_prompt_customized: settings.systemPrompt.trim() !== DEFAULT_SYSTEM_PROMPT,
     temperature: settings.temperature,
     repeat_penalty: settings.repeatPenalty,
     trim_trigger_remaining_tokens: settings.trimReserveTokens,
@@ -427,6 +594,11 @@ async function readNdjson(body: ReadableStream<Uint8Array>, onEvent: (event: Rec
         onEvent(JSON.parse(line) as Record<string, unknown>, sequence);
       }
     }
+  }
+  const tail = buffer.trim();
+  if (tail) {
+    sequence += 1;
+    onEvent(JSON.parse(tail) as Record<string, unknown>, sequence);
   }
 }
 

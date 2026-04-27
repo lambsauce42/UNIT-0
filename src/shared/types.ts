@@ -82,6 +82,10 @@ export interface ChatThread {
   planModeEnabled: boolean;
   documentIndexId: string;
   codexLastSessionId: string;
+  remoteSessionId: string;
+  remoteSlotId: number;
+  remoteSettingsSignature: string;
+  remoteHostIdentity: string;
   activeContextStartMessageIndex: number;
   contextRevision: number;
   contextMarkers: ChatContextMarker[];
@@ -337,6 +341,10 @@ export interface ChatUpdateThreadSettingsPayload {
   planModeEnabled?: boolean;
   documentIndexId?: string;
   codexLastSessionId?: string;
+  remoteSessionId?: string;
+  remoteSlotId?: number;
+  remoteSettingsSignature?: string;
+  remoteHostIdentity?: string;
 }
 
 export interface ChatApplySettingsPresetPayload {
