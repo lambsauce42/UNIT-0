@@ -2,21 +2,30 @@ import {
   Activity,
   ArrowLeft,
   ArrowRight,
+  ArrowUp,
+  Brain,
   Bot,
+  Bolt,
   ChevronRight,
   Code2,
   Database,
   File,
+  FileText,
   FolderOpen,
   Globe,
   GitBranch,
   Grid2X2,
+  Image,
   Layers3,
   LayoutDashboard,
   LayoutTemplate,
+  LockOpen,
   Monitor,
+  MoreHorizontal,
   PanelRight,
   PanelTop,
+  Pencil,
+  Paperclip,
   Plus,
   Power,
   RadioTower,
@@ -25,13 +34,20 @@ import {
   Search,
   Server,
   Settings,
+  ShieldCheck,
   Save,
-  Send,
+  SlidersHorizontal,
+  FolderPlus,
   SquareTerminal,
   Square,
   Trash2,
   X
 } from "lucide-react";
+import MarkdownIt from "markdown-it";
+import markdownItFootnote from "markdown-it-footnote";
+import markdownItTaskLists from "markdown-it-task-lists";
+import katex from "katex";
+import "katex/dist/katex.min.css";
 import CodeMirror from "@uiw/react-codemirror";
 import { LanguageDescription } from "@codemirror/language";
 import { languages } from "@codemirror/language-data";
@@ -50,6 +66,7 @@ import {
   useRef,
   useState,
   type CSSProperties,
+  type ClipboardEvent as ReactClipboardEvent,
   type PointerEvent as ReactPointerEvent,
   type SVGProps
 } from "react";
@@ -60,9 +77,21 @@ import type {
   AppletSession,
   ApplyWorkspaceTemplatePayload,
   BootstrapPayload,
+  ChatActionButton,
+  ChatAppSettings,
   BrowserStatusPayload,
+  ChatAttachment,
+  ChatCodexApprovalMode,
+  ChatGitState,
   ChatMessage,
+  ChatPermissionMode,
+  ChatProviderMode,
+  ChatReasoningEffort,
+  ChatTimelineBlock,
+  ChatRuntimeSettings,
+  ChatSettingsPreset,
   ChatState,
+  ChatUsageIndicatorId,
   FileTreeEntry,
   ReadFileResult,
   RectLike,
@@ -2724,6 +2753,7 @@ function AppletFrame({
     dragging: boolean;
   } | null>(null);
   const canSplitAnyDirection = canSplitRow || canSplitColumn;
+  const hideChrome = false;
   const changeAppletKind = (kind: AppletKind) => {
     if (kind === session.kind) {
       return;
@@ -2840,6 +2870,7 @@ function AppletFrame({
     <section
       className={[
         "applet-frame",
+        hideChrome ? "applet-frame-chrome-hidden" : "",
         switchSourceInstanceId === instanceId ? "applet-frame-switch-source" : "",
         switchSourceInstanceId && switchSourceInstanceId !== instanceId ? "applet-frame-switch-target" : ""
       ]
@@ -2857,6 +2888,7 @@ function AppletFrame({
         onSelectAppletSwitchTarget(instanceId);
       }}
     >
+      {hideChrome ? null : (
       <header
         className="applet-header"
         onPointerDown={(event) => {
@@ -3029,6 +3061,7 @@ function AppletFrame({
           </button>
         </div>
       </header>
+      )}
       <div className="applet-body">{renderAppletBody(session, windowId)}</div>
     </section>
   );
@@ -3559,11 +3592,143 @@ function replaceFileTreeChildren(nodes: FileTreeEntry[], directoryId: string, ch
   });
 }
 
+type ChatMenuAnchor = {
+  left: number;
+  top: number;
+  placement: "above" | "below";
+};
+
+type ChatMenuState =
+  | (ChatMenuAnchor & { kind: "model" })
+  | (ChatMenuAnchor & { kind: "add" })
+  | (ChatMenuAnchor & { kind: "settings" })
+  | (ChatMenuAnchor & { kind: "quality" })
+  | (ChatMenuAnchor & { kind: "permissions" })
+  | (ChatMenuAnchor & { kind: "branch" })
+  | (ChatMenuAnchor & { kind: "document" })
+  | (ChatMenuAnchor & { kind: "thread"; threadId: string })
+  | null;
+
+type ChatDialogState =
+  | { kind: "new-project" }
+  | { kind: "project-settings"; projectId: string }
+  | { kind: "project-actions"; projectId: string }
+  | { kind: "thread-settings"; threadId: string }
+  | { kind: "rename-project"; projectId: string; title: string }
+  | { kind: "rename-thread"; threadId: string; title: string }
+  | { kind: "delete-project"; projectId: string; title: string }
+  | { kind: "delete-thread"; threadId: string; title: string }
+  | { kind: "app-settings" }
+  | { kind: "runtime-settings" }
+  | { kind: "settings-preset"; presetId?: string }
+  | { kind: "document-index"; projectId: string }
+  | { kind: "create-branch"; projectId: string }
+  | null;
+
+const CHAT_REASONING_OPTIONS: Array<{ id: Exclude<ChatReasoningEffort, "xhigh">; label: string }> = [
+  { id: "low", label: "Low" },
+  { id: "medium", label: "Medium" },
+  { id: "high", label: "High" }
+];
+
+const CHAT_PERMISSION_OPTIONS: Array<{ id: ChatPermissionMode; label: string }> = [
+  { id: "default_permissions", label: "Default" },
+  { id: "full_access", label: "Full access" }
+];
+
+const CHAT_CODEX_APPROVAL_OPTIONS: Array<{ id: ChatCodexApprovalMode; label: string }> = [
+  { id: "default", label: "Default" },
+  { id: "on-request", label: "On Request" },
+  { id: "on-failure", label: "On Failure" },
+  { id: "untrusted", label: "Untrusted" },
+  { id: "never", label: "Never Ask" }
+];
+
+function UsageIndicatorSettingsRow({
+  title,
+  indicatorId,
+  appSettings,
+  displayOptions = [["Bar", "bar"], ["Circle", "circle"]],
+  placementOptions = [["Bottom", "bottom"], ["Left Side", "left"], ["Right Side", "right"], ["Hidden", "hidden"]],
+  onChange
+}: {
+  title: string;
+  indicatorId: ChatUsageIndicatorId;
+  appSettings: ChatAppSettings;
+  displayOptions?: Array<[string, ChatAppSettings["usageIndicatorPreferences"][ChatUsageIndicatorId]["displayMode"]]>;
+  placementOptions?: Array<[string, ChatAppSettings["usageIndicatorPreferences"][ChatUsageIndicatorId]["placement"]]>;
+  onChange: (indicatorId: ChatUsageIndicatorId, patch: Partial<ChatAppSettings["usageIndicatorPreferences"][ChatUsageIndicatorId]>) => void;
+}) {
+  const preference = appSettings.usageIndicatorPreferences[indicatorId];
+  return (
+    <div className="chat-usage-settings-row">
+      <span>{title}</span>
+      <label>
+        <small>Style</small>
+        <select value={preference.displayMode} onChange={(event) => onChange(indicatorId, { displayMode: event.currentTarget.value as typeof preference.displayMode })}>
+          {displayOptions.map(([label, value]) => <option key={value} value={value}>{label}</option>)}
+        </select>
+      </label>
+      <label>
+        <small>Placement</small>
+        <select value={preference.placement} onChange={(event) => onChange(indicatorId, { placement: event.currentTarget.value as typeof preference.placement })}>
+          {placementOptions.map(([label, value]) => <option key={value} value={value}>{label}</option>)}
+        </select>
+      </label>
+      <label>
+        <small>Order</small>
+        <select value={String(preference.order)} onChange={(event) => onChange(indicatorId, { order: Number.parseInt(event.currentTarget.value, 10) || 1 })}>
+          {[1, 2, 3, 4].map((value) => <option key={value} value={value}>{value}</option>)}
+        </select>
+      </label>
+    </div>
+  );
+}
+
+const chatMarkdown = MarkdownIt({
+  breaks: false,
+  html: false,
+  linkify: true,
+  typographer: true
+})
+  .use(markdownItFootnote)
+  .use(markdownItTaskLists, { enabled: true, label: true, labelAfter: true });
+
+chatMarkdown.renderer.rules.fence = (tokens, index, options, env, self) => {
+  const token = tokens[index];
+  const info = token.info.trim();
+  const language = info.split(/\s+/)[0] || "";
+  const escapedCode = chatMarkdown.utils.escapeHtml(token.content);
+  const languageLabel = language ? `<figcaption>${chatMarkdown.utils.escapeHtml(language)}</figcaption>` : "";
+  return `<figure class="chat-code-figure">${languageLabel}<pre class="chat-code-block"><code data-language="${chatMarkdown.utils.escapeHtml(language)}">${escapedCode}</code></pre></figure>`;
+};
+
+chatMarkdown.renderer.rules.table_open = () => '<div class="chat-markdown-table-wrap"><table class="chat-markdown-table">';
+chatMarkdown.renderer.rules.table_close = () => "</table></div>";
+
+const defaultLinkOpenRenderer = chatMarkdown.renderer.rules.link_open ?? ((tokens, index, options, env, self) => self.renderToken(tokens, index, options));
+chatMarkdown.renderer.rules.link_open = (tokens, index, options, env, self) => {
+  tokens[index].attrSet("target", "_blank");
+  tokens[index].attrSet("rel", "noreferrer");
+  return defaultLinkOpenRenderer(tokens, index, options, env, self);
+};
+
 function ChatSurface() {
   const [chatState, setChatState] = useState<ChatState | null>(null);
   const [draft, setDraft] = useState("");
   const [localError, setLocalError] = useState<string | null>(null);
   const [expandedProjectIds, setExpandedProjectIds] = useState<Set<string>>(() => new Set());
+  const [chatMenu, setChatMenu] = useState<ChatMenuState>(null);
+  const [chatDialog, setChatDialog] = useState<ChatDialogState>(null);
+  const [pendingAttachments, setPendingAttachments] = useState<ChatAttachment[]>([]);
+  const [attachmentStatus, setAttachmentStatus] = useState("");
+  const [editingThreadId, setEditingThreadId] = useState<string | null>(null);
+  const [editingThreadTitle, setEditingThreadTitle] = useState("");
+  const [gitState, setGitState] = useState<ChatGitState | null>(null);
+  const [projectActionStatuses, setProjectActionStatuses] = useState<Record<string, "running" | "completed" | "error">>({});
+  const [draggedChatItem, setDraggedChatItem] = useState<{ kind: "project" | "thread"; id: string } | null>(null);
+  const [chatDropTarget, setChatDropTarget] = useState<{ kind: "project" | "thread"; id: string; position: "before" | "after" | "inside" } | null>(null);
+  const surfaceRef = useRef<HTMLDivElement | null>(null);
   const composerRef = useRef<HTMLTextAreaElement | null>(null);
 
   useEffect(() => {
@@ -3571,12 +3736,21 @@ function ChatSurface() {
     void window.unitApi.chat.bootstrap().then((state) => {
       if (mounted) {
         setChatState(state);
-        setExpandedProjectIds(new Set(state.projects.map((project) => project.id)));
+        setExpandedProjectIds(new Set(state.appSettings.expandedProjectIds.length > 0 ? state.appSettings.expandedProjectIds : state.projects.map((project) => project.id)));
       }
     }).catch((error: unknown) => setLocalError(errorMessage(error)));
     const removeListener = window.unitApi.chat.onStateChanged((state) => {
       setChatState(state);
       setExpandedProjectIds((current) => {
+        if (state.appSettings.expandedProjectIds.length > 0) {
+          const saved = new Set(state.appSettings.expandedProjectIds);
+          for (const project of state.projects) {
+            if (!current.has(project.id) && !saved.has(project.id)) {
+              saved.add(project.id);
+            }
+          }
+          return saved;
+        }
         const next = new Set(current);
         for (const project of state.projects) {
           if (!next.has(project.id)) {
@@ -3596,11 +3770,46 @@ function ChatSurface() {
   const selectedMessages = chatState
     ? chatState.messages.filter((message) => message.threadId === chatState.selectedThreadId)
     : [];
-  const selectedModel = chatState?.models.find((model) => model.id === chatState.selectedModelId) ?? null;
+  const activeRuntimeSettings = selectedThread?.runtimeSettings ?? chatState?.runtimeSettings;
+  const activeBuiltinModelId = selectedThread?.builtinModelId || chatState?.selectedModelId || "";
+  const selectedModel = chatState?.models.find((model) => model.id === activeBuiltinModelId) ?? null;
+  const threadUsesCodex = selectedThread?.providerMode === "codex";
+  const selectedCodexModel = threadUsesCodex
+    ? chatState?.codexModels.find((model) => model.id === selectedThread.codexModelId) ?? chatState?.codexModels.find((model) => model.isDefault) ?? null
+    : null;
+  const selectedSettingsPreset = selectedThread
+    ? chatState?.settingsPresets.find((preset) => preset.id === selectedThread.selectedSettingsPresetId) ?? chatState?.settingsPresets[0] ?? null
+    : null;
+  const selectedBuiltinFramework = selectedThread?.builtinAgenticFramework ?? selectedSettingsPreset?.builtinAgenticFramework ?? "chat";
   const running = chatState?.generation.status === "running";
-  const blockedReason = !selectedModel ? "Add a local GGUF model before sending." : "";
-  const statusMessage = localError ?? (chatState?.generation.status === "error" ? chatState.generation.error : blockedReason);
+  const submitBlockedReason = !selectedThread
+    ? "Create a new thread to start."
+    : !threadUsesCodex && !selectedModel
+      ? "Add and select a local GGUF model before sending."
+      : "";
+  const statusMessage = localError ?? (chatState?.generation.status === "error" ? chatState.generation.error : "");
   const activeProject = chatState?.projects.find((project) => project.id === chatState.selectedProjectId) ?? null;
+  const selectedDocumentIndex = selectedThread
+    ? chatState?.documentIndexes.find((index) => index.id === selectedThread.documentIndexId) ?? null
+    : null;
+  const documentControlsVisible = Boolean(selectedThread && !threadUsesCodex && selectedBuiltinFramework === "document_analysis");
+  const canCreateDocumentIndex = Boolean(documentControlsVisible && selectedThread?.documentAnalysisEmbeddingModelPath.trim() && (chatState?.appSettings.tokenizerModelPath.trim() || selectedThread?.builtinModelId.trim()));
+  const reasoningButtonLabel = selectedThread
+    ? (threadUsesCodex ? reasoningLabel(selectedThread.codexReasoningEffort) : runtimeReasoningLabel(activeRuntimeSettings ?? chatState.runtimeSettings))
+    : "Medium";
+  const permissionButtonLabel = selectedThread
+    ? (threadUsesCodex ? permissionLabel(codexAccessModeForApprovalMode(selectedThread.codexApprovalMode)) : permissionLabel((activeRuntimeSettings ?? chatState.runtimeSettings).permissionMode))
+    : "Full access";
+  const settingsPresetButtonLabel = selectedSettingsPreset?.label ?? "Default";
+  const modelButtonLabel = threadUsesCodex ? selectedCodexModel?.label ?? "Codex model" : selectedModel?.label ?? "No model";
+  const queueItems = selectedThread
+    ? chatState.queuedSubmissions.filter((submission) => submission.threadId === selectedThread.id)
+    : [];
+  const branchButtonLabel = gitState?.status === "ready"
+    ? `${gitState.currentBranch}${gitState.dirty ? "*" : ""}`
+    : gitState?.status === "no_repo"
+      ? "No repo"
+      : "No project";
   const messagePreviewByThreadId = useMemo(() => {
     const previews = new Map<string, ChatMessage>();
     if (!chatState) {
@@ -3614,6 +3823,7 @@ function ChatSurface() {
 
   const runChatAction = useCallback(async (action: () => Promise<ChatState>) => {
     setLocalError(null);
+    setChatMenu(null);
     try {
       setChatState(await action());
     } catch (error: unknown) {
@@ -3621,14 +3831,190 @@ function ChatSurface() {
     }
   }, []);
 
-  const submitDraft = useCallback(async () => {
+  const refreshGitState = useCallback(async (projectId = activeProject?.id) => {
+    if (!projectId) {
+      setGitState(null);
+      return;
+    }
+    try {
+      setGitState(await window.unitApi.chat.gitState({ projectId }));
+    } catch (error: unknown) {
+      setLocalError(errorMessage(error));
+    }
+  }, [activeProject?.id]);
+
+  const runProjectActionButton = useCallback(async (projectId: string, actionId: string) => {
+    setLocalError(null);
+    setProjectActionStatuses((current) => ({ ...current, [actionId]: "running" }));
+    try {
+      await window.unitApi.chat.runProjectAction({ projectId, actionId });
+      setProjectActionStatuses((current) => ({ ...current, [actionId]: "completed" }));
+      window.setTimeout(() => {
+        setProjectActionStatuses((current) => {
+          if (current[actionId] !== "completed") {
+            return current;
+          }
+          const next = { ...current };
+          delete next[actionId];
+          return next;
+        });
+      }, 2000);
+    } catch (error: unknown) {
+      setProjectActionStatuses((current) => ({ ...current, [actionId]: "error" }));
+      setLocalError(errorMessage(error));
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshGitState();
+  }, [refreshGitState]);
+
+  const toggleProject = useCallback((projectId: string) => {
+    setExpandedProjectIds((current) => {
+      const next = new Set(current);
+      if (next.has(projectId)) {
+        next.delete(projectId);
+      } else {
+        next.add(projectId);
+      }
+      void window.unitApi.chat.updateAppSettings({ settings: { expandedProjectIds: Array.from(next) } })
+        .then(setChatState)
+        .catch((error: unknown) => setLocalError(errorMessage(error)));
+      return next;
+    });
+  }, []);
+
+  const expandProject = useCallback((projectId: string) => {
+    setExpandedProjectIds((current) => {
+      if (current.has(projectId)) {
+        return current;
+      }
+      const next = new Set(current);
+      next.add(projectId);
+      void window.unitApi.chat.updateAppSettings({ settings: { expandedProjectIds: Array.from(next) } })
+        .then(setChatState)
+        .catch((error: unknown) => setLocalError(errorMessage(error)));
+      return next;
+    });
+  }, []);
+
+  const startInlineThreadRename = useCallback((thread: { id: string; title: string }) => {
+    setChatMenu(null);
+    setEditingThreadId(thread.id);
+    setEditingThreadTitle(thread.title);
+  }, []);
+
+  const openChatMenu = useCallback((
+    event: ReactPointerEvent<HTMLElement>,
+    menu: Omit<NonNullable<ChatMenuState>, keyof ChatMenuAnchor>,
+    placement: ChatMenuAnchor["placement"] = "above"
+  ) => {
+    event.stopPropagation();
+    const surface = surfaceRef.current;
+    const targetRect = event.currentTarget.getBoundingClientRect();
+    const surfaceRect = surface?.getBoundingClientRect();
+    if (!surfaceRect) {
+      setChatMenu({ ...menu, left: targetRect.left, top: targetRect.top, placement } as NonNullable<ChatMenuState>);
+      return;
+    }
+    const menuWidth = menu.kind === "thread" ? 192 : 270;
+    const left = Math.min(Math.max(8, targetRect.left - surfaceRect.left), Math.max(8, surfaceRect.width - menuWidth - 8));
+    const top = placement === "above" ? targetRect.top - surfaceRect.top : targetRect.bottom - surfaceRect.top;
+    setChatMenu({ ...menu, left, top, placement } as NonNullable<ChatMenuState>);
+  }, []);
+
+  const commitInlineThreadRename = useCallback(async () => {
+    if (!editingThreadId) {
+      return;
+    }
+    const threadId = editingThreadId;
+    const title = editingThreadTitle.trim();
+    setEditingThreadId(null);
+    if (title) {
+      await runChatAction(() => window.unitApi.chat.renameThread({ threadId, title }));
+    }
+  }, [editingThreadId, editingThreadTitle, runChatAction]);
+
+  const attachFiles = useCallback(async (kind: ChatAttachment["kind"]) => {
+    setLocalError(null);
+    setChatMenu(null);
+    if (kind === "image" && selectedThread?.providerMode !== "codex") {
+      setLocalError("Image inputs are only available on Codex threads.");
+      return;
+    }
+    if (kind === "image" && !selectedCodexModel?.supportsImageInput) {
+      setLocalError("Selected Codex model does not support image input.");
+      return;
+    }
+    try {
+      const result = await window.unitApi.fileSystem.selectFiles({ kind, multiple: true });
+      if (result.paths.length === 0) {
+        return;
+      }
+      setPendingAttachments((current) => [
+        ...current,
+        ...result.paths.map((filePath) => ({
+          id: `attachment-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+          name: chatFileName(filePath),
+          path: filePath,
+          kind
+        }))
+      ]);
+      setAttachmentStatus(`${result.paths.length} ${kind === "image" ? "image" : "file"}${result.paths.length === 1 ? "" : "s"} attached`);
+    } catch (error: unknown) {
+      setLocalError(errorMessage(error));
+    }
+  }, [selectedCodexModel?.supportsImageInput, selectedThread?.providerMode]);
+
+  const handleComposerPaste = useCallback((event: ReactClipboardEvent<HTMLTextAreaElement>) => {
+    const imageItems = Array.from(event.clipboardData.items).filter((item) => item.type.startsWith("image/"));
+    if (imageItems.length === 0) {
+      return;
+    }
+    event.preventDefault();
+    if (selectedThread?.providerMode !== "codex") {
+      setLocalError("Image inputs are only available on Codex threads.");
+      return;
+    }
+    if (!selectedCodexModel?.supportsImageInput) {
+      setLocalError("Selected Codex model does not support image input.");
+      return;
+    }
+    for (const item of imageItems) {
+      const file = item.getAsFile();
+      if (!file) {
+        continue;
+      }
+      const reader = new FileReader();
+      reader.onload = () => {
+        setPendingAttachments((current) => [
+          ...current,
+          {
+            id: `attachment-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+            name: file.name || "Pasted image",
+            path: "",
+            dataUrl: typeof reader.result === "string" ? reader.result : undefined,
+            kind: "image",
+            mimeType: file.type,
+            sizeBytes: file.size
+          }
+        ]);
+        setAttachmentStatus("Image attached");
+      };
+      reader.readAsDataURL(file);
+    }
+  }, [selectedCodexModel?.supportsImageInput, selectedThread?.providerMode]);
+
+  const submitDraft = useCallback(async (submitMode: "normal" | "queue" = "normal") => {
     const text = draft.trim();
-    if (!text || running || blockedReason) {
+    if ((!text && pendingAttachments.length === 0) || submitBlockedReason) {
       return;
     }
     setDraft("");
-    await runChatAction(() => window.unitApi.chat.submit({ text }));
-  }, [blockedReason, draft, runChatAction, running]);
+    setPendingAttachments([]);
+    setAttachmentStatus("");
+    await runChatAction(() => window.unitApi.chat.submit({ text, attachments: pendingAttachments, submitMode }));
+  }, [draft, pendingAttachments, runChatAction, submitBlockedReason]);
 
   useLayoutEffect(() => {
     const composer = composerRef.current;
@@ -3639,12 +4025,52 @@ function ChatSurface() {
     composer.style.height = `${Math.min(176, Math.max(44, composer.scrollHeight))}px`;
   }, [draft]);
 
+  const usageIndicatorPreferences = chatState?.appSettings.usageIndicatorPreferences;
+  const renderUsageIndicator = (indicatorId: string, displayMode: "bar" | "circle" = "bar") => {
+    if (!chatState) {
+      return null;
+    }
+    if (indicatorId === "context") {
+      return (
+        <div className={["chat-context-cluster", displayMode === "circle" ? "circle" : ""].join(" ")} key="context">
+          <span className="chat-context-fill" style={{ width: `${contextUsagePercent(chatState)}%` }} aria-hidden="true" />
+          <span>{displayMode === "circle" ? "Ctx" : "Context"}</span>
+          <span>{formatContextLabel((activeRuntimeSettings ?? chatState.runtimeSettings).nCtx)}</span>
+        </div>
+      );
+    }
+    if (indicatorId === "git_diff") {
+      return (
+        <div className={["chat-git-diff-indicator", gitState?.status === "ready" ? "" : "inactive"].join(" ")} aria-label="Git diff" key="git_diff">
+          <span className="added">+{gitState?.status === "ready" ? gitState.addedLines : 0}</span>
+          <span className="deleted">-{gitState?.status === "ready" ? gitState.deletedLines : 0}</span>
+        </div>
+      );
+    }
+    if (indicatorId === "week") {
+      return <div className={["chat-rate-limit-indicator inline", displayMode === "bar" ? "bar" : ""].join(" ")} aria-label="Weekly rate limit" key="week"><span>{rateLimitIndicatorLabel(chatState, "primary")}</span></div>;
+    }
+    if (indicatorId === "five_hour") {
+      return <div className={["chat-rate-limit-indicator inline", displayMode === "bar" ? "bar" : ""].join(" ")} aria-label="Five hour rate limit" key="five_hour"><span>{rateLimitIndicatorLabel(chatState, "secondary")}</span></div>;
+    }
+    return null;
+  };
+  const usageItems = (["git_diff", "context", "week", "five_hour"] as const)
+    .map((id) => ({ id, preference: usageIndicatorPreferences?.[id] }))
+    .filter((item): item is { id: "git_diff" | "context" | "week" | "five_hour"; preference: NonNullable<typeof usageIndicatorPreferences>["git_diff"] } => Boolean(item.preference))
+    .filter((item) => item.preference.placement !== "hidden")
+    .sort((left, right) => left.preference.order - right.preference.order);
+  const leftUsageIndicators = usageItems.filter((item) => item.preference.placement === "left").map((item) => renderUsageIndicator(item.id, item.preference.displayMode)).filter(Boolean);
+  const rightUsageIndicators = usageItems.filter((item) => item.preference.placement === "right").map((item) => renderUsageIndicator(item.id, item.preference.displayMode)).filter(Boolean);
+  const composerUsageIndicators = usageItems.filter((item) => item.preference.placement === "bottom").map((item) => renderUsageIndicator(item.id, item.preference.displayMode)).filter(Boolean);
+  const footerRightUsageIndicators = usageItems.filter((item) => item.preference.placement === "footer_right").map((item) => renderUsageIndicator(item.id, item.preference.displayMode)).filter(Boolean);
+
   if (!chatState) {
     return <div className="chat-surface chat-loading" data-testid="chat-surface" />;
   }
 
   return (
-    <div className="chat-surface" data-testid="chat-surface">
+    <div className="chat-surface" data-testid="chat-surface" ref={surfaceRef} onPointerDown={() => setChatMenu(null)}>
       <aside className="chat-list" aria-label="Chat projects and threads">
         <button
           className="chat-new-thread-button"
@@ -3657,83 +4083,274 @@ function ChatSurface() {
         </button>
         <div className="chat-list-section-title">
           <span>Threads</span>
-          <button className="chat-card-action" type="button" aria-label="Project settings">
-            <Settings size={14} />
+          <button
+            className="chat-card-action"
+            type="button"
+            aria-label="New project"
+            onClick={(event) => {
+              event.stopPropagation();
+              setChatDialog({ kind: "new-project" });
+            }}
+          >
+            <FolderPlus size={14} />
           </button>
         </div>
-        <div className="chat-project-scroll">
+          <div className="chat-project-scroll">
+          <div className="chat-overlay-scrollbar chat-overlay-scrollbar-sidebar" aria-hidden="true"><span /></div>
           {chatState.projects.map((project) => {
             const projectThreads = chatState.threads.filter((thread) => thread.projectId === project.id);
             const expanded = expandedProjectIds.has(project.id);
             const active = project.id === chatState.selectedProjectId;
             return (
               <section className="chat-project-section" key={project.id}>
-                <button
-                  className={["chat-project-card", active ? "active" : ""].join(" ")}
-                  type="button"
-                  onClick={() => setExpandedProjectIds((current) => {
-                    const next = new Set(current);
-                    if (next.has(project.id)) {
-                      next.delete(project.id);
-                    } else {
-                      next.add(project.id);
+                <div
+                  className={[
+                    "chat-project-card",
+                    active ? "active" : "",
+                    chatDropTarget?.kind === "project" && chatDropTarget.id === project.id ? `drag-target drop-${chatDropTarget.position}` : ""
+                  ].join(" ")}
+                  data-testid={`chat-project-${project.id}`}
+                  role="button"
+                  tabIndex={0}
+                  draggable
+                  onDragStart={(event) => {
+                    event.dataTransfer.effectAllowed = "move";
+                    setDraggedChatItem({ kind: "project", id: project.id });
+                  }}
+                  onDragEnter={(event) => {
+                    if (draggedChatItem) {
+                      event.preventDefault();
+                      const rect = event.currentTarget.getBoundingClientRect();
+                      const position = draggedChatItem.kind === "project"
+                        ? (event.clientY > rect.top + rect.height / 2 ? "after" : "before")
+                        : "inside";
+                      setChatDropTarget({ kind: "project", id: project.id, position });
                     }
-                    return next;
-                  })}
+                  }}
+                  onDragOver={(event) => {
+                    if (draggedChatItem) {
+                      event.preventDefault();
+                      const rect = event.currentTarget.getBoundingClientRect();
+                      const position = draggedChatItem.kind === "project"
+                        ? (event.clientY > rect.top + rect.height / 2 ? "after" : "before")
+                        : "inside";
+                      setChatDropTarget({ kind: "project", id: project.id, position });
+                    }
+                  }}
+                  onDrop={(event) => {
+                    event.preventDefault();
+                    if (draggedChatItem?.kind === "project") {
+                      const rect = event.currentTarget.getBoundingClientRect();
+                      const position = event.clientY > rect.top + rect.height / 2 ? "after" : "before";
+                      void runChatAction(() => window.unitApi.chat.moveProject({
+                        projectId: draggedChatItem.id,
+                        targetProjectId: project.id,
+                        position
+                      }));
+                    } else if (draggedChatItem?.kind === "thread") {
+                      void runChatAction(() => window.unitApi.chat.moveThread({ threadId: draggedChatItem.id, projectId: project.id }));
+                    }
+                    setDraggedChatItem(null);
+                    setChatDropTarget(null);
+                  }}
+                  onDragEnd={() => {
+                    setDraggedChatItem(null);
+                    setChatDropTarget(null);
+                  }}
+                  onClick={() => {
+                    expandProject(project.id);
+                    void runChatAction(() => window.unitApi.chat.selectProject({ projectId: project.id }));
+                  }}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" || event.key === " ") {
+                      event.preventDefault();
+                      expandProject(project.id);
+                      void runChatAction(() => window.unitApi.chat.selectProject({ projectId: project.id }));
+                    }
+                  }}
                 >
-                  <ChevronRight className={expanded ? "expanded" : ""} size={15} />
+                  <button
+                    className="chat-project-toggle"
+                    type="button"
+                    aria-label={expanded ? `Collapse ${project.title}` : `Expand ${project.title}`}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      toggleProject(project.id);
+                    }}
+                  >
+                    <ChevronRight className={expanded ? "expanded" : ""} size={15} />
+                  </button>
                   <span className="chat-project-title">{project.title}</span>
                   <span className="chat-project-actions">
-                    <span
+                    <button
                       className="chat-project-action"
-                      role="button"
-                      tabIndex={0}
+                      type="button"
                       aria-label={`New thread in ${project.title}`}
                       onClick={(event) => {
                         event.stopPropagation();
-                        void runChatAction(() => window.unitApi.chat.createThread());
-                      }}
-                      onKeyDown={(event) => {
-                        if (event.key === "Enter" || event.key === " ") {
-                          event.preventDefault();
-                          event.stopPropagation();
-                          void runChatAction(() => window.unitApi.chat.createThread());
-                        }
+                        void runChatAction(() => window.unitApi.chat.createThread({ projectId: project.id }));
                       }}
                     >
                       <Plus size={13} />
-                    </span>
-                    <span className="chat-project-action placeholder" aria-hidden="true">
-                      <Settings size={13} />
-                    </span>
-                    <span className="chat-project-action placeholder destructive" aria-hidden="true">
+                    </button>
+                    <button
+                      className="chat-project-action"
+                      type="button"
+                      aria-label={`Project settings for ${project.title}`}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        setChatDialog({ kind: "project-settings", projectId: project.id });
+                      }}
+                    >
+                      <MoreHorizontal size={13} />
+                    </button>
+                    <button
+                      className="chat-project-action destructive"
+                      type="button"
+                      aria-label={`Delete ${project.title}`}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        setChatDialog({ kind: "delete-project", projectId: project.id, title: project.title });
+                      }}
+                    >
                       <X size={13} />
-                    </span>
+                    </button>
                   </span>
-                </button>
-                {expanded ? (
-                  <div className="chat-thread-list">
+                </div>
+                <div className={["chat-thread-list", expanded ? "expanded" : "collapsed"].join(" ")}>
                     {projectThreads.map((thread) => (
-                      <button
-                        className={thread.id === chatState.selectedThreadId ? "active" : ""}
+                      <div
+                        className={[
+                          thread.id === chatState.selectedThreadId ? "active" : "",
+                          chatDropTarget?.kind === "thread" && chatDropTarget.id === thread.id ? `drag-target drop-${chatDropTarget.position}` : ""
+                        ].join(" ")}
                         data-testid={`chat-thread-${thread.id}`}
                         key={thread.id}
-                        type="button"
+                        role="button"
+                        tabIndex={0}
+                        draggable
+                        onDragStart={(event) => {
+                          event.dataTransfer.effectAllowed = "move";
+                          setDraggedChatItem({ kind: "thread", id: thread.id });
+                        }}
+                        onDragEnter={(event) => {
+                          if (draggedChatItem) {
+                            event.preventDefault();
+                            const rect = event.currentTarget.getBoundingClientRect();
+                            const position = event.clientY > rect.top + rect.height / 2 ? "after" : "before";
+                            setChatDropTarget({ kind: "thread", id: thread.id, position });
+                          }
+                        }}
+                        onDragOver={(event) => {
+                          if (draggedChatItem) {
+                            event.preventDefault();
+                            const rect = event.currentTarget.getBoundingClientRect();
+                            const position = event.clientY > rect.top + rect.height / 2 ? "after" : "before";
+                            setChatDropTarget({ kind: "thread", id: thread.id, position });
+                          }
+                        }}
+                        onDrop={(event) => {
+                          event.preventDefault();
+                          if (draggedChatItem?.kind === "thread") {
+                            void runChatAction(() => window.unitApi.chat.moveThread({
+                              threadId: draggedChatItem.id,
+                              projectId: thread.projectId,
+                              targetThreadId: thread.id,
+                              position: chatDropTarget?.position === "after" ? "after" : "before"
+                            }));
+                          }
+                          setDraggedChatItem(null);
+                          setChatDropTarget(null);
+                        }}
+                        onDragEnd={() => {
+                          setDraggedChatItem(null);
+                          setChatDropTarget(null);
+                        }}
                         onClick={() => void runChatAction(() => window.unitApi.chat.selectThread({ threadId: thread.id }))}
+                        onKeyDown={(event) => {
+                          if (event.key === "Enter" || event.key === " ") {
+                            event.preventDefault();
+                            void runChatAction(() => window.unitApi.chat.selectThread({ threadId: thread.id }));
+                          }
+                        }}
                       >
-                        <span className="chat-thread-title">{thread.title}</span>
-                        <span className="chat-thread-time">
-                          {formatChatTimestamp(messagePreviewByThreadId.get(thread.id)?.updatedAt ?? thread.updatedAt)}
+                        <span
+                          className={[
+                            "chat-thread-state",
+                            chatState.generation.status === "running" && chatState.generation.threadId === thread.id ? "loading" : "",
+                            thread.id !== chatState.selectedThreadId && messagePreviewByThreadId.has(thread.id) ? "unread" : ""
+                          ].join(" ")}
+                          aria-hidden="true"
+                        />
+                        {editingThreadId === thread.id ? (
+                          <input
+                            className="chat-thread-title-editor"
+                            autoFocus
+                            value={editingThreadTitle}
+                            onChange={(event) => setEditingThreadTitle(event.currentTarget.value)}
+                            onBlur={() => void commitInlineThreadRename()}
+                            onClick={(event) => event.stopPropagation()}
+                            onKeyDown={(event) => {
+                              if (event.key === "Enter") {
+                                event.preventDefault();
+                                void commitInlineThreadRename();
+                              } else if (event.key === "Escape") {
+                                event.preventDefault();
+                                setEditingThreadId(null);
+                              }
+                            }}
+                          />
+                        ) : (
+                          <span className="chat-thread-title">{thread.title}</span>
+                        )}
+                        <span className="chat-thread-action-slot">
+                          <span className="chat-thread-time">
+                            {formatChatTimestamp(messagePreviewByThreadId.get(thread.id)?.updatedAt ?? thread.updatedAt)}
+                          </span>
+                          <span className="chat-thread-actions">
+                            <button
+                              className="chat-project-action"
+                              type="button"
+                              aria-label={`Rename ${thread.title}`}
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                startInlineThreadRename(thread);
+                              }}
+                            >
+                              <Pencil size={13} />
+                            </button>
+                            <button
+                              className="chat-project-action"
+                              type="button"
+                              aria-label={`More actions for ${thread.title}`}
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                openChatMenu(event, { kind: "thread", threadId: thread.id }, "below");
+                              }}
+                            >
+                              <MoreHorizontal size={13} />
+                            </button>
+                            <button
+                              className="chat-project-action destructive"
+                              type="button"
+                              aria-label={`Delete ${thread.title}`}
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                setChatDialog({ kind: "delete-thread", threadId: thread.id, title: thread.title });
+                              }}
+                            >
+                              <X size={13} />
+                            </button>
+                          </span>
                         </span>
-                      </button>
+                      </div>
                     ))}
-                  </div>
-                ) : null}
+                </div>
               </section>
             );
           })}
         </div>
-        <button className="chat-settings-button" type="button">
+        <button className="chat-settings-button" type="button" onClick={() => setChatDialog({ kind: "app-settings" })}>
           <Settings size={15} />
           <span>Settings</span>
         </button>
@@ -3741,131 +4358,2136 @@ function ChatSurface() {
       <section className="chat-main">
         <header className="chat-toolbar">
           <div className="chat-title">
-            <strong>{activeProject?.title ?? "Project"}</strong>
+            <strong>{[activeProject?.title ?? "Project", selectedThread?.title].filter(Boolean).join(" - ")}</strong>
           </div>
           <div className="chat-action-strip">
-            <button className="chat-action-button" type="button">Chat</button>
-            <button className="chat-action-manager" type="button" aria-label="Chat actions">
-              <Settings size={15} />
+            {activeProject?.actionButtons.map((action) => (
+              <button
+                className={["chat-action-manager", projectActionStatuses[action.id] ? `status-${projectActionStatuses[action.id]}` : ""].join(" ")}
+                key={action.id}
+                type="button"
+                title={action.command}
+                disabled={projectActionStatuses[action.id] === "running"}
+                onClick={() => void runProjectActionButton(activeProject.id, action.id)}
+              >
+                <span>{action.label}</span>
+                <span className="chat-action-indicator" aria-hidden="true" />
+              </button>
+            ))}
+            <button
+              className="chat-action-manager"
+              type="button"
+              aria-label="Chat actions"
+              onPointerDown={(event) => {
+                event.stopPropagation();
+                if (activeProject) {
+                  setChatDialog({ kind: "project-actions", projectId: activeProject.id });
+                }
+              }}
+            >
+              <Plus size={15} />
             </button>
           </div>
         </header>
+        <div className="chat-top-fade" aria-hidden="true" />
         <div className="chat-thread" data-testid="chat-message-list">
+          <div className="chat-overlay-scrollbar chat-overlay-scrollbar-thread" aria-hidden="true"><span /></div>
           <div className="chat-content-column">
-            {selectedMessages.length === 0 ? (
-              <div className="chat-empty">Start a thread with a local GGUF model.</div>
+            {!selectedThread ? (
+              <div className="chat-empty">
+                <h2>No Thread Selected</h2>
+                <p>Make a new thread to start chatting, sketch ideas, or test prompts.</p>
+              </div>
+            ) : selectedMessages.length === 0 ? (
+              <div className="chat-empty-transcript" aria-label="Empty thread" />
             ) : (
-              selectedMessages.map((message) => <ChatMessageBubble key={message.id} message={message} />)
+              selectedMessages.map((message) => (
+                <ChatMessageBubble
+                  key={message.id}
+                  message={message}
+                  onTimelineAction={(blockId, action, answer) => runChatAction(() => window.unitApi.chat.timelineAction({ messageId: message.id, blockId, action, answer }))}
+                />
+              ))
             )}
           </div>
         </div>
         <div className="chat-composer-section">
+          <div className="chat-composer-main-row">
+          <div className="chat-composer-side-dock left">{leftUsageIndicators}</div>
           <form
             className="chat-composer"
+            onPointerDown={(event) => event.stopPropagation()}
             onSubmit={(event) => {
               event.preventDefault();
               void submitDraft();
             }}
-          >
-            <div className="chat-composer-input-wrap">
+            >
+              <div className="chat-composer-input-wrap">
               <textarea
                 ref={composerRef}
                 aria-label="Chat message"
-                disabled={running || Boolean(statusMessage)}
-                placeholder="Ask anything..."
+                readOnly={Boolean(statusMessage)}
+                placeholder={selectedThread ? "Ask anything..." : "Create a new thread to start"}
                 value={draft}
                 onChange={(event) => setDraft(event.currentTarget.value)}
+                onPaste={handleComposerPaste}
                 onKeyDown={(event) => {
-                  if (event.key === "Enter" && !event.shiftKey) {
+                  if (event.key === "Tab" && event.shiftKey && selectedThread && threadUsesCodex) {
+                    event.preventDefault();
+                    void runChatAction(() => window.unitApi.chat.updateThreadSettings({
+                      threadId: selectedThread.id,
+                      planModeEnabled: !selectedThread.planModeEnabled
+                    }));
+                    return;
+                  }
+                  if (event.key === "Enter" && event.ctrlKey && !running) {
+                    event.preventDefault();
+                    insertTextareaNewline(event.currentTarget, draft, setDraft);
+                    return;
+                  }
+                  if (event.key === "Enter" && event.ctrlKey && running) {
+                    event.preventDefault();
+                    void submitDraft("queue");
+                    return;
+                  }
+                  if (event.key === "Enter" && !event.shiftKey && !event.ctrlKey) {
                     event.preventDefault();
                     void submitDraft();
                   }
                 }}
               />
               {statusMessage ? (
-                <div className="chat-status" data-testid="chat-status">
+                <div className="chat-status chat-status-overlay" data-testid="chat-status">
                   {statusMessage}
                 </div>
               ) : null}
             </div>
+            <ChatAttachmentStrip
+              attachments={pendingAttachments}
+              status={attachmentStatus}
+              queuedSubmissions={queueItems}
+              onRemove={(attachmentId) => setPendingAttachments((current) => current.filter((attachment) => attachment.id !== attachmentId))}
+              onCancelQueued={(submissionId) => void runChatAction(() => window.unitApi.chat.cancelQueuedSubmission({ submissionId }))}
+            />
             <div className="chat-composer-control-row">
               <button
                 className="chat-ghost-button"
                 type="button"
-                aria-label="Add local model"
-                onClick={() => void runChatAction(() => window.unitApi.chat.addLocalModel())}
+                aria-label="Add"
+                onPointerDown={(event) => openChatMenu(event, { kind: "add" })}
               >
                 <Plus size={18} />
               </button>
-              <button className="chat-ghost-button" type="button" aria-label="Model settings">
-                <Settings size={17} />
-              </button>
-              <label className="chat-model-menu">
-                <Bot size={15} />
-                <span>{selectedModel?.label ?? "No model"}</span>
+              {documentControlsVisible ? (
+                <button className="chat-document-button composer-document-button" type="button" aria-label="Document" onPointerDown={(event) => openChatMenu(event, { kind: "document" })}>
+                  <FileText size={13} />
+                  <span>Document</span>
+                </button>
+              ) : null}
+              <button
+                className="chat-settings-menu-button"
+                type="button"
+                aria-label="Model settings"
+                onPointerDown={(event) => openChatMenu(event, { kind: "settings" })}
+              >
+                <SlidersHorizontal size={15} />
+                <span>{settingsPresetButtonLabel}</span>
                 <ChevronRight className="chat-model-caret" size={12} />
-                <select
-                  aria-label="Local chat model"
-                  value={chatState.selectedModelId}
-                  onChange={(event) => void runChatAction(() => window.unitApi.chat.selectModel({ modelId: event.currentTarget.value }))}
-                >
-                  <option value="" disabled>
-                    No model
+              </button>
+              <button
+                className="chat-model-menu"
+                type="button"
+                aria-label="Open model menu"
+                onPointerDown={(event) => openChatMenu(event, { kind: "model" })}
+              >
+                {threadUsesCodex ? <Code2 size={15} /> : <Bot size={15} />}
+                <span>{modelButtonLabel}</span>
+                <ChevronRight className="chat-model-caret" size={12} />
+              </button>
+              <select
+                className="chat-hidden-select"
+                aria-label="Local chat model"
+                value={activeBuiltinModelId}
+                onChange={(event) => void runChatAction(() => window.unitApi.chat.selectModel({ modelId: event.currentTarget.value }))}
+              >
+                <option value="" disabled>
+                  No model
+                </option>
+                {chatState.models.map((model) => (
+                  <option key={model.id} value={model.id}>
+                    {model.label}
                   </option>
-                  {chatState.models.map((model) => (
-                    <option key={model.id} value={model.id}>
-                      {model.label}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <button className="chat-text-button" type="button">Medium</button>
+                ))}
+              </select>
+              <button
+                className="chat-text-button"
+                type="button"
+                onPointerDown={(event) => openChatMenu(event, { kind: "quality" })}
+              >
+                {reasoningButtonLabel}
+              </button>
+              <span className={["chat-plan-separator", selectedThread?.planModeEnabled ? "" : "inactive"].join(" ")} aria-hidden="true">|</span>
+              <button
+                className={["chat-plan-indicator", selectedThread?.planModeEnabled ? "active" : "inactive"].join(" ")}
+                type="button"
+                aria-label="Plan mode"
+                disabled={!selectedThread || !threadUsesCodex}
+                onClick={() => {
+                  if (selectedThread && threadUsesCodex) {
+                    void runChatAction(() => window.unitApi.chat.updateThreadSettings({
+                      threadId: selectedThread.id,
+                      planModeEnabled: !selectedThread.planModeEnabled
+                    }));
+                  }
+                }}
+              >
+                Plan
+              </button>
               <div className="chat-composer-spacer" />
               {running ? (
                 <button
-                  className="chat-send-button halting"
+                  className="chat-ghost-button chat-halt-button"
                   type="button"
                   aria-label="Cancel chat response"
                   onClick={() => void runChatAction(() => window.unitApi.chat.cancel())}
                 >
                   <Square size={15} />
                 </button>
-              ) : (
-                <button
-                  className="chat-send-button"
-                  type="submit"
-                  aria-label="Send chat message"
-                  disabled={!draft.trim() || Boolean(blockedReason)}
-                >
-                  <Send size={15} />
-                </button>
-              )}
+              ) : null}
+              <button
+                className="chat-send-button"
+                type="submit"
+                aria-label="Send chat message"
+                disabled={(!draft.trim() && pendingAttachments.length === 0) || Boolean(submitBlockedReason)}
+              >
+                <ArrowUp size={18} />
+              </button>
             </div>
           </form>
+          <div className="chat-composer-side-dock right">{rightUsageIndicators}</div>
+          </div>
           <div className="chat-composer-footer">
-            <div className="chat-footer-slot">Full access</div>
-            <div className="chat-context-cluster">
-              <span>32K</span>
-              <GitBranch size={13} />
-              <span>0</span>
+            <button
+              className="chat-footer-slot chat-footer-button"
+              type="button"
+              onPointerDown={(event) => openChatMenu(event, { kind: "permissions" })}
+            >
+              <LockOpen size={13} />
+              <span>{permissionButtonLabel}</span>
+            </button>
+            <div className="chat-footer-usage-indicators">{composerUsageIndicators}</div>
+            <div className="chat-footer-right-cluster">
+              {footerRightUsageIndicators}
+              <div className={["chat-document-progress", documentControlsVisible && selectedDocumentIndex ? "visible" : ""].join(" ")} aria-label="Document progress">
+                <span style={{ width: `${Math.round((selectedDocumentIndex?.progress ?? 0) * 100)}%` }} />
+              </div>
+              <button
+                className="chat-footer-slot chat-footer-button right"
+                type="button"
+                onPointerDown={(event) => openChatMenu(event, { kind: "branch" })}
+              >
+                <GitBranch size={13} />
+                <span>{branchButtonLabel}</span>
+              </button>
             </div>
-            <div className="chat-footer-slot right">main</div>
           </div>
         </div>
+        {chatMenu ? (
+          <ChatDropUpMenu
+            chatState={chatState}
+            menu={chatMenu}
+            onAttach={attachFiles}
+            onClose={() => setChatMenu(null)}
+            onDialog={setChatDialog}
+            onRun={runChatAction}
+            gitState={gitState}
+            activeProjectId={activeProject?.id ?? ""}
+            onRefreshGitState={refreshGitState}
+            onError={setLocalError}
+            onStartThreadRename={startInlineThreadRename}
+          />
+        ) : null}
+        {chatDialog ? (
+          <ChatDialog
+            dialog={chatDialog}
+            state={chatState}
+            onClose={() => setChatDialog(null)}
+            onDialog={setChatDialog}
+            onRun={runChatAction}
+          />
+        ) : null}
       </section>
     </div>
   );
 }
 
-function ChatMessageBubble({ message }: { message: ChatMessage }) {
-  const displayContent = message.content || (message.status === "streaming" ? "..." : "");
+function ChatDropUpMenu({
+  chatState,
+  menu,
+  onAttach,
+  onClose,
+  onDialog,
+  onRun,
+  gitState,
+  activeProjectId,
+  onRefreshGitState,
+  onError,
+  onStartThreadRename
+}: {
+  chatState: ChatState;
+  menu: ChatMenuState;
+  onAttach: (kind: ChatAttachment["kind"]) => Promise<void>;
+  onClose: () => void;
+  onDialog: (dialog: ChatDialogState) => void;
+  onRun: (action: () => Promise<ChatState>) => Promise<void>;
+  gitState: ChatGitState | null;
+  activeProjectId: string;
+  onRefreshGitState: (projectId?: string) => Promise<void>;
+  onError: (message: string) => void;
+  onStartThreadRename: (thread: { id: string; title: string }) => void;
+}) {
+  if (!menu) {
+    return null;
+  }
+  const activeThread = chatState.threads.find((thread) => thread.id === chatState.selectedThreadId) ?? null;
+  const activeUsesCodex = activeThread?.providerMode === "codex";
+  const activeCodexModel = activeThread
+    ? chatState.codexModels.find((model) => model.id === activeThread.codexModelId) ?? chatState.codexModels.find((model) => model.isDefault) ?? null
+    : null;
+  const activeRuntimeSettings = activeThread?.runtimeSettings ?? chatState.runtimeSettings;
+  const activeBuiltinModelId = activeThread?.builtinModelId || chatState.selectedModelId;
+  const activePermissionMode = activeRuntimeSettings.permissionMode;
+  const activeAccessMode = activeUsesCodex && activeThread ? codexAccessModeForApprovalMode(activeThread.codexApprovalMode) : activePermissionMode;
+  const activeReasoningEffort = activeUsesCodex ? activeThread?.codexReasoningEffort : activeRuntimeSettings.reasoningEffort;
+  const selectedThread = menu.kind === "thread" ? chatState.threads.find((thread) => thread.id === menu.threadId) : null;
   return (
-    <article className={["chat-message", message.role, message.status].join(" ")} data-testid={`chat-message-${message.role}`}>
-      {message.role === "assistant" ? <div className="chat-message-label">Assistant</div> : null}
-      <div className="chat-message-body">{renderMarkdownBlocks(displayContent)}</div>
+    <div
+      className={["chat-dropup", `placement-${menu.placement}`, menu.kind === "thread" ? "sidebar-menu" : ""].join(" ")}
+      style={{ left: menu.left, top: menu.top }}
+      role="menu"
+      onPointerDown={(event) => event.stopPropagation()}
+    >
+      {menu.kind === "add" ? (
+        activeUsesCodex && activeThread ? (
+          <>
+            <button
+              className={activeThread.planModeEnabled ? "selected" : ""}
+              type="button"
+              role="menuitemcheckbox"
+              aria-checked={activeThread.planModeEnabled}
+              onClick={() => void onRun(() => window.unitApi.chat.updateThreadSettings({
+                threadId: activeThread.id,
+                planModeEnabled: !activeThread.planModeEnabled
+              }))}
+            >
+              <Settings size={14} />
+              <span>Plan mode</span>
+            </button>
+            <button type="button" role="menuitem" onClick={() => void onAttach("image")}>
+              <Paperclip size={14} />
+              <span>Upload image...</span>
+            </button>
+          </>
+        ) : (
+          <>
+            <button type="button" role="menuitem" onClick={() => void onRun(() => window.unitApi.chat.addLocalModel())}>
+              <Plus size={14} />
+              <span>Add GGUF model...</span>
+            </button>
+            <button type="button" role="menuitem" onClick={() => void onAttach("image")}>
+              <Paperclip size={14} />
+              <span>Upload image...</span>
+            </button>
+          </>
+        )
+      ) : null}
+      {menu.kind === "model" ? (
+        activeUsesCodex && activeThread ? (
+          <>
+            <div className="chat-dropup-section-label">Codex Agent</div>
+            {chatState.codexModels.length === 0 ? <div className="chat-dropup-empty">No Codex models available</div> : null}
+            {chatState.codexModels.map((model) => (
+              <button
+                className={model.id === activeThread.codexModelId ? "selected" : ""}
+                key={model.id}
+                type="button"
+                role="menuitemradio"
+                aria-checked={model.id === activeThread.codexModelId}
+                onClick={() => void onRun(() => window.unitApi.chat.updateThreadSettings({ threadId: activeThread.id, codexModelId: model.id }))}
+              >
+                <Code2 size={14} />
+                <span>{model.label}  [{model.isDefault ? "Default" : "Codex"}]</span>
+              </button>
+            ))}
+            <div className="chat-dropup-divider" />
+            <button type="button" role="menuitem" onClick={() => void onRun(() => window.unitApi.chat.refreshCodexAccount({ force: true }))}>
+              <RefreshCw size={14} />
+              <span>Refresh</span>
+            </button>
+            {chatState.codexAccount.status === "ready" ? (
+              <div className="chat-dropup-empty">{chatState.codexAccount.email || chatState.codexAccount.planType || "Codex account ready"}</div>
+            ) : chatState.codexAccount.status === "error" ? (
+              <div className="chat-dropup-empty">{chatState.codexAccount.error}</div>
+            ) : null}
+          </>
+        ) : (
+          <>
+            <div className="chat-dropup-section-label">Built-in</div>
+            {chatState.models.length === 0 ? <div className="chat-dropup-empty">No models available</div> : null}
+            {chatState.models.map((model) => (
+              <button
+                className={model.id === activeBuiltinModelId ? "selected" : ""}
+                key={model.id}
+                type="button"
+                role="menuitemradio"
+                aria-checked={model.id === activeBuiltinModelId}
+                onClick={() => void onRun(() => window.unitApi.chat.selectModel({ modelId: model.id }))}
+              >
+                <Bot size={14} />
+                <span>{model.label}  [Local GGUF]</span>
+              </button>
+            ))}
+            <div className="chat-dropup-divider" />
+            <button type="button" role="menuitem" onClick={() => void onRun(() => window.unitApi.chat.addLocalModel())}>
+              <Plus size={14} />
+              <span>Add GGUF...</span>
+            </button>
+            <button type="button" role="menuitem" onClick={() => void onRun(() => window.unitApi.chat.refreshLocalModels())}>
+              <RefreshCw size={14} />
+              <span>Refresh</span>
+            </button>
+          </>
+        )
+      ) : null}
+      {menu.kind === "quality" ? (
+        (activeUsesCodex && activeThread && activeCodexModel
+          ? activeCodexModel.reasoningEfforts.map((id) => ({ id, label: reasoningLabel(id) }))
+          : CHAT_REASONING_OPTIONS
+        ).map((option) => (
+          <button
+            className={option.id === activeReasoningEffort ? "selected" : ""}
+            key={option.id}
+            type="button"
+            role="menuitemradio"
+            aria-checked={option.id === activeReasoningEffort}
+            onClick={() => {
+              if (activeUsesCodex && activeThread) {
+                void onRun(() => window.unitApi.chat.updateThreadSettings({
+                  threadId: activeThread.id,
+                  codexReasoningEffort: option.id as ChatReasoningEffort
+                }));
+              } else {
+                void onRun(() => window.unitApi.chat.updateRuntimeSettings({
+                  settings: { reasoningEffort: option.id as Exclude<ChatReasoningEffort, "xhigh"> }
+                }));
+              }
+            }}
+          >
+            <Settings size={14} />
+            <span>{option.label}</span>
+          </button>
+        ))
+      ) : null}
+      {menu.kind === "settings" ? (
+        <>
+          {chatState.settingsPresets.map((preset) => {
+            const Icon = settingsPresetIcon(preset.iconName, preset.providerMode);
+            const selected = activeThread?.selectedSettingsPresetId === preset.id;
+            return (
+              <div className="chat-dropup-action-row" key={preset.id}>
+                <button
+                  className={selected ? "selected" : ""}
+                  type="button"
+                  role="menuitemradio"
+                  aria-checked={selected}
+                  disabled={!activeThread}
+                  onMouseEnter={() => undefined}
+                  onClick={() => {
+                    if (activeThread) {
+                      void onRun(() => window.unitApi.chat.applySettingsPreset({ threadId: activeThread.id, presetId: preset.id }));
+                    }
+                  }}
+                >
+                  <Icon size={14} />
+                  <span>{preset.label}</span>
+                </button>
+                {preset.editable ? (
+                  <button
+                    className="chat-dropup-inline-action"
+                    type="button"
+                    aria-label={`Edit ${preset.label}`}
+                    onClick={() => {
+                      onClose();
+                      onDialog({ kind: "settings-preset", presetId: preset.id });
+                    }}
+                  >
+                    <Pencil size={12} />
+                  </button>
+                ) : null}
+                {preset.deletable ? (
+                  <button
+                    className="chat-dropup-inline-action danger"
+                    type="button"
+                    aria-label={`Delete ${preset.label}`}
+                    onClick={() => void onRun(() => window.unitApi.chat.deleteSettingsPreset({ presetId: preset.id }))}
+                  >
+                    <Trash2 size={12} />
+                  </button>
+                ) : null}
+              </div>
+            );
+          })}
+          <div className="chat-dropup-divider" />
+          <button
+            type="button"
+            role="menuitem"
+            onClick={() => {
+              onClose();
+              onDialog({ kind: "settings-preset" });
+            }}
+          >
+            <Plus size={14} />
+            <span>New preset...</span>
+          </button>
+        </>
+      ) : null}
+      {menu.kind === "permissions" ? (
+        CHAT_PERMISSION_OPTIONS.map((option) => (
+          <button
+            className={option.id === activeAccessMode ? "selected" : ""}
+            key={option.id}
+            type="button"
+            role="menuitemradio"
+            aria-checked={option.id === activeAccessMode}
+            onClick={() => {
+              if (activeUsesCodex && activeThread) {
+                void onRun(() => window.unitApi.chat.updateThreadSettings({
+                  threadId: activeThread.id,
+                  permissionMode: option.id,
+                  codexApprovalMode: codexApprovalModeForAccessMode(option.id)
+                }));
+              } else {
+                void onRun(async () => {
+                  await window.unitApi.chat.updateRuntimeSettings({ settings: { permissionMode: option.id } });
+                  return window.unitApi.chat.bootstrap();
+                });
+              }
+            }}
+          >
+            <ShieldCheck size={14} />
+            <span>{option.label}</span>
+          </button>
+        ))
+      ) : null}
+      {menu.kind === "branch" ? (
+        gitState?.status === "ready" ? (
+          <>
+          {gitState.branches.map((branch) => (
+            <button
+              className={branch === gitState.currentBranch ? "selected" : ""}
+              key={branch}
+              type="button"
+              role="menuitemradio"
+              aria-checked={branch === gitState.currentBranch}
+              disabled={branch === gitState.currentBranch}
+              onClick={() => {
+                window.unitApi.chat.switchGitBranch({ projectId: activeProjectId, branch })
+                  .then(() => onRefreshGitState(activeProjectId))
+                  .catch((error: unknown) => onError(errorMessage(error)));
+                onClose();
+              }}
+            >
+              <GitBranch size={14} />
+              <span>{branch}{branch === gitState.currentBranch && gitState.dirty ? " *" : ""}</span>
+            </button>
+          ))}
+          <div className="chat-dropup-divider" />
+          {gitState.hasCommits ? <button type="button" role="menuitem" onClick={() => {
+            onClose();
+            onDialog({ kind: "create-branch", projectId: activeProjectId });
+          }}>
+            <Plus size={14} />
+            <span>New branch...</span>
+          </button> : null}
+          <button type="button" role="menuitem" onClick={() => void onRefreshGitState(activeProjectId)}>
+            <RefreshCw size={14} />
+            <span>Refresh</span>
+          </button>
+          </>
+        ) : (
+          <>
+            <div className="chat-dropup-empty">{gitState?.message ?? "Select a project to show git branches."}</div>
+            <button type="button" role="menuitem" onClick={() => void onRefreshGitState(activeProjectId)}>
+              <RefreshCw size={14} />
+              <span>Refresh</span>
+            </button>
+          </>
+        )
+      ) : null}
+      {menu.kind === "document" ? (
+        <>
+          <div className="chat-dropup-section-label">Document Analysis</div>
+          {chatState.documentIndexes.filter((index) => index.projectId === activeThread?.projectId && (index.state === "ready" || index.state === "building")).length === 0 ? <div className="chat-dropup-empty">No document indexes</div> : null}
+          {chatState.documentIndexes
+            .filter((index) => index.projectId === activeThread?.projectId && (index.state === "ready" || index.state === "building"))
+            .map((index) => (
+              <button
+                className={index.id === activeThread?.documentIndexId ? "selected" : ""}
+                key={index.id}
+                type="button"
+                role="menuitemradio"
+                aria-checked={index.id === activeThread?.documentIndexId}
+                onClick={() => {
+                  if (activeThread) {
+                    void onRun(() => window.unitApi.chat.selectDocumentIndex({ threadId: activeThread.id, documentIndexId: index.id }));
+                  }
+                }}
+              >
+                <FileText size={14} />
+                <span>{index.title}  [{formatTimelineStatus(index.state)}]</span>
+              </button>
+            ))}
+          {activeThread?.documentIndexId ? (
+            <button type="button" role="menuitem" onClick={() => void onRun(() => window.unitApi.chat.selectDocumentIndex({ threadId: activeThread.id, documentIndexId: "" }))}>
+              <X size={14} />
+              <span>Clear document index</span>
+            </button>
+          ) : null}
+          <div className="chat-dropup-divider" />
+          <button type="button" role="menuitem" disabled={!canCreateDocumentIndex} onClick={() => {
+            onClose();
+            if (activeProjectId) {
+              onDialog({ kind: "document-index", projectId: activeProjectId });
+            }
+          }}>
+            <Plus size={14} />
+            <span>Create document index...</span>
+          </button>
+          <button type="button" role="menuitem" onClick={() => {
+            onClose();
+            onDialog({ kind: "app-settings" });
+          }}>
+            <Settings size={14} />
+            <span>Document settings...</span>
+          </button>
+        </>
+      ) : null}
+      {menu.kind === "thread" && selectedThread ? (
+        <>
+          <button
+            type="button"
+            role="menuitem"
+            onClick={() => {
+              onClose();
+              onDialog({ kind: "thread-settings", threadId: selectedThread.id });
+            }}
+          >
+            <Settings size={14} />
+            <span>Thread Settings</span>
+          </button>
+          <div className="chat-dropup-divider" />
+          <button
+            type="button"
+            role="menuitem"
+            onClick={() => {
+              onStartThreadRename(selectedThread);
+            }}
+          >
+            <Pencil size={14} />
+            <span>Rename</span>
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            onClick={() => {
+              onClose();
+              onDialog({ kind: "delete-thread", threadId: selectedThread.id, title: selectedThread.title });
+            }}
+          >
+            <Trash2 size={14} />
+            <span>Delete</span>
+          </button>
+        </>
+      ) : null}
+    </div>
+  );
+}
+
+function ChatDialog({
+  dialog,
+  state,
+  onClose,
+  onDialog,
+  onRun
+}: {
+  dialog: ChatDialogState;
+  state: ChatState;
+  onClose: () => void;
+  onDialog: (dialog: ChatDialogState) => void;
+  onRun: (action: () => Promise<ChatState>) => Promise<void>;
+}) {
+  const [title, setTitle] = useState(initialChatDialogTitle(dialog, state));
+  const [directory, setDirectory] = useState(initialChatDialogDirectory(dialog, state));
+  const [settings, setSettings] = useState(() => initialRuntimeSettingsForm(dialog, state));
+  const [appSettings, setAppSettings] = useState<ChatAppSettings>(() => state.appSettings);
+  const [threadProviderMode, setThreadProviderMode] = useState<ChatProviderMode>(() => initialThreadProviderMode(dialog, state));
+  const [threadBuiltinModelId, setThreadBuiltinModelId] = useState(() => initialThreadBuiltinModelId(dialog, state));
+  const [threadCodexModelId, setThreadCodexModelId] = useState(() => initialThreadCodexModelId(dialog, state));
+  const [threadCodexReasoningEffort, setThreadCodexReasoningEffort] = useState<ChatReasoningEffort>(() => initialThreadCodexReasoningEffort(dialog, state));
+  const [threadPermissionMode, setThreadPermissionMode] = useState<ChatPermissionMode>(() => initialThreadPermissionMode(dialog, state));
+  const [threadCodexApprovalMode, setThreadCodexApprovalMode] = useState<ChatCodexApprovalMode>(() => initialThreadCodexApprovalMode(dialog, state));
+  const [threadPlanModeEnabled, setThreadPlanModeEnabled] = useState(() => initialThreadPlanModeEnabled(dialog, state));
+  const [presetIconName, setPresetIconName] = useState(() => initialSettingsPresetIconName(dialog, state));
+  const [presetBuiltinFramework, setPresetBuiltinFramework] = useState<"chat" | "document_analysis">(() => initialSettingsPresetBuiltinFramework(dialog, state));
+  const [presetEmbeddingModelPath, setPresetEmbeddingModelPath] = useState(() => initialSettingsPresetEmbeddingModelPath(dialog, state));
+  const [projectActionButtons, setProjectActionButtons] = useState<ChatActionButton[]>(() => initialProjectActionButtons(dialog, state));
+  const [documentIndexPaths, setDocumentIndexPaths] = useState<string[]>([]);
+
+  useEffect(() => {
+    setTitle(initialChatDialogTitle(dialog, state));
+    setDirectory(initialChatDialogDirectory(dialog, state));
+    setSettings(initialRuntimeSettingsForm(dialog, state));
+    setAppSettings(state.appSettings);
+    setThreadProviderMode(initialThreadProviderMode(dialog, state));
+    setThreadBuiltinModelId(initialThreadBuiltinModelId(dialog, state));
+    setThreadCodexModelId(initialThreadCodexModelId(dialog, state));
+    setThreadCodexReasoningEffort(initialThreadCodexReasoningEffort(dialog, state));
+    setThreadPermissionMode(initialThreadPermissionMode(dialog, state));
+    setThreadCodexApprovalMode(initialThreadCodexApprovalMode(dialog, state));
+    setThreadPlanModeEnabled(initialThreadPlanModeEnabled(dialog, state));
+    setPresetIconName(initialSettingsPresetIconName(dialog, state));
+    setPresetBuiltinFramework(initialSettingsPresetBuiltinFramework(dialog, state));
+    setPresetEmbeddingModelPath(initialSettingsPresetEmbeddingModelPath(dialog, state));
+    setProjectActionButtons(initialProjectActionButtons(dialog, state));
+    setDocumentIndexPaths([]);
+  }, [dialog, state]);
+
+  const updateUsageIndicatorPreference = (
+    indicatorId: ChatUsageIndicatorId,
+    patch: Partial<ChatAppSettings["usageIndicatorPreferences"][ChatUsageIndicatorId]>
+  ) => {
+    setAppSettings({
+      ...appSettings,
+      usageIndicatorPreferences: {
+        ...appSettings.usageIndicatorPreferences,
+        [indicatorId]: {
+          ...appSettings.usageIndicatorPreferences[indicatorId],
+          ...patch
+        }
+      }
+    });
+  };
+
+  if (!dialog) {
+    return null;
+  }
+  if (dialog.kind === "new-project") {
+    return (
+      <div className="chat-dialog-backdrop" role="presentation" onPointerDown={onClose}>
+        <form
+          className="chat-settings-dialog chat-project-dialog"
+          role="dialog"
+          aria-modal="true"
+          aria-label="New project"
+          onPointerDown={(event) => event.stopPropagation()}
+          onSubmit={(event) => {
+            event.preventDefault();
+            void onRun(async () => {
+              const created = await window.unitApi.chat.createProject();
+              const projectId = created.selectedProjectId || created.projects.at(-1)?.id;
+              if (!projectId) {
+                return created;
+              }
+              return window.unitApi.chat.updateProjectSettings({ projectId, title, directory, actionButtons: projectActionButtons });
+            }).then(onClose);
+          }}
+        >
+          <header className="chat-settings-header">
+            <div>
+              <strong>Project Settings</strong>
+              <span>New Project</span>
+            </div>
+            <button type="button" aria-label="Close new project" onClick={onClose}>
+              <X size={15} />
+            </button>
+          </header>
+          <ProjectSettingsFields
+            title={title}
+            directory={directory}
+            actionButtons={projectActionButtons}
+            onTitleChange={setTitle}
+            onDirectoryChange={setDirectory}
+            onActionButtonsChange={setProjectActionButtons}
+          />
+          <div className="chat-dialog-actions">
+            <button type="button" onClick={onClose}>Cancel</button>
+            <button type="submit" disabled={!title.trim()}>Save</button>
+          </div>
+        </form>
+      </div>
+    );
+  }
+  if (dialog.kind === "app-settings") {
+    return (
+      <div className="chat-dialog-backdrop" role="presentation" onPointerDown={onClose}>
+        <form
+          className="chat-settings-dialog chat-app-settings-dialog"
+          role="dialog"
+          aria-modal="true"
+          aria-label="App settings"
+          onPointerDown={(event) => event.stopPropagation()}
+          onSubmit={(event) => {
+            event.preventDefault();
+            void onRun(() => window.unitApi.chat.updateAppSettings({ settings: appSettings })).then(onClose);
+          }}
+        >
+          <header className="chat-settings-header">
+            <div>
+              <strong>Settings</strong>
+              <span>Application</span>
+            </div>
+            <button type="button" aria-label="Close app settings" onClick={onClose}>
+              <X size={15} />
+            </button>
+          </header>
+          <div className="chat-settings-body">
+            <section className="chat-settings-section">
+              <h3>Interface</h3>
+              <p className="chat-settings-hint">Arrange Git Diff, Context, Week, and 5h independently. Side items stack beside the chatbox; Git Diff can sit next to Branch; bottom items sit between footer buttons.</p>
+              <label className="chat-settings-check">
+                <input
+                  type="checkbox"
+                  checked={appSettings.autoExpandCodexDisclosures}
+                  onChange={(event) => setAppSettings({ ...appSettings, autoExpandCodexDisclosures: event.currentTarget.checked })}
+                />
+                <span>Auto-expand reasoning, tools, and diffs</span>
+              </label>
+            </section>
+            <section className="chat-settings-section">
+              <h3>Usage Indicators</h3>
+              <UsageIndicatorSettingsRow title="Git Diff" indicatorId="git_diff" appSettings={appSettings} displayOptions={[["Text", "bar"]]} placementOptions={[["Bottom", "bottom"], ["Next to Branch", "footer_right"], ["Left Side", "left"], ["Right Side", "right"], ["Hidden", "hidden"]]} onChange={updateUsageIndicatorPreference} />
+              <UsageIndicatorSettingsRow title="Context" indicatorId="context" appSettings={appSettings} onChange={updateUsageIndicatorPreference} />
+              <UsageIndicatorSettingsRow title="Week" indicatorId="week" appSettings={appSettings} onChange={updateUsageIndicatorPreference} />
+              <UsageIndicatorSettingsRow title="5h" indicatorId="five_hour" appSettings={appSettings} onChange={updateUsageIndicatorPreference} />
+              <p className="chat-settings-hint">Codex rate limits only appear on Codex threads and only when the chosen arrangement fits the current width.</p>
+            </section>
+            <section className="chat-settings-section">
+              <h3>Document Analysis</h3>
+              <div className="chat-settings-row">
+                <label>
+                  <span>Tokenizer</span>
+                  <input
+                    aria-label="Document tokenizer"
+                    placeholder="Path to tokenizer GGUF"
+                    value={appSettings.tokenizerModelPath}
+                    onChange={(event) => setAppSettings({ ...appSettings, tokenizerModelPath: event.currentTarget.value })}
+                  />
+                </label>
+                <label>
+                  <span>Index</span>
+                  <select
+                    value={appSettings.documentIndexLocation}
+                    aria-label="Document index"
+                    onChange={(event) => setAppSettings({ ...appSettings, documentIndexLocation: event.currentTarget.value as ChatAppSettings["documentIndexLocation"] })}
+                  >
+                    <option value="local">Local laptop</option>
+                    <option value="remote">Remote host</option>
+                  </select>
+                </label>
+              </div>
+              <label className="chat-settings-check">
+                <input
+                  type="checkbox"
+                  checked={appSettings.documentToolExecutionLocation === "local"}
+                  onChange={(event) => setAppSettings({
+                    ...appSettings,
+                    documentToolExecutionLocation: event.currentTarget.checked ? "local" : "remote"
+                  })}
+                />
+                <span>Run document tool calls locally</span>
+              </label>
+            </section>
+            <section className="chat-settings-section">
+              <h3>Remote Built-in Host</h3>
+              <div className="chat-settings-row">
+                <label>
+                  <span>Address</span>
+                  <input value={appSettings.remoteHostAddress} onChange={(event) => setAppSettings({ ...appSettings, remoteHostAddress: event.currentTarget.value })} />
+                </label>
+                <label>
+                  <span>Port</span>
+                  <input value={String(appSettings.remoteHostPort)} onChange={(event) => setAppSettings({ ...appSettings, remoteHostPort: Number.parseInt(event.currentTarget.value, 10) || 0 })} />
+                </label>
+                <label>
+                  <span>Pairing Code</span>
+                  <input value={appSettings.remotePairingCode} onChange={(event) => setAppSettings({ ...appSettings, remotePairingCode: event.currentTarget.value })} />
+                </label>
+              </div>
+            </section>
+          </div>
+          <div className="chat-dialog-actions">
+            <button type="button" onClick={onClose}>Cancel</button>
+            <button type="submit">Save</button>
+          </div>
+        </form>
+      </div>
+    );
+  }
+  if (dialog.kind === "runtime-settings") {
+    return (
+      <div className="chat-dialog-backdrop" role="presentation" onPointerDown={onClose}>
+        <form
+          className="chat-settings-dialog"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Runtime settings"
+          onPointerDown={(event) => event.stopPropagation()}
+          onSubmit={(event) => {
+            event.preventDefault();
+            void onRun(() => window.unitApi.chat.updateRuntimeSettings({ settings: parseRuntimeSettingsForm(settings) })).then(onClose);
+          }}
+        >
+          <header className="chat-settings-header">
+            <div>
+              <strong>Settings</strong>
+              <span>Built-in bundled llama-server</span>
+            </div>
+            <button type="button" aria-label="Close runtime settings" onClick={onClose}>
+              <X size={15} />
+            </button>
+          </header>
+          <div className="chat-settings-body">
+            <section className="chat-settings-section">
+              <h3>Defaults</h3>
+              <div className="chat-settings-row">
+                <label>
+                  <span>Model</span>
+                  <select value={state.selectedModelId ?? ""} aria-label="Default model" onChange={(event) => void window.unitApi.chat.selectModel({ modelId: event.currentTarget.value })}>
+                    {state.models.length === 0 ? <option value="">No built-in model available</option> : null}
+                    {state.models.map((model) => (
+                      <option key={model.id} value={model.id}>{model.label}  [Local GGUF]</option>
+                    ))}
+                  </select>
+                </label>
+                <label>
+                  <span>Agentic framework</span>
+                  <select value="chat" aria-label="Agentic framework">
+                    <option value="chat">Chat</option>
+                    <option value="document_analysis">Document analysis</option>
+                  </select>
+                </label>
+              </div>
+              <label className="chat-embedding-field">
+                <span>Embedding Model</span>
+                <div className="chat-directory-row">
+                  <input readOnly placeholder="Path to embedding GGUF" value="" />
+                  <button type="button">Browse...</button>
+                </div>
+              </label>
+            </section>
+            <section className="chat-settings-section">
+              <h3>Runtime</h3>
+              <div className="chat-settings-row">
+                <label>
+                  <span>Context Window</span>
+                  <select name="nCtx" value={settings.nCtx} onChange={(event) => setSettings({ ...settings, nCtx: event.currentTarget.value })}>
+                    <option value="32768">Default</option>
+                    <option value="4096">4K</option>
+                    <option value="8192">8K</option>
+                    <option value="16384">16K</option>
+                    <option value="32768">32K</option>
+                    <option value="65536">64K</option>
+                    <option value="131072">128K</option>
+                  </select>
+                </label>
+                <label>
+                  <span>GPU Layers</span>
+                  <select name="nGpuLayers" value={settings.nGpuLayers} onChange={(event) => setSettings({ ...settings, nGpuLayers: event.currentTarget.value })}>
+                    <option value="-1">Auto</option>
+                    <option value="0">CPU only</option>
+                    <option value="20">20 layers</option>
+                    <option value="40">40 layers</option>
+                    <option value="80">80 layers</option>
+                  </select>
+                </label>
+                <label>
+                  <span>Reasoning</span>
+                  <select
+                    value={settings.reasoningEffort}
+                    aria-label="Reasoning"
+                    onChange={(event) => setSettings({ ...settings, reasoningEffort: event.currentTarget.value })}
+                  >
+                    <option value="low">Low</option>
+                    <option value="medium">Medium</option>
+                    <option value="high">High</option>
+                  </select>
+                </label>
+                <label>
+                  <span>Access</span>
+                  <select
+                    value={settings.permissionMode}
+                    aria-label="Access"
+                    onChange={(event) => setSettings({ ...settings, permissionMode: event.currentTarget.value })}
+                  >
+                    <option value="default_permissions">Default</option>
+                    <option value="full_access">Full access</option>
+                  </select>
+                </label>
+              </div>
+            </section>
+            <section className="chat-settings-section">
+              <h3>Sampling</h3>
+              <div className="chat-settings-row">
+                <label>
+                  <span>Temperature</span>
+                  <input name="temperature" value={settings.temperature} onChange={(event) => setSettings({ ...settings, temperature: event.currentTarget.value })} />
+                </label>
+                <label>
+                  <span>Repeat Penalty</span>
+                  <input name="repeatPenalty" value={settings.repeatPenalty} onChange={(event) => setSettings({ ...settings, repeatPenalty: event.currentTarget.value })} />
+                </label>
+              </div>
+            </section>
+            <section className="chat-settings-section">
+              <h3>Context Trimming</h3>
+              <div className="chat-settings-row chat-settings-row-four">
+                <label>
+                  <span>Trim Reserve Tokens</span>
+                  <input value={settings.trimReserveTokens} onChange={(event) => setSettings({ ...settings, trimReserveTokens: event.currentTarget.value })} />
+                </label>
+                <label>
+                  <span>Trim Reserve %</span>
+                  <input value={settings.trimReservePercent} onChange={(event) => setSettings({ ...settings, trimReservePercent: event.currentTarget.value })} />
+                </label>
+                <label>
+                  <span>Trim Amount Tokens</span>
+                  <input value={settings.trimAmountTokens} onChange={(event) => setSettings({ ...settings, trimAmountTokens: event.currentTarget.value })} />
+                </label>
+                <label>
+                  <span>Trim Amount %</span>
+                  <input value={settings.trimAmountPercent} onChange={(event) => setSettings({ ...settings, trimAmountPercent: event.currentTarget.value })} />
+                </label>
+              </div>
+            </section>
+            <section className="chat-settings-section">
+              <h3>Generation</h3>
+              <div className="chat-settings-row">
+                <label>
+                  <span>Max Tokens</span>
+                  <input name="maxTokens" value={settings.maxTokens} onChange={(event) => setSettings({ ...settings, maxTokens: event.currentTarget.value })} />
+                </label>
+              </div>
+            </section>
+            <section className="chat-settings-section">
+              <h3>System Prompt</h3>
+              <textarea className="chat-settings-prompt" value={settings.systemPrompt} onChange={(event) => setSettings({ ...settings, systemPrompt: event.currentTarget.value })} />
+            </section>
+          </div>
+          <div className="chat-dialog-actions">
+            <button type="button" onClick={onClose}>Cancel</button>
+            <button type="submit">Save</button>
+          </div>
+        </form>
+      </div>
+    );
+  }
+  if (dialog.kind === "settings-preset") {
+    const preset = dialog.presetId ? state.settingsPresets.find((candidate) => candidate.id === dialog.presetId) : null;
+    return (
+      <div className="chat-dialog-backdrop" role="presentation" onPointerDown={onClose}>
+        <form
+          className="chat-settings-dialog"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Settings preset"
+          onPointerDown={(event) => event.stopPropagation()}
+          onSubmit={(event) => {
+            event.preventDefault();
+            void onRun(() => window.unitApi.chat.saveSettingsPreset({
+              presetId: preset?.id,
+              label: title,
+              runtimeSettings: parseRuntimeSettingsForm(settings),
+              providerMode: threadProviderMode,
+              iconName: presetIconName,
+              builtinModelId: state.selectedModelId,
+              builtinAgenticFramework: presetBuiltinFramework,
+              documentAnalysisEmbeddingModelPath: presetEmbeddingModelPath,
+              codexModelId: threadCodexModelId,
+              codexReasoningEffort: threadCodexReasoningEffort
+            })).then(onClose);
+          }}
+        >
+          <header className="chat-settings-header">
+            <div>
+              <strong>{preset ? "Edit Preset" : "New Preset"}</strong>
+              <span>{preset?.builtIn ? "Built-in preset override" : "Custom settings preset"}</span>
+            </div>
+            <button type="button" aria-label="Close settings preset" onClick={onClose}>
+              <X size={15} />
+            </button>
+          </header>
+          <div className="chat-settings-body">
+            <section className="chat-settings-section">
+              <h3>Preset</h3>
+              <div className="chat-settings-row">
+                <label>
+                  <span>Name</span>
+                  <input value={title} onChange={(event) => setTitle(event.currentTarget.value)} />
+                </label>
+                <label>
+                  <span>Icon</span>
+                  <select value={presetIconName} onChange={(event) => setPresetIconName(event.currentTarget.value)}>
+                    <option value="sliders">Sliders</option>
+                    <option value="bolt">Bolt</option>
+                    <option value="brain">Brain</option>
+                    <option value="code">Code</option>
+                  </select>
+                </label>
+                <label>
+                  <span>Provider</span>
+                  <select value={threadProviderMode} onChange={(event) => setThreadProviderMode(event.currentTarget.value as ChatProviderMode)}>
+                    <option value="builtin">Built-in</option>
+                    <option value="codex">Codex</option>
+                  </select>
+                </label>
+              </div>
+            </section>
+            <section className="chat-settings-section">
+              <h3>Built-in</h3>
+              <div className="chat-settings-row">
+                <label>
+                  <span>Agentic framework</span>
+                  <select value={presetBuiltinFramework} onChange={(event) => setPresetBuiltinFramework(event.currentTarget.value as "chat" | "document_analysis")}>
+                    <option value="chat">Chat</option>
+                    <option value="document_analysis">Document analysis</option>
+                  </select>
+                </label>
+                <label>
+                  <span>Access</span>
+                  <select value={settings.permissionMode} onChange={(event) => setSettings({ ...settings, permissionMode: event.currentTarget.value })}>
+                    <option value="default_permissions">Default</option>
+                    <option value="full_access">Full access</option>
+                  </select>
+                </label>
+              </div>
+              <label className="chat-embedding-field">
+                <span>Embedding Model</span>
+                <div className="chat-directory-row">
+                  <input placeholder="Path to embedding GGUF" value={presetEmbeddingModelPath} onChange={(event) => setPresetEmbeddingModelPath(event.currentTarget.value)} />
+                  <button type="button" onClick={() => {
+                    void window.unitApi.fileSystem.selectFiles({ kind: "file", multiple: false }).then((result) => {
+                      if (result.paths[0]) {
+                        setPresetEmbeddingModelPath(result.paths[0]);
+                      }
+                    });
+                  }}>Browse...</button>
+                </div>
+              </label>
+            </section>
+            <section className="chat-settings-section">
+              <h3>Codex</h3>
+              <div className="chat-settings-row">
+                <label>
+                  <span>Model</span>
+                  <select value={threadCodexModelId} onChange={(event) => setThreadCodexModelId(event.currentTarget.value)}>
+                    {state.codexModels.map((model) => <option key={model.id} value={model.id}>{model.label}</option>)}
+                  </select>
+                </label>
+                <label>
+                  <span>Reasoning</span>
+                  <select value={threadCodexReasoningEffort} onChange={(event) => setThreadCodexReasoningEffort(event.currentTarget.value as ChatReasoningEffort)}>
+                    <option value="low">Low</option>
+                    <option value="medium">Medium</option>
+                    <option value="high">High</option>
+                    <option value="xhigh">XHigh</option>
+                  </select>
+                </label>
+              </div>
+            </section>
+            <section className="chat-settings-section">
+              <h3>Runtime</h3>
+              <div className="chat-settings-row">
+                <label>
+                  <span>Context Window</span>
+                  <select value={settings.nCtx} onChange={(event) => setSettings({ ...settings, nCtx: event.currentTarget.value })}>
+                    <option value="4096">4K</option>
+                    <option value="8192">8K</option>
+                    <option value="16384">16K</option>
+                    <option value="32768">32K</option>
+                    <option value="65536">64K</option>
+                    <option value="131072">128K</option>
+                  </select>
+                </label>
+                <label>
+                  <span>Reasoning</span>
+                  <select value={settings.reasoningEffort} onChange={(event) => setSettings({ ...settings, reasoningEffort: event.currentTarget.value })}>
+                    <option value="low">Low</option>
+                    <option value="medium">Medium</option>
+                    <option value="high">High</option>
+                  </select>
+                </label>
+                <label>
+                  <span>Max Tokens</span>
+                  <input value={settings.maxTokens} onChange={(event) => setSettings({ ...settings, maxTokens: event.currentTarget.value })} />
+                </label>
+              </div>
+            </section>
+          </div>
+          <div className="chat-dialog-actions">
+            <button type="button" onClick={onClose}>Cancel</button>
+            <button type="submit" disabled={!title.trim()}>Save</button>
+          </div>
+        </form>
+      </div>
+    );
+  }
+  if (dialog.kind === "document-index") {
+    const addDocumentPaths = (paths: string[]) => {
+      setDocumentIndexPaths((current) => {
+        const seen = new Set(current.map((path) => path.toLocaleLowerCase()));
+        const next = [...current];
+        for (const path of paths) {
+          if (!path.trim() || seen.has(path.toLocaleLowerCase())) {
+            continue;
+          }
+          seen.add(path.toLocaleLowerCase());
+          next.push(path);
+        }
+        if (!title.trim() && next.length > 0) {
+          setTitle(next.length === 1 ? chatFileName(next[0]) : `${chatFileName(next[0])} + ${next.length - 1} more`);
+        }
+        return next;
+      });
+    };
+    return (
+      <div className="chat-dialog-backdrop" role="presentation" onPointerDown={onClose}>
+        <form
+          className="chat-settings-dialog chat-document-index-dialog"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Create document index"
+          onPointerDown={(event) => event.stopPropagation()}
+          onSubmit={(event) => {
+            event.preventDefault();
+            void onRun(() => window.unitApi.chat.createDocumentIndex({
+              projectId: dialog.projectId,
+              title,
+              sourcePath: documentIndexPaths.join("\n")
+            })).then(onClose);
+          }}
+        >
+          <header className="chat-settings-header">
+            <div>
+              <strong>Create Document Index</strong>
+              <span>{state.projects.find((project) => project.id === dialog.projectId)?.title ?? "Project"}</span>
+            </div>
+            <button type="button" aria-label="Close document index" onClick={onClose}>
+              <X size={15} />
+            </button>
+          </header>
+          <div className="chat-settings-body">
+            <section className="chat-settings-section">
+              <h3>Index</h3>
+              <label>
+                <span>Name</span>
+                <input name="document-index-title" value={title} onChange={(event) => setTitle(event.currentTarget.value)} />
+              </label>
+            </section>
+            <section className="chat-settings-section">
+              <h3>PDFs</h3>
+              <div className="chat-document-index-toolbar">
+                <button type="button" onClick={() => {
+                  void window.unitApi.fileSystem.selectFiles({
+                    currentPath: state.projects.find((project) => project.id === dialog.projectId)?.directory,
+                    kind: "file",
+                    multiple: true
+                  }).then((result) => addDocumentPaths(result.paths.filter((path) => path.toLocaleLowerCase().endsWith(".pdf"))));
+                }}>Add PDFs</button>
+                <button type="button" disabled={documentIndexPaths.length === 0} onClick={() => setDocumentIndexPaths([])}>Clear</button>
+              </div>
+              <div className="chat-document-index-file-list">
+                {documentIndexPaths.length === 0 ? (
+                  <div className="chat-document-index-empty">No PDFs selected.</div>
+                ) : documentIndexPaths.map((path) => (
+                  <div className="chat-document-index-file-row" key={path}>
+                    <input type="checkbox" aria-label={`Select ${chatFileName(path)}`} readOnly />
+                    <div>
+                      <strong>{chatFileName(path)}</strong>
+                      <span>{path}</span>
+                    </div>
+                    <button type="button" aria-label={`Remove ${chatFileName(path)}`} onClick={() => setDocumentIndexPaths((current) => current.filter((item) => item !== path))}>
+                      <X size={13} />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </section>
+          </div>
+          <div className="chat-dialog-actions">
+            <button type="button" onClick={onClose}>Cancel</button>
+            <button type="submit" disabled={!title.trim() || documentIndexPaths.length === 0}>Create</button>
+          </div>
+        </form>
+      </div>
+    );
+  }
+  if (dialog.kind === "create-branch") {
+    return (
+      <div className="chat-dialog-backdrop" role="presentation" onPointerDown={onClose}>
+        <form
+          className="chat-settings-dialog chat-branch-dialog"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Create Branch"
+          onPointerDown={(event) => event.stopPropagation()}
+          onSubmit={(event) => {
+            event.preventDefault();
+            void window.unitApi.chat.createGitBranch({ projectId: dialog.projectId, branch: title.trim() })
+              .then(() => onClose())
+              .catch((error: unknown) => {
+                void onRun(() => Promise.reject(error));
+              });
+          }}
+        >
+          <header className="chat-settings-header">
+            <div>
+              <strong>Create Branch</strong>
+              <span>Branch name:</span>
+            </div>
+            <button type="button" aria-label="Close create branch" onClick={onClose}>
+              <X size={15} />
+            </button>
+          </header>
+          <div className="chat-settings-body">
+            <section className="chat-settings-section">
+              <label>
+                <span>Branch name</span>
+                <input autoFocus name="branch-name" value={title} onChange={(event) => setTitle(event.currentTarget.value)} />
+              </label>
+            </section>
+          </div>
+          <div className="chat-dialog-actions">
+            <button type="button" onClick={onClose}>Cancel</button>
+            <button type="submit" disabled={!title.trim()}>Create</button>
+          </div>
+        </form>
+      </div>
+    );
+  }
+  if (dialog.kind === "project-settings") {
+    const project = state.projects.find((item) => item.id === dialog.projectId);
+    return (
+      <div className="chat-dialog-backdrop" role="presentation" onPointerDown={onClose}>
+        <form
+          className="chat-settings-dialog"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Project settings"
+          onPointerDown={(event) => event.stopPropagation()}
+          onSubmit={(event) => {
+            event.preventDefault();
+            void onRun(() => window.unitApi.chat.updateProjectSettings({ projectId: dialog.projectId, title, directory, actionButtons: projectActionButtons })).then(onClose);
+          }}
+        >
+          <header className="chat-settings-header">
+            <div>
+              <strong>Project Settings</strong>
+              <span>{project?.title ?? "Project"}</span>
+            </div>
+            <button type="button" aria-label="Close project settings" onClick={onClose}>
+              <X size={15} />
+            </button>
+          </header>
+          <ProjectSettingsFields
+            title={title}
+            directory={directory}
+            actionButtons={projectActionButtons}
+            onTitleChange={setTitle}
+            onDirectoryChange={setDirectory}
+            onActionButtonsChange={setProjectActionButtons}
+          />
+          <div className="chat-dialog-actions">
+            <button type="button" onClick={onClose}>Cancel</button>
+            <button type="submit" disabled={!title.trim()}>Save</button>
+          </div>
+        </form>
+      </div>
+    );
+  }
+  if (dialog.kind === "project-actions") {
+    const project = state.projects.find((item) => item.id === dialog.projectId);
+    return (
+      <div className="chat-dialog-backdrop" role="presentation" onPointerDown={onClose}>
+        <form
+          className="chat-settings-dialog chat-action-buttons-dialog"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Action buttons"
+          onPointerDown={(event) => event.stopPropagation()}
+          onSubmit={(event) => {
+            event.preventDefault();
+            const project = state.projects.find((item) => item.id === dialog.projectId);
+            if (project) {
+              void onRun(() => window.unitApi.chat.updateProjectSettings({
+                projectId: dialog.projectId,
+                title: project.title,
+                directory: project.directory,
+                actionButtons: projectActionButtons
+              })).then(onClose);
+            } else {
+              onClose();
+            }
+          }}
+        >
+          <header className="chat-settings-header">
+            <div>
+              <strong>Action Buttons</strong>
+              <span>{project?.title ?? "Project"}</span>
+            </div>
+            <button type="button" aria-label="Close action buttons" onClick={onClose}>
+              <X size={15} />
+            </button>
+          </header>
+          <div className="chat-settings-body">
+            <section className="chat-settings-section">
+              <h3>Action Buttons</h3>
+              <ProjectActionEditor rows={projectActionButtons} onRowsChange={setProjectActionButtons} />
+            </section>
+          </div>
+          <div className="chat-dialog-actions">
+            <button type="button" onClick={onClose}>Cancel</button>
+            <button type="submit">Save</button>
+          </div>
+        </form>
+      </div>
+    );
+  }
+  if (dialog.kind === "thread-settings") {
+    const thread = state.threads.find((item) => item.id === dialog.threadId);
+    return (
+      <div className="chat-dialog-backdrop" role="presentation" onPointerDown={onClose}>
+        <form
+          className="chat-settings-dialog chat-conversation-settings-dialog"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Thread settings"
+          onPointerDown={(event) => event.stopPropagation()}
+          onSubmit={(event) => {
+            event.preventDefault();
+            void onRun(async () => {
+              if (thread && title.trim() && title.trim() !== thread.title) {
+                await window.unitApi.chat.renameThread({ threadId: dialog.threadId, title: title.trim() });
+              }
+              return window.unitApi.chat.updateThreadSettings({
+                threadId: dialog.threadId,
+                providerMode: threadProviderMode,
+                builtinModelId: threadBuiltinModelId,
+                runtimeSettings: threadProviderMode === "builtin" ? parseRuntimeSettingsForm(settings) : undefined,
+                builtinAgenticFramework: presetBuiltinFramework,
+                documentAnalysisEmbeddingModelPath: presetEmbeddingModelPath,
+                codexModelId: threadCodexModelId,
+                codexReasoningEffort: threadCodexReasoningEffort,
+                permissionMode: threadPermissionMode,
+                codexApprovalMode: threadCodexApprovalMode,
+                planModeEnabled: threadPlanModeEnabled
+              });
+            }).then(onClose);
+          }}
+        >
+          <header className="chat-settings-header">
+            <div>
+              <strong>Thread Settings</strong>
+              <span>{thread?.title ?? "Thread"}</span>
+            </div>
+            <button type="button" aria-label="Close thread settings" onClick={onClose}>
+              <X size={15} />
+            </button>
+          </header>
+          <div className="chat-settings-body">
+            <section className="chat-settings-section">
+              <h3>Thread</h3>
+              <label>
+                <span>Title</span>
+                <input name="thread-title" value={title || thread?.title || ""} onChange={(event) => setTitle(event.currentTarget.value)} />
+              </label>
+              <label>
+                <span>Runtime</span>
+                <select
+                  value={threadProviderMode}
+                  aria-label="Thread runtime"
+                  onChange={(event) => setThreadProviderMode(event.currentTarget.value as ChatProviderMode)}
+                >
+                  <option value="builtin">Built-in model</option>
+                  <option value="codex">Codex agent</option>
+                </select>
+              </label>
+            </section>
+            {threadProviderMode === "codex" ? (
+            <section className="chat-settings-section">
+              <h3>Codex Agent</h3>
+              <div className="chat-settings-row">
+                <label>
+                  <span>Model</span>
+                  <select value={threadCodexModelId} aria-label="Thread Codex model" onChange={(event) => setThreadCodexModelId(event.currentTarget.value)}>
+                    {state.codexModels.map((model) => (
+                      <option key={model.id} value={model.id}>{model.label}  [{model.isDefault ? "Default" : "Codex"}]</option>
+                    ))}
+                  </select>
+                </label>
+                <label>
+                  <span>Reasoning</span>
+                  <select value={threadCodexReasoningEffort} aria-label="Thread Codex reasoning" onChange={(event) => setThreadCodexReasoningEffort(event.currentTarget.value as ChatReasoningEffort)}>
+                    {(state.codexModels.find((model) => model.id === threadCodexModelId)?.reasoningEfforts ?? ["low", "medium", "high"]).map((effort) => (
+                      <option key={effort} value={effort}>{reasoningLabel(effort)}</option>
+                    ))}
+                  </select>
+                </label>
+              </div>
+              <div className="chat-settings-row">
+                <label>
+                  <span>Access</span>
+                  <select
+                    value={codexAccessModeForApprovalMode(threadCodexApprovalMode)}
+                    aria-label="Thread Codex access"
+                    onChange={(event) => {
+                      const nextAccess = event.currentTarget.value as ChatPermissionMode;
+                      setThreadPermissionMode(nextAccess);
+                      setThreadCodexApprovalMode(codexApprovalModeForAccessMode(nextAccess));
+                    }}
+                  >
+                    {CHAT_PERMISSION_OPTIONS.map((option) => (
+                      <option key={option.id} value={option.id}>{option.label}</option>
+                    ))}
+                  </select>
+                </label>
+                <label className="chat-settings-check">
+                  <input type="checkbox" checked={threadPlanModeEnabled} onChange={(event) => setThreadPlanModeEnabled(event.currentTarget.checked)} />
+                  <span>Plan mode</span>
+                </label>
+              </div>
+            </section>
+            ) : (
+            <section className="chat-settings-section">
+              <h3>Runtime Settings</h3>
+              <label>
+                <span>Model</span>
+                <select value={threadBuiltinModelId} aria-label="Thread built-in model" onChange={(event) => setThreadBuiltinModelId(event.currentTarget.value)}>
+                  {state.models.length === 0 ? <option value="">No built-in model available</option> : null}
+                  {state.models.map((model) => (
+                    <option key={model.id} value={model.id}>{model.label}  [Local GGUF]</option>
+                  ))}
+                </select>
+              </label>
+              <div className="chat-settings-row">
+                <label>
+                  <span>Agentic framework</span>
+                  <select value={presetBuiltinFramework} aria-label="Thread agentic framework" onChange={(event) => setPresetBuiltinFramework(event.currentTarget.value as "chat" | "document_analysis")}>
+                    <option value="chat">Chat</option>
+                    <option value="document_analysis">Document analysis</option>
+                  </select>
+                </label>
+                <label>
+                  <span>Context Window</span>
+                  <select value={settings.nCtx} aria-label="Thread context window" onChange={(event) => setSettings({ ...settings, nCtx: event.currentTarget.value })}>
+                    <option value="32768">Default</option>
+                    <option value="4096">4K</option>
+                    <option value="8192">8K</option>
+                    <option value="16384">16K</option>
+                    <option value="32768">32K</option>
+                    <option value="65536">64K</option>
+                    <option value="131072">128K</option>
+                  </select>
+                </label>
+                <label>
+                  <span>GPU Layers</span>
+                  <select value={settings.nGpuLayers} aria-label="Thread GPU layers" onChange={(event) => setSettings({ ...settings, nGpuLayers: event.currentTarget.value })}>
+                    <option value="-1">Auto</option>
+                    <option value="0">CPU only</option>
+                    <option value="20">20 layers</option>
+                    <option value="40">40 layers</option>
+                    <option value="80">80 layers</option>
+                  </select>
+                </label>
+              </div>
+              <div className="chat-settings-row">
+                <label>
+                  <span>Reasoning</span>
+                  <select value={settings.reasoningEffort} aria-label="Thread reasoning" onChange={(event) => setSettings({ ...settings, reasoningEffort: event.currentTarget.value })}>
+                    <option value="low">Low</option>
+                    <option value="medium">Medium</option>
+                    <option value="high">High</option>
+                  </select>
+                </label>
+                <label>
+                  <span>Access</span>
+                  <select value={settings.permissionMode} aria-label="Thread permissions" onChange={(event) => setSettings({ ...settings, permissionMode: event.currentTarget.value })}>
+                    <option value="default_permissions">Default</option>
+                    <option value="full_access">Full access</option>
+                  </select>
+                </label>
+              </div>
+              <div className="chat-settings-row">
+                <label>
+                  <span>Temperature</span>
+                  <input value={settings.temperature} onChange={(event) => setSettings({ ...settings, temperature: event.currentTarget.value })} />
+                </label>
+                <label>
+                  <span>Repeat Penalty</span>
+                  <input value={settings.repeatPenalty} onChange={(event) => setSettings({ ...settings, repeatPenalty: event.currentTarget.value })} />
+                </label>
+              </div>
+              <div className="chat-settings-row chat-settings-row-four">
+                <label>
+                  <span>Trim Reserve Tokens</span>
+                  <input value={settings.trimReserveTokens} onChange={(event) => setSettings({ ...settings, trimReserveTokens: event.currentTarget.value })} />
+                </label>
+                <label>
+                  <span>Trim Reserve %</span>
+                  <input value={settings.trimReservePercent} onChange={(event) => setSettings({ ...settings, trimReservePercent: event.currentTarget.value })} />
+                </label>
+                <label>
+                  <span>Trim Amount Tokens</span>
+                  <input value={settings.trimAmountTokens} onChange={(event) => setSettings({ ...settings, trimAmountTokens: event.currentTarget.value })} />
+                </label>
+                <label>
+                  <span>Trim Amount %</span>
+                  <input value={settings.trimAmountPercent} onChange={(event) => setSettings({ ...settings, trimAmountPercent: event.currentTarget.value })} />
+                </label>
+              </div>
+              <section className="chat-settings-section chat-nested-settings-section">
+                <h3>System Prompt</h3>
+                <textarea className="chat-settings-prompt" value={settings.systemPrompt} onChange={(event) => setSettings({ ...settings, systemPrompt: event.currentTarget.value })} />
+              </section>
+            </section>
+            )}
+            <section className="chat-settings-section">
+              <h3>Workspace</h3>
+              <label>
+                <span>Project</span>
+                <input readOnly value={state.projects.find((project) => project.id === thread?.projectId)?.title ?? ""} />
+              </label>
+              <label>
+                <span>Effective Working Directory</span>
+                <input readOnly placeholder="No project directory set" value={state.projects.find((project) => project.id === thread?.projectId)?.directory ?? ""} />
+              </label>
+            </section>
+          </div>
+          <div className="chat-dialog-actions chat-dialog-actions-split">
+            {thread ? (
+              <button
+                type="button"
+                onClick={() => {
+                  onDialog({ kind: "project-settings", projectId: thread.projectId });
+                }}
+              >
+                Project Settings
+              </button>
+            ) : null}
+            <span />
+            <button type="button" onClick={onClose}>Cancel</button>
+            <button type="submit" disabled={!title.trim()}>Save</button>
+          </div>
+        </form>
+      </div>
+    );
+  }
+  const isDelete = dialog.kind.startsWith("delete");
+  const subject = dialog.kind.includes("project") ? "project" : "thread";
+  return (
+    <div className="chat-dialog-backdrop" role="presentation" onPointerDown={onClose}>
+      <form
+        className="chat-rename-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-label={isDelete ? `Delete ${subject}` : `Rename ${subject}`}
+        onPointerDown={(event) => event.stopPropagation()}
+        onSubmit={(event) => {
+          event.preventDefault();
+          if (dialog.kind === "rename-project") {
+            void onRun(() => window.unitApi.chat.renameProject({ projectId: dialog.projectId, title })).then(onClose);
+          } else if (dialog.kind === "rename-thread") {
+            void onRun(() => window.unitApi.chat.renameThread({ threadId: dialog.threadId, title })).then(onClose);
+          } else if (dialog.kind === "delete-project") {
+            void onRun(() => window.unitApi.chat.deleteProject({ projectId: dialog.projectId })).then(onClose);
+          } else {
+            void onRun(() => window.unitApi.chat.deleteThread({ threadId: dialog.threadId })).then(onClose);
+          }
+        }}
+      >
+        <header>
+          <strong>{isDelete ? `Delete ${subject}` : `Rename ${subject}`}</strong>
+          <button type="button" aria-label="Close dialog" onClick={onClose}>
+            <X size={15} />
+          </button>
+        </header>
+        {isDelete ? (
+          <p>{dialog.title}</p>
+        ) : (
+          <label>
+            <span>Name</span>
+            <input autoFocus value={title} onChange={(event) => setTitle(event.currentTarget.value)} />
+          </label>
+        )}
+        <div className="chat-dialog-actions">
+          <button type="button" onClick={onClose}>Cancel</button>
+          <button className={isDelete ? "destructive" : ""} type="submit" disabled={!isDelete && !title.trim()}>
+            {isDelete ? "Delete" : "Save"}
+          </button>
+        </div>
+      </form>
+    </div>
+  );
+}
+
+function initialChatDialogTitle(dialog: ChatDialogState, state: ChatState) {
+  if (!dialog) {
+    return "";
+  }
+  if (dialog.kind === "new-project") {
+    return "New Project";
+  }
+  if (dialog.kind === "rename-project" || dialog.kind === "rename-thread" || dialog.kind === "delete-project" || dialog.kind === "delete-thread") {
+    return dialog.title;
+  }
+  if (dialog.kind === "project-settings") {
+    return state.projects.find((project) => project.id === dialog.projectId)?.title ?? "";
+  }
+  if (dialog.kind === "project-actions") {
+    return state.projects.find((project) => project.id === dialog.projectId)?.title ?? "";
+  }
+  if (dialog.kind === "thread-settings") {
+    return state.threads.find((thread) => thread.id === dialog.threadId)?.title ?? "";
+  }
+  if (dialog.kind === "settings-preset") {
+    return dialog.presetId
+      ? state.settingsPresets.find((preset) => preset.id === dialog.presetId)?.label ?? ""
+      : "Untitled settings";
+  }
+  return "";
+}
+
+function ProjectSettingsFields({
+  title,
+  directory,
+  actionButtons,
+  onTitleChange,
+  onDirectoryChange,
+  onActionButtonsChange
+}: {
+  title: string;
+  directory: string;
+  actionButtons: ChatActionButton[];
+  onTitleChange: (title: string) => void;
+  onDirectoryChange: (directory: string) => void;
+  onActionButtonsChange: (actionButtons: ChatActionButton[]) => void;
+}) {
+  const chooseDirectory = useCallback(async () => {
+    const result = await window.unitApi.fileSystem.selectDirectory({ currentPath: directory });
+    if (result.rootPath) {
+      onDirectoryChange(result.rootPath);
+    }
+  }, [directory, onDirectoryChange]);
+
+  return (
+    <div className="chat-settings-body">
+      <section className="chat-settings-section">
+        <h3>Project</h3>
+        <label>
+          <span>Name</span>
+          <input autoFocus name="project-title" placeholder="Project name" value={title} onChange={(event) => onTitleChange(event.currentTarget.value)} />
+        </label>
+        <label>
+          <span>Directory</span>
+          <div className="chat-directory-row">
+            <input name="project-directory" placeholder="Optional" value={directory} onChange={(event) => onDirectoryChange(event.currentTarget.value)} />
+            <button type="button" onClick={() => void chooseDirectory()}>Browse</button>
+          </div>
+        </label>
+      </section>
+      <section className="chat-settings-section">
+        <h3>Action Buttons</h3>
+        <ProjectActionEditor rows={actionButtons} onRowsChange={onActionButtonsChange} />
+      </section>
+    </div>
+  );
+}
+
+function ChatAttachmentStrip({
+  attachments,
+  status,
+  queuedSubmissions,
+  onRemove,
+  onCancelQueued
+}: {
+  attachments: ChatAttachment[];
+  status: string;
+  queuedSubmissions: ChatState["queuedSubmissions"];
+  onRemove: (attachmentId: string) => void;
+  onCancelQueued: (submissionId: string) => void;
+}) {
+  if (attachments.length === 0 && !status && queuedSubmissions.length === 0) {
+    return null;
+  }
+  return (
+    <div className="chat-attachment-strip visible" aria-label="Pending attachments">
+      <div className="chat-attachment-tile-row">
+        {attachments.map((attachment) => (
+          <div className="chat-attachment-tile" key={attachment.id}>
+            {attachment.kind === "image" ? <Image size={14} /> : <Paperclip size={14} />}
+            <span>{attachment.name}</span>
+            <button type="button" aria-label={`Remove ${attachment.name}`} onClick={() => onRemove(attachment.id)}>
+              <X size={12} />
+            </button>
+            {attachment.kind === "image" ? (
+              <div className="chat-attachment-hover-preview" aria-hidden="true">
+                <img src={attachment.dataUrl ?? attachmentPreviewSrc(attachment.path)} alt="" />
+              </div>
+            ) : null}
+          </div>
+        ))}
+      </div>
+      {queuedSubmissions.length > 0 ? (
+        <div className="chat-queued-submission-list" aria-label="Queued prompts">
+          {queuedSubmissions.map((submission, index) => (
+            <div className="chat-queued-submission" key={submission.id}>
+              <span>{submission.inputMode === "steer" ? "STEERING" : `${index + 1}.`}</span>
+              <strong>{submission.preview}</strong>
+              <button type="button" aria-label={`Cancel queued prompt ${index + 1}`} onClick={() => onCancelQueued(submission.id)}>
+                <X size={12} />
+              </button>
+            </div>
+          ))}
+        </div>
+      ) : null}
+      {status ? <span className="chat-attachment-status">{status}</span> : null}
+    </div>
+  );
+}
+
+function ProjectActionEditor({ rows, onRowsChange }: { rows: ChatActionButton[]; onRowsChange: (rows: ChatActionButton[]) => void }) {
+  return (
+    <div className="chat-action-editor">
+      <div className="chat-action-editor-header">
+        <span>Label</span>
+        <span>Command</span>
+        <span>Directory</span>
+        <span />
+      </div>
+      <div className="chat-action-editor-rows">
+        {rows.map((row) => (
+          <div className="chat-action-editor-row" key={row.id}>
+            <input aria-label="Action label" value={row.label} onChange={(event) => onRowsChange(rows.map((item) => item.id === row.id ? { ...item, label: event.currentTarget.value } : item))} />
+            <input aria-label="Action command" value={row.command} onChange={(event) => onRowsChange(rows.map((item) => item.id === row.id ? { ...item, command: event.currentTarget.value } : item))} />
+            <input aria-label="Action directory" value={row.directory} onChange={(event) => onRowsChange(rows.map((item) => item.id === row.id ? { ...item, directory: event.currentTarget.value } : item))} />
+            <button aria-label="Remove action button" type="button" onClick={() => onRowsChange(rows.filter((item) => item.id !== row.id))}>
+              <X size={13} />
+            </button>
+          </div>
+        ))}
+      </div>
+      <button
+        className="chat-action-editor-add"
+        type="button"
+        onClick={() => onRowsChange([...rows, { id: `action-${Date.now()}-${rows.length}`, label: "", command: "", directory: "" }])}
+      >
+        <Plus size={14} />
+        <span>Add action button</span>
+      </button>
+    </div>
+  );
+}
+
+function initialChatDialogDirectory(dialog: ChatDialogState, state: ChatState) {
+  if (dialog?.kind !== "project-settings" && dialog?.kind !== "project-actions") {
+    return "";
+  }
+  return state.projects.find((project) => project.id === dialog.projectId)?.directory ?? "";
+}
+
+function initialRuntimeSettingsForm(dialog: ChatDialogState, state: ChatState): Record<keyof ChatRuntimeSettings, string> {
+  if (dialog?.kind === "thread-settings") {
+    const thread = state.threads.find((candidate) => candidate.id === dialog.threadId);
+    if (thread) {
+      return runtimeSettingsToForm(thread.runtimeSettings);
+    }
+  }
+  if (dialog?.kind === "settings-preset" && dialog.presetId) {
+    const preset = state.settingsPresets.find((candidate) => candidate.id === dialog.presetId);
+    if (preset) {
+      return runtimeSettingsToForm(preset.runtimeSettings);
+    }
+  }
+  return runtimeSettingsToForm(state.runtimeSettings);
+}
+
+function initialThreadProviderMode(dialog: ChatDialogState, state: ChatState): ChatProviderMode {
+  if (dialog?.kind === "thread-settings") {
+    return state.threads.find((thread) => thread.id === dialog.threadId)?.providerMode ?? "builtin";
+  }
+  if (dialog?.kind === "settings-preset" && dialog.presetId) {
+    return state.settingsPresets.find((preset) => preset.id === dialog.presetId)?.providerMode ?? "builtin";
+  }
+  return "builtin";
+}
+
+function initialThreadBuiltinModelId(dialog: ChatDialogState, state: ChatState) {
+  if (dialog?.kind === "thread-settings") {
+    return state.threads.find((thread) => thread.id === dialog.threadId)?.builtinModelId || state.selectedModelId || state.models[0]?.id || "";
+  }
+  return state.selectedModelId || state.models[0]?.id || "";
+}
+
+function initialThreadCodexModelId(dialog: ChatDialogState, state: ChatState) {
+  const defaultModelId = state.codexModels.find((model) => model.isDefault)?.id ?? state.codexModels[0]?.id ?? "";
+  if (dialog?.kind === "thread-settings") {
+    return state.threads.find((thread) => thread.id === dialog.threadId)?.codexModelId ?? defaultModelId;
+  }
+  if (dialog?.kind === "settings-preset" && dialog.presetId) {
+    return state.settingsPresets.find((preset) => preset.id === dialog.presetId)?.codexModelId ?? defaultModelId;
+  }
+  return defaultModelId;
+}
+
+function initialThreadCodexReasoningEffort(dialog: ChatDialogState, state: ChatState): ChatReasoningEffort {
+  if (dialog?.kind === "thread-settings") {
+    return state.threads.find((thread) => thread.id === dialog.threadId)?.codexReasoningEffort ?? "medium";
+  }
+  if (dialog?.kind === "settings-preset" && dialog.presetId) {
+    return state.settingsPresets.find((preset) => preset.id === dialog.presetId)?.codexReasoningEffort ?? "medium";
+  }
+  return "medium";
+}
+
+function initialThreadPermissionMode(dialog: ChatDialogState, state: ChatState): ChatPermissionMode {
+  return dialog?.kind === "thread-settings"
+    ? state.threads.find((thread) => thread.id === dialog.threadId)?.permissionMode ?? state.runtimeSettings.permissionMode
+    : state.runtimeSettings.permissionMode;
+}
+
+function initialThreadCodexApprovalMode(dialog: ChatDialogState, state: ChatState): ChatCodexApprovalMode {
+  return dialog?.kind === "thread-settings"
+    ? state.threads.find((thread) => thread.id === dialog.threadId)?.codexApprovalMode ?? "default"
+    : "default";
+}
+
+function initialThreadPlanModeEnabled(dialog: ChatDialogState, state: ChatState) {
+  return dialog?.kind === "thread-settings"
+    ? state.threads.find((thread) => thread.id === dialog.threadId)?.planModeEnabled ?? false
+    : false;
+}
+
+function initialSettingsPresetIconName(dialog: ChatDialogState, state: ChatState) {
+  return dialog?.kind === "settings-preset" && dialog.presetId
+    ? state.settingsPresets.find((preset) => preset.id === dialog.presetId)?.iconName ?? "sliders"
+    : "sliders";
+}
+
+function initialSettingsPresetBuiltinFramework(dialog: ChatDialogState, state: ChatState): "chat" | "document_analysis" {
+  if (dialog?.kind === "thread-settings") {
+    return state.threads.find((thread) => thread.id === dialog.threadId)?.builtinAgenticFramework ?? "chat";
+  }
+  return dialog?.kind === "settings-preset" && dialog.presetId
+    ? state.settingsPresets.find((preset) => preset.id === dialog.presetId)?.builtinAgenticFramework ?? "chat"
+    : "chat";
+}
+
+function initialSettingsPresetEmbeddingModelPath(dialog: ChatDialogState, state: ChatState) {
+  if (dialog?.kind === "thread-settings") {
+    return state.threads.find((thread) => thread.id === dialog.threadId)?.documentAnalysisEmbeddingModelPath ?? "";
+  }
+  return dialog?.kind === "settings-preset" && dialog.presetId
+    ? state.settingsPresets.find((preset) => preset.id === dialog.presetId)?.documentAnalysisEmbeddingModelPath ?? ""
+    : "";
+}
+
+function initialProjectActionButtons(dialog: ChatDialogState, state: ChatState): ChatActionButton[] {
+  if (dialog?.kind !== "project-settings" && dialog?.kind !== "project-actions") {
+    return [];
+  }
+  return state.projects.find((project) => project.id === dialog.projectId)?.actionButtons ?? [];
+}
+
+type ChatTimelineActionHandler = (blockId: string, action: "approve" | "deny" | "answer" | "retry" | "retry_new_thread", answer?: string) => Promise<void>;
+
+function ChatMessageBubble({ message, onTimelineAction }: { message: ChatMessage; onTimelineAction: ChatTimelineActionHandler }) {
+  const displayContent = message.content || (message.status === "streaming" ? "..." : "");
+  const html = message.role === "user" ? renderChatUserPromptHtml(displayContent, message.attachments) : renderChatMarkdownHtml(displayContent, message.id);
+  return (
+    <article
+      className={[
+        "chat-message",
+        message.role,
+        message.status,
+        "chat-message-row",
+        message.role === "user" ? "chat-message-row-user" : "chat-message-row-assistant"
+      ].join(" ")}
+      data-testid={`chat-message-${message.role}`}
+    >
+      {message.role === "assistant" ? (
+        <section className="chat-message-label assistant-turn-meta">
+          <span className="chat-assistant-pill assistant-turn-badge">{message.label || "UNIT-0"}</span>
+          <small className="assistant-turn-source">{message.sourceLabel || "Built-in"}</small>
+        </section>
+      ) : null}
+      {message.role === "assistant" && message.reasoning ? (
+        <details className="assistant-turn-reasoning-shell">
+          <summary>Reasoning</summary>
+          <div dangerouslySetInnerHTML={{ __html: renderChatMarkdownHtml(message.reasoning, `${message.id}-reasoning`) }} />
+        </details>
+      ) : null}
+      <div
+        className={[
+          "chat-message-body",
+          message.role === "user" ? "chat-message-bubble chat-message-bubble-user" : "chat-formatted-view assistant-content-block"
+        ].join(" ")}
+        dangerouslySetInnerHTML={{ __html: html }}
+      />
+      {message.role === "assistant" && message.timelineBlocks?.length ? (
+        <ChatTimeline blocks={message.timelineBlocks} messageId={message.id} onTimelineAction={onTimelineAction} />
+      ) : null}
       {message.status === "interrupted" ? <small>Interrupted</small> : message.status === "error" ? <small>Error</small> : null}
     </article>
   );
+}
+
+function ChatTimeline({ blocks, messageId, onTimelineAction }: { blocks: ChatTimelineBlock[]; messageId: string; onTimelineAction: ChatTimelineActionHandler }) {
+  return (
+    <div className="codex-event-stack" aria-label="Assistant timeline">
+      {blocks.map((block, index) => <ChatTimelineBlockView block={block} key={`${messageId}-${block.kind}-${block.id || index}`} onTimelineAction={onTimelineAction} />)}
+    </div>
+  );
+}
+
+function ChatTimelineBlockView({ block, onTimelineAction }: { block: ChatTimelineBlock; onTimelineAction: ChatTimelineActionHandler }) {
+  const [answer, setAnswer] = useState("");
+  if (block.kind === "tool") {
+    const title = block.command || block.summary || formatTimelineTitle(block.toolName || "Tool Call");
+    return (
+      <details className="codex-event-card codex-tool-card" open={block.status === "started"}>
+        <summary>
+          <span className="codex-event-title">{title}</span>
+          <span className="codex-event-badge" data-status={block.status}>{formatTimelineStatus(block.status)}</span>
+        </summary>
+        {block.directory ? <div className="codex-event-meta">Directory: {block.directory}</div> : null}
+        {block.output ? <pre className="codex-event-pre">{block.output}</pre> : null}
+      </details>
+    );
+  }
+  if (block.kind === "diff") {
+    return (
+      <details className="codex-event-card codex-diff-card">
+        <summary>
+          <span className="codex-event-title">{block.summary}</span>
+          <span className="codex-diff-counts codex-diff-counts-compact">
+            <span className="codex-diff-count codex-diff-count-added">+{block.addedLines ?? 0}</span>
+            <span className="codex-diff-count codex-diff-count-deleted">-{block.deletedLines ?? 0}</span>
+          </span>
+        </summary>
+        {block.branchName ? <div className="codex-event-meta">Branch: {block.branchName}</div> : null}
+        {block.preview ? <pre className="codex-event-pre codex-diff-preview">{block.preview}</pre> : null}
+      </details>
+    );
+  }
+  if (block.kind === "plan") {
+    return (
+      <div className="codex-event-card codex-plan-card">
+        <div className="codex-event-card-header">
+          <span className="codex-event-title">Plan</span>
+          <span className="codex-event-badge" data-status={block.status}>{formatTimelineStatus(block.status)}</span>
+        </div>
+        {block.explanation ? <div className="codex-event-text">{block.explanation}</div> : null}
+        {block.steps?.length ? (
+          <ol className="codex-plan-steps">
+            {block.steps.map((step, index) => (
+              <li key={`${block.id}-step-${index}`} data-status={step.status}>
+                <span>{formatTimelineStatus(step.status)}</span>
+                <strong>{step.text}</strong>
+              </li>
+            ))}
+          </ol>
+        ) : null}
+      </div>
+    );
+  }
+  if (block.kind === "approval" || block.kind === "question") {
+    return (
+      <div className="codex-event-card codex-approval-card">
+        <div className="codex-event-card-header">
+          <span className="codex-event-title">{block.kind === "approval" ? block.title : block.title}</span>
+          <span className="codex-event-badge" data-status={block.status}>{formatTimelineStatus(block.status)}</span>
+        </div>
+        {"question" in block && block.question ? <div className="codex-event-text">{block.question}</div> : null}
+        {"details" in block && block.details ? <div className="codex-event-text">{block.details}</div> : null}
+        {block.kind === "approval" && block.status === "requested" ? (
+          <div className="codex-event-actions">
+            <button type="button" className="codex-event-action" onClick={() => void onTimelineAction(block.id, "approve")}>Approve</button>
+            <button type="button" className="codex-event-action" data-variant="danger" onClick={() => void onTimelineAction(block.id, "deny")}>Deny</button>
+          </div>
+        ) : null}
+        {block.kind === "question" && block.status === "requested" ? (
+          <div className="codex-event-answer-form">
+            <textarea
+              aria-label="Question answer"
+              value={answer}
+              onChange={(event) => setAnswer(event.currentTarget.value)}
+            />
+            <div className="codex-event-actions">
+              <button
+                type="button"
+                className="codex-event-action"
+                disabled={!answer.trim()}
+                onClick={() => void onTimelineAction(block.id, "answer", answer.trim())}
+              >
+                Answer
+              </button>
+            </div>
+          </div>
+        ) : null}
+      </div>
+    );
+  }
+  const title = block.kind === "delegated"
+    ? "Delegated Work"
+    : block.kind === "compaction"
+      ? "Context Compaction"
+      : formatTimelineTitle("level" in block ? block.level : "Status");
+  const message = "summary" in block ? block.summary : "message" in block ? block.message : block.status;
+  const status = "status" in block ? block.status : "info";
+  return (
+    <div className="codex-event-card codex-status-card">
+      <div className="codex-event-card-header">
+        <span className="codex-event-title">{title}</span>
+        <span className="codex-event-badge" data-status={status}>{formatTimelineStatus(status)}</span>
+      </div>
+      <div className="codex-event-text">{message}</div>
+      {"code" in block && block.code ? <pre className="codex-event-pre">{block.code}</pre> : null}
+      {block.kind === "status" && block.level === "error" ? (
+        <div className="codex-event-actions">
+          <button type="button" className="codex-event-action" onClick={() => void onTimelineAction(block.id, "retry")}>Retry</button>
+          <button type="button" className="codex-event-action" onClick={() => void onTimelineAction(block.id, "retry_new_thread")}>Retry in new thread</button>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function formatTimelineTitle(value: string) {
+  const normalized = value.trim().replace(/[_-]+/g, " ");
+  return normalized ? normalized.replace(/\b\w/g, (char) => char.toUpperCase()) : "Status";
+}
+
+function formatTimelineStatus(value: string) {
+  const normalized = value.trim().replace(/[_-]+/g, " ");
+  if (!normalized) {
+    return "Pending";
+  }
+  if (normalized.toLowerCase() === "in progress") {
+    return "In Progress";
+  }
+  if (normalized.toLowerCase() === "started") {
+    return "Running";
+  }
+  return normalized.replace(/\b\w/g, (char) => char.toUpperCase());
 }
 
 function formatChatTimestamp(value: string) {
@@ -3876,28 +6498,246 @@ function formatChatTimestamp(value: string) {
   return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
-function renderMarkdownBlocks(markdown: string) {
-  const blocks: JSX.Element[] = [];
-  const segments = markdown.split(/```/g);
-  for (let index = 0; index < segments.length; index += 1) {
-    const segment = segments[index];
-    if (index % 2 === 1) {
-      const [firstLine, ...rest] = segment.split(/\r?\n/);
-      const language = firstLine.trim();
-      const code = rest.length > 0 ? rest.join("\n") : segment;
-      blocks.push(
-        <pre className="chat-code-block" key={`code-${index}`}>
-          <code data-language={language}>{code}</code>
-        </pre>
-      );
-      continue;
-    }
-    const paragraphs = segment.split(/\n{2,}/).map((paragraph) => paragraph.trim()).filter(Boolean);
-    for (const paragraph of paragraphs) {
-      blocks.push(<p key={`text-${index}-${blocks.length}`}>{paragraph}</p>);
-    }
+function reasoningLabel(value: ChatReasoningEffort) {
+  return value === "xhigh" ? "XHigh" : value.replace(/\b\w/g, (char) => char.toUpperCase());
+}
+
+function permissionLabel(value: ChatPermissionMode) {
+  return CHAT_PERMISSION_OPTIONS.find((option) => option.id === value)?.label ?? "Default";
+}
+
+function codexApprovalLabel(value: ChatCodexApprovalMode) {
+  return CHAT_CODEX_APPROVAL_OPTIONS.find((option) => option.id === value)?.label ?? "Default";
+}
+
+function codexApprovalModeForAccessMode(value: ChatPermissionMode): ChatCodexApprovalMode {
+  return value === "full_access" ? "never" : "default";
+}
+
+function codexAccessModeForApprovalMode(value: ChatCodexApprovalMode): ChatPermissionMode {
+  return value === "never" ? "full_access" : "default_permissions";
+}
+
+function settingsPresetIcon(iconName: string, providerMode: ChatSettingsPreset["providerMode"]) {
+  if (providerMode === "codex" || iconName === "code") {
+    return Code2;
   }
-  return blocks.length > 0 ? blocks : null;
+  if (iconName === "bolt") {
+    return Bolt;
+  }
+  if (iconName === "brain") {
+    return Brain;
+  }
+  return SlidersHorizontal;
+}
+
+function runtimeReasoningLabel(settings: ChatRuntimeSettings) {
+  return reasoningLabel(settings.reasoningEffort);
+}
+
+function formatContextLabel(tokens: number) {
+  if (tokens >= 1024) {
+    const value = tokens / 1024;
+    return `${Number.isInteger(value) ? value : value.toFixed(1)}K`;
+  }
+  return String(tokens);
+}
+
+function contextUsagePercent(state: ChatState) {
+  const selectedMessages = state.messages.filter((message) => message.threadId === state.selectedThreadId);
+  const usedCharacters = selectedMessages.reduce((total, message) => total + message.content.length + (message.reasoning?.length ?? 0), 0);
+  const approximateTokens = Math.ceil(usedCharacters / 4);
+  return Math.max(0, Math.min(100, Math.round((approximateTokens / Math.max(1, state.runtimeSettings.nCtx)) * 100)));
+}
+
+function rateLimitIndicatorLabel(state: ChatState, slot: "primary" | "secondary") {
+  if (state.codexAccount.status === "error") {
+    return "Error";
+  }
+  if (state.codexAccount.status !== "ready") {
+    return slot === "primary" ? "Week" : "5h";
+  }
+  const window = state.codexAccount.rateLimits?.[slot];
+  if (!window) {
+    return slot === "primary" ? "Week" : "5h";
+  }
+  return `${Math.round(window.usedPercent)}%`;
+}
+
+function runtimeSettingsToForm(settings: ChatRuntimeSettings): Record<keyof ChatRuntimeSettings, string> {
+  return {
+    nCtx: String(settings.nCtx),
+    nGpuLayers: String(settings.nGpuLayers),
+    temperature: String(settings.temperature),
+    repeatPenalty: String(settings.repeatPenalty),
+    maxTokens: String(settings.maxTokens),
+    reasoningEffort: settings.reasoningEffort,
+    permissionMode: settings.permissionMode,
+    trimReserveTokens: String(settings.trimReserveTokens),
+    trimReservePercent: String(settings.trimReservePercent),
+    trimAmountTokens: String(settings.trimAmountTokens),
+    trimAmountPercent: String(settings.trimAmountPercent),
+    systemPrompt: settings.systemPrompt
+  };
+}
+
+function parseRuntimeSettingsForm(settings: Record<keyof ChatRuntimeSettings, string>): Partial<ChatRuntimeSettings> {
+  return {
+    nCtx: Number.parseInt(settings.nCtx, 10),
+    nGpuLayers: Number.parseInt(settings.nGpuLayers, 10),
+    temperature: Number.parseFloat(settings.temperature),
+    repeatPenalty: Number.parseFloat(settings.repeatPenalty),
+    maxTokens: Number.parseInt(settings.maxTokens, 10),
+    reasoningEffort: settings.reasoningEffort as Exclude<ChatReasoningEffort, "xhigh">,
+    permissionMode: settings.permissionMode as ChatPermissionMode,
+    trimReserveTokens: Number.parseInt(settings.trimReserveTokens, 10),
+    trimReservePercent: Number.parseFloat(settings.trimReservePercent),
+    trimAmountTokens: Number.parseInt(settings.trimAmountTokens, 10),
+    trimAmountPercent: Number.parseFloat(settings.trimAmountPercent),
+    systemPrompt: settings.systemPrompt
+  };
+}
+
+type ChatMathReplacement = {
+  html: string;
+  kind: "display" | "inline";
+  token: string;
+};
+
+function renderChatUserPromptHtml(text: string, attachments: ChatAttachment[] = []) {
+  const normalized = text.trim();
+  const textHtml = normalized ? `<div class="chat-message-text">${escapeHtml(normalized).replace(/\r?\n/g, "<br />")}</div>` : "";
+  const attachmentsHtml = attachments.length > 0
+    ? `<div class="chat-message-attachments">${attachments.map((attachment) => `
+        <div class="chat-message-attachment ${attachment.kind === "image" ? "image" : ""}">
+          ${attachment.kind === "image" ? `<img src="${escapeHtml(attachment.dataUrl ?? attachmentPreviewSrc(attachment.path))}" alt="${escapeHtml(attachment.name)}" />` : `<span>File</span>`}
+          <strong>${escapeHtml(attachment.name)}</strong>
+        </div>
+      `).join("")}</div>`
+    : "";
+  return `${textHtml}${attachmentsHtml}`;
+}
+
+function insertTextareaNewline(textarea: HTMLTextAreaElement, value: string, setValue: (next: string) => void): void {
+  const start = textarea.selectionStart;
+  const end = textarea.selectionEnd;
+  const next = `${value.slice(0, start)}\n${value.slice(end)}`;
+  setValue(next);
+  window.requestAnimationFrame(() => {
+    textarea.selectionStart = start + 1;
+    textarea.selectionEnd = start + 1;
+  });
+}
+
+function chatFileName(filePath: string) {
+  return filePath.split(/[\\/]/g).filter(Boolean).at(-1) ?? filePath;
+}
+
+function attachmentPreviewSrc(filePath: string) {
+  const normalized = filePath.replace(/\\/g, "/");
+  return normalized.startsWith("/") ? `file://${normalized}` : `file:///${normalized}`;
+}
+
+function renderChatMarkdownHtml(markdown: string, footnoteScope: string) {
+  if (!markdown.trim()) {
+    return "";
+  }
+  const { source, replacements } = extractChatMath(markdown);
+  let html = chatMarkdown.render(source);
+  html = scopeChatFootnotes(html, footnoteScope);
+  for (const replacement of replacements) {
+    if (replacement.kind === "display") {
+      html = html.replace(new RegExp(`<p>\\s*${escapeRegExp(replacement.token)}\\s*</p>`, "g"), replacement.html);
+    }
+    html = html.replace(new RegExp(escapeRegExp(replacement.token), "g"), replacement.html);
+  }
+  return html;
+}
+
+function extractChatMath(markdown: string) {
+  const replacements: ChatMathReplacement[] = [];
+  const parts = markdown.split(/(```[\s\S]*?```)/g);
+  let mathIndex = 0;
+  const source = parts.map((part, partIndex) => {
+    if (partIndex % 2 === 1) {
+      return part;
+    }
+    return part
+      .replace(/\$\$([\s\S]+?)\$\$/g, (_match, expression: string) => {
+        const token = `UNIT0_DISPLAY_MATH_${mathIndex++}`;
+        replacements.push({
+          token,
+          kind: "display",
+          html: renderMathExpression(expression, true)
+        });
+        return token;
+      })
+      .replace(/\\\[([\s\S]+?)\\\]/g, (_match, expression: string) => {
+        const token = `UNIT0_DISPLAY_MATH_${mathIndex++}`;
+        replacements.push({
+          token,
+          kind: "display",
+          html: renderMathExpression(expression, true)
+        });
+        return token;
+      })
+      .replace(/\\\(([\s\S]+?)\\\)/g, (_match, expression: string) => {
+        const token = `UNIT0_INLINE_MATH_${mathIndex++}`;
+        replacements.push({
+          token,
+          kind: "inline",
+          html: renderMathExpression(expression, false)
+        });
+        return token;
+      })
+      .replace(/(^|[^$])\$([^$\n]+?)\$(?!\$)/g, (_match, prefix: string, expression: string) => {
+        const token = `UNIT0_INLINE_MATH_${mathIndex++}`;
+        replacements.push({
+          token,
+          kind: "inline",
+          html: renderMathExpression(expression, false)
+        });
+        return `${prefix}${token}`;
+      });
+  }).join("");
+  return { source, replacements };
+}
+
+function renderMathExpression(expression: string, display: boolean) {
+  try {
+    const rendered = katex.renderToString(expression.trim(), {
+      displayMode: display,
+      output: "htmlAndMathml",
+      throwOnError: false
+    });
+    return display ? `<div class="chat-math-block">${rendered}</div>` : `<span class="chat-math-inline">${rendered}</span>`;
+  } catch (error: unknown) {
+    const message = escapeHtml(errorMessage(error));
+    return display ? `<div class="chat-math-block chat-math-error">${message}</div>` : `<span class="chat-math-inline chat-math-error">${message}</span>`;
+  }
+}
+
+function scopeChatFootnotes(html: string, footnoteScope: string) {
+  const scope = footnoteScope.replace(/[^A-Za-z0-9_-]+/g, "-").slice(0, 80);
+  if (!scope || !html.includes("fn")) {
+    return html;
+  }
+  return html
+    .replace(/\bid="(fnref|fn)([^"]*)"/g, (_match, kind: string, suffix: string) => `id="${kind}-${scope}-${suffix}"`)
+    .replace(/\bhref="#(fnref|fn)([^"]*)"/g, (_match, kind: string, suffix: string) => `href="#${kind}-${scope}-${suffix}"`);
+}
+
+function escapeHtml(value: string) {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function escapeRegExp(value: string) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function BrowserSurface({ session, windowId }: { session: AppletSession; windowId: number }) {

@@ -23,7 +23,7 @@ async function launchApp(dataDir = makeDataDir()): Promise<ElectronApplication> 
 
 async function firstWindow(app: ElectronApplication): Promise<Page> {
   const page = await app.firstWindow();
-  await page.waitForSelector('[data-testid="workspace-tab-strip"]');
+  await page.waitForSelector("main.app-shell");
   return page;
 }
 
@@ -107,12 +107,14 @@ test("launches with pinned Workspace Manager and default workspace tabs", async 
   const app = await launchApp();
   const page = await firstWindow(app);
 
-  const order = await tabOrder(page);
+  const state = await appState(page);
+  const host = Object.values(state.hosts)[0];
+  const order = host.tabIds.map((tabId) => state.tabs[tabId]?.title ?? "");
   expect(order[0]).toContain("Workspace Manager");
-  await expect(page.getByTestId("workspace-tab-atlas")).toBeVisible();
-  await expect(page.getByTestId("workspace-tab-redesign")).toBeVisible();
-  await expect(page.getByTestId("workspace-tab-lab")).toBeVisible();
-  await expect(page.getByTestId("workspace-tab-research")).toBeVisible();
+  expect(order).toContain("Project Atlas");
+  expect(order).toContain("Website Redesign");
+  expect(order).toContain("VM Lab");
+  expect(order).toContain("Research");
 
   await app.close();
 });
@@ -120,13 +122,13 @@ test("launches with pinned Workspace Manager and default workspace tabs", async 
 test("renders the initial applet surfaces", async () => {
   const app = await launchApp();
   const page = await firstWindow(app);
-  await page.getByTestId("workspace-tab-atlas").click();
 
-  await expect(page.getByTestId("applet-terminal")).toBeVisible();
-  await expect(page.getByTestId("applet-fileViewer")).toBeVisible();
-  await expect(page.getByTestId("applet-browser")).toBeVisible();
-  await expect(page.getByTestId("applet-chat")).toBeVisible();
-  await expect(page.getByTestId("applet-sandbox")).toBeVisible();
+  const state = await appState(page);
+  const atlas = Object.values(state.workspaces).find((workspace) => workspace.title === "Project Atlas");
+  expect(atlas).toBeTruthy();
+  const kinds = atlas!.applets.map((applet) => state.appletSessions[applet.sessionId]?.kind);
+  expect(kinds).toEqual(expect.arrayContaining(["terminal", "fileViewer", "browser", "chat", "sandbox"]));
+  await expect(page.getByTestId("chat-surface")).toBeVisible();
 
   await app.close();
 });
@@ -137,10 +139,9 @@ test("renders global chat state and persists local model selection", async () =>
   fs.writeFileSync(modelPath, "not a real model");
   let app = await launchApp(dataDir);
   let page = await firstWindow(app);
-  await page.getByTestId("workspace-tab-atlas").click();
 
   await expect(page.getByTestId("chat-surface")).toBeVisible();
-  await expect(page.getByTestId("chat-status")).toContainText("Add a local GGUF model");
+  await expect(page.getByTestId("chat-status")).toHaveCount(0);
   const firstState = await page.evaluate(() => window.unitApi.chat.bootstrap());
   expect(firstState.projects).toHaveLength(1);
   expect(firstState.threads).toHaveLength(1);
@@ -153,7 +154,6 @@ test("renders global chat state and persists local model selection", async () =>
 
   app = await launchApp(dataDir);
   page = await firstWindow(app);
-  await page.getByTestId("workspace-tab-atlas").click();
   await expect(page.getByLabel("Local chat model")).toHaveValue(modelState.models[0].id);
   await app.close();
 });
@@ -161,7 +161,6 @@ test("renders global chat state and persists local model selection", async () =>
 test("chat creates and selects threads through the applet API", async () => {
   const app = await launchApp();
   const page = await firstWindow(app);
-  await page.getByTestId("workspace-tab-atlas").click();
 
   const created = await page.evaluate(() => window.unitApi.chat.createThread());
   expect(created.threads).toHaveLength(2);
@@ -170,6 +169,79 @@ test("chat creates and selects threads through the applet API", async () => {
   await page.evaluate((threadId) => window.unitApi.chat.selectThread({ threadId }), created.threads[0].id);
   const selected = await page.evaluate(() => window.unitApi.chat.bootstrap());
   expect(selected.selectedThreadId).toBe(created.threads[0].id);
+
+  await app.close();
+});
+
+test("chat project actions and composer menus are backed by persistent state", async () => {
+  const app = await launchApp();
+  const page = await firstWindow(app);
+  await expect(page.getByTestId("chat-surface")).toBeVisible();
+
+  await page.getByLabel("New project").click();
+  await page.locator("input[name='project-title']").fill("Visual Parity");
+  await page.locator("input[name='project-directory']").fill("C:\\Workspace");
+  await page.getByRole("dialog", { name: "New project" }).getByRole("button", { name: "Save" }).click();
+  let state = await page.evaluate(() => window.unitApi.chat.bootstrap());
+  const project = state.projects.at(-1)!;
+  expect(state.selectedProjectId).toBe(project.id);
+  expect(state.projects.find((item) => item.id === project.id)?.title).toBe("Visual Parity");
+  expect(state.projects.find((item) => item.id === project.id)?.directory).toBe("C:\\Workspace");
+
+  await page.getByRole("button", { name: "Medium" }).click();
+  await page.getByRole("menuitemradio", { name: "High" }).click();
+  state = await page.evaluate(() => window.unitApi.chat.bootstrap());
+  expect(state.runtimeSettings.reasoningEffort).toBe("high");
+
+  await page.getByLabel("Model settings").click();
+  await page.getByRole("menuitem", { name: "New preset..." }).click();
+  const presetDialog = page.getByRole("dialog", { name: "Settings preset" });
+  await expect(presetDialog).toBeVisible();
+  await presetDialog.getByLabel("Name").fill("Parity Preset");
+  await presetDialog.getByRole("button", { name: "Save" }).click();
+  state = await page.evaluate(() => window.unitApi.chat.bootstrap());
+  expect(state.settingsPresets.some((preset) => preset.label === "Parity Preset")).toBe(true);
+
+  await app.close();
+});
+
+test("chat Codex mode uses mocked events and provider-aware menus", async () => {
+  const app = await launchApp();
+  const page = await firstWindow(app);
+  await expect(page.getByTestId("chat-surface")).toBeVisible();
+  await expect(page.getByTestId("workspace-tab-strip")).toBeVisible();
+
+  await page.evaluate(async () => {
+    const state = await window.unitApi.chat.bootstrap();
+    await window.unitApi.chat.updateProjectSettings({
+      projectId: state.selectedProjectId,
+      title: state.projects.find((project) => project.id === state.selectedProjectId)?.title ?? "Project 1",
+      directory: "C:\\Workspace"
+    });
+    await window.unitApi.chat.updateThreadSettings({
+      threadId: state.selectedThreadId,
+      providerMode: "codex",
+      codexModelId: "gpt-5.3-codex",
+      codexReasoningEffort: "medium",
+      permissionMode: "default_permissions",
+      planModeEnabled: true
+    });
+  });
+
+  await expect(page.getByRole("button", { name: "Open model menu" })).toContainText("GPT-5.3 Codex");
+  await page.getByTestId("chat-surface").getByRole("button", { name: "Add" }).click();
+  await expect(page.getByRole("menuitemcheckbox", { name: "Plan mode" })).toBeVisible();
+  await expect(page.getByRole("menuitem", { name: "Upload image..." })).toBeVisible();
+  await page.keyboard.press("Escape").catch(() => undefined);
+  await page.locator(".chat-surface").click({ position: { x: 10, y: 10 } });
+
+  await page.getByRole("textbox", { name: "Chat message" }).fill("mock codex turn");
+  await page.getByLabel("Send chat message").click();
+  await expect(page.getByTestId("chat-message-assistant")).toContainText("Mocked Codex response: mock codex turn");
+  const state = await page.evaluate(() => window.unitApi.chat.bootstrap());
+  const assistant = state.messages.find((message) => message.role === "assistant");
+  expect(assistant?.sourceLabel).toBe("Codex");
+  expect(assistant?.timelineBlocks?.some((block) => block.kind === "tool")).toBe(true);
 
   await app.close();
 });

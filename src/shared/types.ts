@@ -23,10 +23,44 @@ export interface BrowserSessionState {
 
 export type ChatMessageRole = "user" | "assistant";
 export type ChatMessageStatus = "complete" | "streaming" | "interrupted" | "error";
+export type ChatProviderMode = "builtin" | "codex";
+export type ChatReasoningEffort = "low" | "medium" | "high" | "xhigh";
+export type ChatPermissionMode = "default_permissions" | "full_access";
+export type ChatCodexApprovalMode = "default" | "on-request" | "on-failure" | "untrusted" | "never";
+export type ChatBuiltinAgenticFramework = "chat" | "document_analysis";
+
+export interface ChatActionButton {
+  id: string;
+  label: string;
+  command: string;
+  directory: string;
+}
+
+export interface ChatAttachment {
+  id: string;
+  name: string;
+  path: string;
+  kind: "file" | "image";
+  dataUrl?: string;
+  mimeType?: string;
+  sizeBytes?: number;
+}
+
+export type ChatTimelineBlock =
+  | { kind: "tool"; id: string; toolName: string; status: string; summary?: string; command?: string; directory?: string; output?: string }
+  | { kind: "approval"; id: string; status: string; title: string; decision?: string; details?: string; requestMethod?: string; toolCallId?: string }
+  | { kind: "diff"; id: string; status?: string; summary: string; branchName?: string; preview?: string; addedLines?: number; deletedLines?: number }
+  | { kind: "status"; id: string; level: string; message: string; code?: string }
+  | { kind: "plan"; id: string; status: string; explanation?: string; markdown?: string; steps?: Array<{ status: string; text: string }> }
+  | { kind: "question"; id: string; status: string; title: string; question?: string; questions?: Array<{ id: string; label: string; options?: string[]; allowsCustomAnswer?: boolean }>; answers?: Record<string, string> }
+  | { kind: "delegated"; id: string; status: string; summary: string }
+  | { kind: "compaction"; id: string; status: string };
 
 export interface ChatProject {
   id: string;
   title: string;
+  directory: string;
+  actionButtons: ChatActionButton[];
   createdAt: string;
   updatedAt: string;
 }
@@ -35,6 +69,40 @@ export interface ChatThread {
   id: string;
   projectId: string;
   title: string;
+  providerMode: ChatProviderMode;
+  selectedSettingsPresetId: string;
+  builtinModelId: string;
+  runtimeSettings: ChatRuntimeSettings;
+  builtinAgenticFramework: ChatBuiltinAgenticFramework;
+  documentAnalysisEmbeddingModelPath: string;
+  codexModelId: string;
+  codexReasoningEffort: ChatReasoningEffort;
+  permissionMode: ChatPermissionMode;
+  codexApprovalMode: ChatCodexApprovalMode;
+  planModeEnabled: boolean;
+  documentIndexId: string;
+  codexLastSessionId: string;
+  activeContextStartMessageIndex: number;
+  contextRevision: number;
+  contextMarkers: ChatContextMarker[];
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ChatContextMarker {
+  kind: "trim" | "reset";
+  boundaryMessageCount: number;
+  timestamp: string;
+}
+
+export interface ChatDocumentIndex {
+  id: string;
+  projectId: string;
+  title: string;
+  sourcePath: string;
+  state: "ready" | "building" | "error";
+  progress: number;
+  message: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -44,6 +112,12 @@ export interface ChatMessage {
   threadId: string;
   role: ChatMessageRole;
   content: string;
+  attachments: ChatAttachment[];
+  label?: string;
+  sourceLabel?: string;
+  reasoning?: string;
+  timelineBlocks?: ChatTimelineBlock[];
+  metadata?: Record<string, unknown>;
   status: ChatMessageStatus;
   createdAt: string;
   updatedAt: string;
@@ -53,8 +127,37 @@ export interface ChatModel {
   id: string;
   label: string;
   path: string;
+  providerId?: "local" | "remote";
+  reference?: string;
+  sourceLabel?: string;
+  hostId?: string;
   createdAt: string;
 }
+
+export interface ChatCodexModel {
+  id: string;
+  label: string;
+  isDefault: boolean;
+  reasoningEfforts: ChatReasoningEffort[];
+  supportsImageInput: boolean;
+}
+
+export interface ChatCodexRateLimitWindow {
+  usedPercent: number;
+  windowDurationMins: number;
+  resetsAt: number;
+}
+
+export interface ChatCodexRateLimits {
+  primary: ChatCodexRateLimitWindow | null;
+  secondary: ChatCodexRateLimitWindow | null;
+  rateLimitReachedType: string | null;
+}
+
+export type ChatCodexAccountState =
+  | { status: "unknown" }
+  | { status: "ready"; authMode: string | null; email: string; planType: string | null; requiresOpenaiAuth: boolean; rateLimits: ChatCodexRateLimits | null }
+  | { status: "error"; error: string };
 
 export interface ChatRuntimeSettings {
   nCtx: number;
@@ -62,6 +165,56 @@ export interface ChatRuntimeSettings {
   temperature: number;
   repeatPenalty: number;
   maxTokens: number;
+  reasoningEffort: Exclude<ChatReasoningEffort, "xhigh">;
+  permissionMode: ChatPermissionMode;
+  trimReserveTokens: number;
+  trimReservePercent: number;
+  trimAmountTokens: number;
+  trimAmountPercent: number;
+  systemPrompt: string;
+}
+
+export type ChatUsageIndicatorId = "git_diff" | "context" | "week" | "five_hour";
+export type ChatUsageIndicatorPlacement = "left" | "right" | "bottom" | "footer_right" | "hidden";
+export type ChatUsageIndicatorDisplayMode = "bar" | "circle";
+
+export interface ChatUsageIndicatorPreference {
+  displayMode: ChatUsageIndicatorDisplayMode;
+  placement: ChatUsageIndicatorPlacement;
+  order: number;
+}
+
+export interface ChatAppSettings {
+  usageIndicatorPlacement: "footer" | "composer";
+  usageIndicatorOrder: string[];
+  usageIndicatorPreferences: Record<ChatUsageIndicatorId, ChatUsageIndicatorPreference>;
+  expandedProjectIds: string[];
+  autoExpandCodexDisclosures: boolean;
+  documentIndexLocation: "local" | "remote";
+  documentToolExecutionLocation: "local" | "remote";
+  tokenizerModelPath: string;
+  remoteHostAddress: string;
+  remoteHostPort: number;
+  remotePairingCode: string;
+  remoteHostId: string;
+  remoteHostIdentity: string;
+  remoteProtocolVersion: string;
+}
+
+export interface ChatSettingsPreset {
+  id: string;
+  label: string;
+  runtimeSettings: ChatRuntimeSettings;
+  providerMode: ChatProviderMode;
+  iconName: string;
+  builtinModelId: string;
+  builtinAgenticFramework: ChatBuiltinAgenticFramework;
+  documentAnalysisEmbeddingModelPath: string;
+  codexModelId: string;
+  codexReasoningEffort: ChatReasoningEffort;
+  builtIn: boolean;
+  editable: boolean;
+  deletable: boolean;
 }
 
 export type ChatGenerationState =
@@ -74,18 +227,82 @@ export interface ChatState {
   threads: ChatThread[];
   messages: ChatMessage[];
   models: ChatModel[];
+  codexModels: ChatCodexModel[];
+  codexAccount: ChatCodexAccountState;
+  settingsPresets: ChatSettingsPreset[];
+  documentIndexes: ChatDocumentIndex[];
   selectedProjectId: string;
   selectedThreadId: string;
   selectedModelId: string;
   runtimeSettings: ChatRuntimeSettings;
+  appSettings: ChatAppSettings;
+  queuedSubmissions: ChatQueuedSubmission[];
   generation: ChatGenerationState;
+}
+
+export interface ChatQueuedSubmission {
+  id: string;
+  threadId: string;
+  preview: string;
+  attachmentCount: number;
+  providerMode: ChatProviderMode;
+  inputMode: "queue" | "steer";
+  createdAt: string;
 }
 
 export interface ChatSubmitPayload {
   text: string;
+  attachments?: ChatAttachment[];
+  submitMode?: "normal" | "queue";
+}
+
+export interface ChatCreateThreadPayload {
+  projectId?: string;
+}
+
+export interface ChatSelectProjectPayload {
+  projectId: string;
 }
 
 export interface ChatSelectThreadPayload {
+  threadId: string;
+}
+
+export interface ChatRenameProjectPayload {
+  projectId: string;
+  title: string;
+}
+
+export interface ChatUpdateProjectSettingsPayload {
+  projectId: string;
+  title: string;
+  directory: string;
+  actionButtons?: ChatActionButton[];
+}
+
+export interface ChatRenameThreadPayload {
+  threadId: string;
+  title: string;
+}
+
+export interface ChatMoveThreadPayload {
+  threadId: string;
+  projectId: string;
+  targetThreadId?: string;
+  position?: "before" | "after";
+}
+
+export interface ChatMoveProjectPayload {
+  projectId: string;
+  targetProjectId: string;
+  position: "before" | "after";
+}
+
+export interface ChatDeleteProjectPayload {
+  projectId: string;
+}
+
+export interface ChatDeleteThreadPayload {
   threadId: string;
 }
 
@@ -95,6 +312,103 @@ export interface ChatSelectModelPayload {
 
 export interface ChatAddLocalModelPayload {
   path?: string;
+}
+
+export interface ChatUpdateRuntimeSettingsPayload {
+  settings: Partial<ChatRuntimeSettings>;
+}
+
+export interface ChatUpdateAppSettingsPayload {
+  settings: Partial<ChatAppSettings>;
+}
+
+export interface ChatUpdateThreadSettingsPayload {
+  threadId: string;
+  providerMode?: ChatProviderMode;
+  selectedSettingsPresetId?: string;
+  builtinModelId?: string;
+  runtimeSettings?: Partial<ChatRuntimeSettings>;
+  builtinAgenticFramework?: ChatBuiltinAgenticFramework;
+  documentAnalysisEmbeddingModelPath?: string;
+  codexModelId?: string;
+  codexReasoningEffort?: ChatReasoningEffort;
+  permissionMode?: ChatPermissionMode;
+  codexApprovalMode?: ChatCodexApprovalMode;
+  planModeEnabled?: boolean;
+  documentIndexId?: string;
+  codexLastSessionId?: string;
+}
+
+export interface ChatApplySettingsPresetPayload {
+  threadId: string;
+  presetId: string;
+}
+
+export interface ChatSaveSettingsPresetPayload {
+  presetId?: string;
+  label: string;
+  runtimeSettings: Partial<ChatRuntimeSettings>;
+  providerMode: ChatProviderMode;
+  iconName?: string;
+  builtinModelId?: string;
+  builtinAgenticFramework?: ChatBuiltinAgenticFramework;
+  documentAnalysisEmbeddingModelPath?: string;
+  codexModelId?: string;
+  codexReasoningEffort?: ChatReasoningEffort;
+}
+
+export interface ChatDeleteSettingsPresetPayload {
+  presetId: string;
+}
+
+export interface ChatRefreshCodexAccountPayload {
+  force?: boolean;
+}
+
+export interface ChatCancelQueuedSubmissionPayload {
+  submissionId: string;
+}
+
+export interface ChatGitStatePayload {
+  projectId: string;
+}
+
+export type ChatGitState =
+  | { status: "no_directory"; message: string }
+  | { status: "no_repo"; message: string }
+  | { status: "ready"; currentBranch: string; branches: string[]; dirty: boolean; ahead: number; behind: number; addedLines: number; deletedLines: number; hasCommits: boolean };
+
+export interface ChatSwitchGitBranchPayload {
+  projectId: string;
+  branch: string;
+}
+
+export interface ChatCreateGitBranchPayload {
+  projectId: string;
+  branch: string;
+}
+
+export interface ChatRunProjectActionPayload {
+  projectId: string;
+  actionId: string;
+}
+
+export interface ChatCreateDocumentIndexPayload {
+  projectId: string;
+  title: string;
+  sourcePath: string;
+}
+
+export interface ChatSelectDocumentIndexPayload {
+  threadId: string;
+  documentIndexId: string;
+}
+
+export interface ChatTimelineActionPayload {
+  messageId: string;
+  blockId: string;
+  action: "approve" | "deny" | "answer" | "retry" | "retry_new_thread";
+  answer?: string;
 }
 
 export interface AppletInstance {
@@ -423,6 +737,16 @@ export interface SelectDirectoryResult {
   rootPath: string | null;
 }
 
+export interface SelectFilesPayload {
+  currentPath?: string;
+  kind?: "file" | "image";
+  multiple?: boolean;
+}
+
+export interface SelectFilesResult {
+  paths: string[];
+}
+
 export interface BrowserMountPayload {
   windowId: number;
   sessionId: string;
@@ -505,15 +829,41 @@ export interface UnitApi {
     readFile: (payload: ReadFilePayload) => Promise<ReadFileResult>;
     writeFile: (payload: WriteFilePayload) => Promise<WriteFileResult>;
     selectDirectory: (payload: SelectDirectoryPayload) => Promise<SelectDirectoryResult>;
+    selectFiles: (payload: SelectFilesPayload) => Promise<SelectFilesResult>;
   };
   chat: {
     bootstrap: () => Promise<ChatState>;
-    createThread: () => Promise<ChatState>;
+    createProject: () => Promise<ChatState>;
+    createThread: (payload?: ChatCreateThreadPayload) => Promise<ChatState>;
+    selectProject: (payload: ChatSelectProjectPayload) => Promise<ChatState>;
     selectThread: (payload: ChatSelectThreadPayload) => Promise<ChatState>;
+    renameProject: (payload: ChatRenameProjectPayload) => Promise<ChatState>;
+    updateProjectSettings: (payload: ChatUpdateProjectSettingsPayload) => Promise<ChatState>;
+    renameThread: (payload: ChatRenameThreadPayload) => Promise<ChatState>;
+    updateThreadSettings: (payload: ChatUpdateThreadSettingsPayload) => Promise<ChatState>;
+    applySettingsPreset: (payload: ChatApplySettingsPresetPayload) => Promise<ChatState>;
+    saveSettingsPreset: (payload: ChatSaveSettingsPresetPayload) => Promise<ChatState>;
+    deleteSettingsPreset: (payload: ChatDeleteSettingsPresetPayload) => Promise<ChatState>;
+    refreshCodexAccount: (payload?: ChatRefreshCodexAccountPayload) => Promise<ChatState>;
+    refreshLocalModels: () => Promise<ChatState>;
+    cancelQueuedSubmission: (payload: ChatCancelQueuedSubmissionPayload) => Promise<ChatState>;
+    moveThread: (payload: ChatMoveThreadPayload) => Promise<ChatState>;
+    moveProject: (payload: ChatMoveProjectPayload) => Promise<ChatState>;
+    deleteProject: (payload: ChatDeleteProjectPayload) => Promise<ChatState>;
+    deleteThread: (payload: ChatDeleteThreadPayload) => Promise<ChatState>;
     submit: (payload: ChatSubmitPayload) => Promise<ChatState>;
     cancel: () => Promise<ChatState>;
     addLocalModel: (payload?: ChatAddLocalModelPayload) => Promise<ChatState>;
     selectModel: (payload: ChatSelectModelPayload) => Promise<ChatState>;
+    updateRuntimeSettings: (payload: ChatUpdateRuntimeSettingsPayload) => Promise<ChatState>;
+    updateAppSettings: (payload: ChatUpdateAppSettingsPayload) => Promise<ChatState>;
+    gitState: (payload: ChatGitStatePayload) => Promise<ChatGitState>;
+    switchGitBranch: (payload: ChatSwitchGitBranchPayload) => Promise<ChatGitState>;
+    createGitBranch: (payload: ChatCreateGitBranchPayload) => Promise<ChatGitState>;
+    runProjectAction: (payload: ChatRunProjectActionPayload) => Promise<void>;
+    createDocumentIndex: (payload: ChatCreateDocumentIndexPayload) => Promise<ChatState>;
+    selectDocumentIndex: (payload: ChatSelectDocumentIndexPayload) => Promise<ChatState>;
+    timelineAction: (payload: ChatTimelineActionPayload) => Promise<ChatState>;
     onStateChanged: (callback: (payload: ChatState) => void) => () => void;
   };
   browser: {

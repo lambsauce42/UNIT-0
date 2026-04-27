@@ -13,9 +13,33 @@ import type {
   BrowserWindowVisibilityPayload,
   BootstrapPayload,
   ChatAddLocalModelPayload,
+  ChatApplySettingsPresetPayload,
+  ChatCancelQueuedSubmissionPayload,
+  ChatCreateDocumentIndexPayload,
+  ChatCreateThreadPayload,
+  ChatCreateGitBranchPayload,
+  ChatDeleteProjectPayload,
+  ChatDeleteSettingsPresetPayload,
+  ChatDeleteThreadPayload,
+  ChatGitStatePayload,
+  ChatMoveProjectPayload,
+  ChatMoveThreadPayload,
+  ChatRenameProjectPayload,
+  ChatRenameThreadPayload,
+  ChatRunProjectActionPayload,
+  ChatSaveSettingsPresetPayload,
+  ChatRefreshCodexAccountPayload,
   ChatSelectModelPayload,
+  ChatSelectDocumentIndexPayload,
+  ChatSelectProjectPayload,
   ChatSelectThreadPayload,
+  ChatSwitchGitBranchPayload,
   ChatSubmitPayload,
+  ChatTimelineActionPayload,
+  ChatUpdateAppSettingsPayload,
+  ChatUpdateProjectSettingsPayload,
+  ChatUpdateRuntimeSettingsPayload,
+  ChatUpdateThreadSettingsPayload,
   ChangeAppletInstanceKindPayload,
   CloseAppletInstancePayload,
   CloseWorkspacePayload,
@@ -47,6 +71,7 @@ import type {
   AppletInstance,
   WorkspaceTab,
   SelectDirectoryPayload,
+  SelectFilesPayload,
   WriteFilePayload
 } from "../shared/types.js";
 import { WORKSPACE_TAB_SIZE } from "../shared/tabMetrics.js";
@@ -56,6 +81,8 @@ import { BrowserViewManager } from "./browserViewManager.js";
 import { ChatStore } from "./chatStore.js";
 import { ChatService } from "./chatService.js";
 import { LocalLlamaRuntime } from "./localLlamaRuntime.js";
+import { RemoteHostRuntime } from "./remoteHostRuntime.js";
+import { CodexAppServerRuntime, MockCodexRuntime } from "./codexRuntime.js";
 
 const preloadPath = path.join(__dirname, "../preload/preload.js");
 const rendererEntry = path.join(__dirname, "../renderer/index.html");
@@ -969,6 +996,23 @@ async function selectFileViewerDirectory(payload: SelectDirectoryPayload) {
   return { rootPath: result.canceled ? null : result.filePaths[0] };
 }
 
+async function selectFileViewerFiles(payload: SelectFilesPayload, parentWindow: BrowserWindow | null) {
+  const currentPath = await directoryOrDefault(payload.currentPath);
+  const properties: Electron.OpenDialogOptions["properties"] = payload.multiple === false ? ["openFile"] : ["openFile", "multiSelections"];
+  const filters = payload.kind === "image"
+    ? [{ name: "Images", extensions: ["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg"] }]
+    : undefined;
+  const options: Electron.OpenDialogOptions = {
+    defaultPath: currentPath,
+    properties,
+    filters
+  };
+  const result = parentWindow && !parentWindow.isDestroyed()
+    ? await dialog.showOpenDialog(parentWindow, options)
+    : await dialog.showOpenDialog(options);
+  return { paths: result.canceled ? [] : result.filePaths };
+}
+
 async function selectLocalModelPath(parentWindow: BrowserWindow | null): Promise<string | null> {
   const options: Electron.OpenDialogOptions = {
     title: "Select GGUF model",
@@ -1041,8 +1085,8 @@ function createWindow(options: { tabId?: string; x?: number; y?: number; primary
     show: !HIDE_TEST_WINDOWS,
     width: 1440,
     height: 920,
-    minWidth: 960,
-    minHeight: 640,
+    minWidth: 1060,
+    minHeight: 700,
     x: Math.round(options.x ?? display.workArea.x + 80),
     y: Math.round(options.y ?? display.workArea.y + 80),
     title: "UNIT-0",
@@ -1408,7 +1452,13 @@ app.whenReady().then(() => {
   const databasePath = workspaceDatabasePath();
   const workspaceStore = new WorkspaceStateStore(databasePath);
   registry = new TabRegistry(workspaceStore);
-  chatService = new ChatService(new ChatStore(databasePath), new LocalLlamaRuntime(), broadcastChatState);
+  chatService = new ChatService(
+    new ChatStore(databasePath),
+    new LocalLlamaRuntime(),
+    new RemoteHostRuntime(),
+    process.env.NODE_ENV === "test" ? new MockCodexRuntime() : new CodexAppServerRuntime(),
+    broadcastChatState
+  );
   terminalManager = new TerminalManager((payload) => {
     for (const browserWindow of windows.values()) {
       if (!browserWindow.isDestroyed()) {
@@ -1587,9 +1637,31 @@ app.whenReady().then(() => {
   ipcMain.handle("fileSystem:readFile", (_event, payload: ReadFilePayload) => readFileViewerFile(payload));
   ipcMain.handle("fileSystem:writeFile", (_event, payload: WriteFilePayload) => writeFileViewerFile(payload));
   ipcMain.handle("fileSystem:selectDirectory", (_event, payload: SelectDirectoryPayload) => selectFileViewerDirectory(payload));
+  ipcMain.handle("fileSystem:selectFiles", (event, payload: SelectFilesPayload) =>
+    selectFileViewerFiles(payload, BrowserWindow.fromWebContents(event.sender)));
   ipcMain.handle("chat:bootstrap", () => chatService.state());
-  ipcMain.handle("chat:createThread", () => chatService.createThread());
+  ipcMain.handle("chat:createProject", () => chatService.createProject());
+  ipcMain.handle("chat:createThread", (_event, payload?: ChatCreateThreadPayload) => chatService.createThread(payload?.projectId));
+  ipcMain.handle("chat:selectProject", (_event, payload: ChatSelectProjectPayload) => chatService.selectProject(payload.projectId));
   ipcMain.handle("chat:selectThread", (_event, payload: ChatSelectThreadPayload) => chatService.selectThread(payload.threadId));
+  ipcMain.handle("chat:renameProject", (_event, payload: ChatRenameProjectPayload) => chatService.renameProject(payload.projectId, payload.title));
+  ipcMain.handle("chat:updateProjectSettings", (_event, payload: ChatUpdateProjectSettingsPayload) =>
+    chatService.updateProjectSettings(payload.projectId, payload.title, payload.directory, payload.actionButtons));
+  ipcMain.handle("chat:renameThread", (_event, payload: ChatRenameThreadPayload) => chatService.renameThread(payload.threadId, payload.title));
+  ipcMain.handle("chat:updateThreadSettings", (_event, payload: ChatUpdateThreadSettingsPayload) => chatService.updateThreadSettings(payload));
+  ipcMain.handle("chat:applySettingsPreset", (_event, payload: ChatApplySettingsPresetPayload) => chatService.applySettingsPreset(payload));
+  ipcMain.handle("chat:saveSettingsPreset", (_event, payload: ChatSaveSettingsPresetPayload) => chatService.saveSettingsPreset(payload));
+  ipcMain.handle("chat:deleteSettingsPreset", (_event, payload: ChatDeleteSettingsPresetPayload) => chatService.deleteSettingsPreset(payload));
+  ipcMain.handle("chat:refreshCodexAccount", (_event, payload?: ChatRefreshCodexAccountPayload) => chatService.refreshCodexAccount(payload));
+  ipcMain.handle("chat:refreshLocalModels", () => chatService.refreshLocalModels());
+  ipcMain.handle("chat:cancelQueuedSubmission", (_event, payload: ChatCancelQueuedSubmissionPayload) => chatService.cancelQueuedSubmission(payload.submissionId));
+  ipcMain.handle("chat:moveThread", (_event, payload: ChatMoveThreadPayload) =>
+    chatService.moveThread(payload.threadId, payload.projectId, payload.targetThreadId, payload.position)
+  );
+  ipcMain.handle("chat:moveProject", (_event, payload: ChatMoveProjectPayload) =>
+    chatService.moveProject(payload.projectId, payload.targetProjectId, payload.position));
+  ipcMain.handle("chat:deleteProject", (_event, payload: ChatDeleteProjectPayload) => chatService.deleteProject(payload.projectId));
+  ipcMain.handle("chat:deleteThread", (_event, payload: ChatDeleteThreadPayload) => chatService.deleteThread(payload.threadId));
   ipcMain.handle("chat:submit", (_event, payload: ChatSubmitPayload) => chatService.submit(payload));
   ipcMain.handle("chat:cancel", () => chatService.cancel());
   ipcMain.handle("chat:addLocalModel", async (event, payload?: ChatAddLocalModelPayload) => {
@@ -1600,6 +1672,15 @@ app.whenReady().then(() => {
     return chatService.addLocalModel(selectedPath);
   });
   ipcMain.handle("chat:selectModel", (_event, payload: ChatSelectModelPayload) => chatService.selectModel(payload.modelId));
+  ipcMain.handle("chat:updateRuntimeSettings", (_event, payload: ChatUpdateRuntimeSettingsPayload) => chatService.updateRuntimeSettings(payload.settings));
+  ipcMain.handle("chat:updateAppSettings", (_event, payload: ChatUpdateAppSettingsPayload) => chatService.updateAppSettings(payload.settings));
+  ipcMain.handle("chat:gitState", (_event, payload: ChatGitStatePayload) => chatService.gitState(payload.projectId));
+  ipcMain.handle("chat:switchGitBranch", (_event, payload: ChatSwitchGitBranchPayload) => chatService.switchGitBranch(payload.projectId, payload.branch));
+  ipcMain.handle("chat:createGitBranch", (_event, payload: ChatCreateGitBranchPayload) => chatService.createGitBranch(payload.projectId, payload.branch));
+  ipcMain.handle("chat:runProjectAction", (_event, payload: ChatRunProjectActionPayload) => chatService.runProjectAction(payload.projectId, payload.actionId));
+  ipcMain.handle("chat:createDocumentIndex", (_event, payload: ChatCreateDocumentIndexPayload) => chatService.createDocumentIndex(payload));
+  ipcMain.handle("chat:selectDocumentIndex", (_event, payload: ChatSelectDocumentIndexPayload) => chatService.selectDocumentIndex(payload));
+  ipcMain.handle("chat:timelineAction", (_event, payload: ChatTimelineActionPayload) => chatService.timelineAction(payload));
   ipcMain.handle("browser:mount", (_event, payload: BrowserMountPayload) => browserViewManager.mount(payload));
   ipcMain.handle("browser:updateBounds", (_event, payload: BrowserBoundsPayload) => {
     browserViewManager.updateBounds(payload);

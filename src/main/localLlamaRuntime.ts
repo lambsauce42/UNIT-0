@@ -57,6 +57,7 @@ export class LocalLlamaRuntime {
       settings: ChatRuntimeSettings;
       messages: ChatMessage[];
       onToken: (token: string) => void;
+      onReasoning?: (token: string) => void;
     }
   ): Promise<void> {
     const server = await this.ensureServer(options.model, options.settings);
@@ -71,10 +72,7 @@ export class LocalLlamaRuntime {
         },
         body: JSON.stringify({
           model: server.modelId,
-          messages: options.messages.map((message) => ({
-            role: message.role,
-            content: message.content
-          })),
+          messages: localRuntimeMessages(options.settings, options.messages),
           stream: true,
           stream_options: { include_usage: true },
           temperature: options.settings.temperature,
@@ -101,6 +99,10 @@ export class LocalLlamaRuntime {
         const content = extractText(delta.content);
         if (content) {
           options.onToken(content);
+        }
+        const reasoning = extractText(delta.reasoning_content) || extractText(delta.reasoning) || extractText(delta.thinking);
+        if (reasoning) {
+          options.onReasoning?.(reasoning);
         }
       });
     } catch (error) {
@@ -300,6 +302,15 @@ function serverKeyMatches(left: ServerKey, right: ServerKey): boolean {
 
 function extractText(value: unknown): string {
   return typeof value === "string" ? value : "";
+}
+
+function localRuntimeMessages(settings: ChatRuntimeSettings, messages: ChatMessage[]): Array<{ role: "system" | "user" | "assistant"; content: string }> {
+  const payload = messages.map((message) => ({
+    role: message.role,
+    content: message.content
+  }));
+  const systemPrompt = settings.systemPrompt.trim();
+  return systemPrompt ? [{ role: "system", content: systemPrompt }, ...payload] : payload;
 }
 
 function sleep(ms: number): Promise<void> {

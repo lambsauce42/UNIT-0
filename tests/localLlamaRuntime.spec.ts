@@ -15,7 +15,14 @@ test("builds a llama-server command for one local slot", () => {
       nGpuLayers: -1,
       temperature: 0.7,
       repeatPenalty: 1.1,
-      maxTokens: 512
+      maxTokens: 512,
+      reasoningEffort: "medium",
+      permissionMode: "full_access",
+      trimReserveTokens: 2000,
+      trimReservePercent: 15,
+      trimAmountTokens: 4000,
+      trimAmountPercent: 30,
+      systemPrompt: "You are a helpful local assistant."
     }
   });
 
@@ -87,7 +94,20 @@ test("streams content from llama-server SSE responses", async () => {
 
   await runtime.streamChat({
     model: { id: "model", label: "Model", path: modelPath, createdAt: new Date().toISOString() },
-    settings: { nCtx: 4096, nGpuLayers: 0, temperature: 0.7, repeatPenalty: 1.1, maxTokens: 256 },
+    settings: {
+      nCtx: 4096,
+      nGpuLayers: 0,
+      temperature: 0.7,
+      repeatPenalty: 1.1,
+      maxTokens: 256,
+      reasoningEffort: "medium",
+      permissionMode: "full_access",
+      trimReserveTokens: 2000,
+      trimReservePercent: 15,
+      trimAmountTokens: 4000,
+      trimAmountPercent: 30,
+      systemPrompt: "You are a helpful local assistant."
+    },
     messages: [{ id: "m1", threadId: "t1", role: "user", content: "Hi", status: "complete", createdAt: "", updatedAt: "" }],
     onToken: (token) => {
       output += token;
@@ -108,7 +128,20 @@ test("fails visibly when the bundled binary is missing", async () => {
   await expect(
     runtime.streamChat({
       model: { id: "model", label: "Model", path: modelPath, createdAt: "" },
-      settings: { nCtx: 4096, nGpuLayers: 0, temperature: 0.7, repeatPenalty: 1.1, maxTokens: 256 },
+      settings: {
+        nCtx: 4096,
+        nGpuLayers: 0,
+        temperature: 0.7,
+        repeatPenalty: 1.1,
+        maxTokens: 256,
+        reasoningEffort: "medium",
+        permissionMode: "full_access",
+        trimReserveTokens: 2000,
+        trimReservePercent: 15,
+        trimAmountTokens: 4000,
+        trimAmountPercent: 30,
+        systemPrompt: "You are a helpful local assistant."
+      },
       messages: [],
       onToken: () => undefined
     })
