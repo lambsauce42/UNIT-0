@@ -246,6 +246,31 @@ test("blocks switching a local-history thread to Codex", () => {
   }
 });
 
+test("runs global chat action buttons from the selected project root when directory is empty", async () => {
+  const { service, store, cleanup } = makeService();
+  const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-action-root-"));
+  try {
+    const state = store.loadState();
+    store.updateProjectSettings(state.selectedProjectId, "Action Root", projectRoot);
+    store.updateAppSettings({
+      actionButtons: [{
+        id: "write-cwd",
+        label: "CWD",
+        command: `${JSON.stringify(process.execPath)} -e "require('fs').writeFileSync('cwd.txt', process.cwd())"`,
+        directory: ""
+      }]
+    });
+
+    await service.runProjectAction(state.selectedProjectId, "write-cwd");
+
+    expect(fs.readFileSync(path.join(projectRoot, "cwd.txt"), "utf-8")).toBe(projectRoot);
+  } finally {
+    service.close();
+    cleanup();
+    fs.rmSync(projectRoot, { recursive: true, force: true });
+  }
+});
+
 test("handles local /reset without starting generation", async () => {
   const { service, store, cleanup } = makeService();
   try {

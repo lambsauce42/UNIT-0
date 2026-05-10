@@ -210,6 +210,7 @@ export interface ChatAppSettings {
   usageIndicatorPlacement: "footer" | "composer";
   usageIndicatorOrder: string[];
   usageIndicatorPreferences: Record<ChatUsageIndicatorId, ChatUsageIndicatorPreference>;
+  actionButtons: ChatActionButton[];
   expandedProjectIds: string[];
   autoExpandCodexDisclosures: boolean;
   documentIndexLocation: "local" | "remote";
@@ -299,7 +300,6 @@ export interface ChatUpdateProjectSettingsPayload {
   projectId: string;
   title: string;
   directory: string;
-  actionButtons?: ChatActionButton[];
 }
 
 export interface ChatRenameThreadPayload {
@@ -423,6 +423,16 @@ export interface ChatCreateDocumentIndexPayload {
   projectId: string;
   title: string;
   sourcePath: string;
+}
+
+export interface ChatUpdateDocumentIndexPayload {
+  documentIndexId: string;
+  title: string;
+  sourcePath: string;
+}
+
+export interface ChatDeleteDocumentIndexPayload {
+  documentIndexId: string;
 }
 
 export interface ChatSelectDocumentIndexPayload {
@@ -888,6 +898,8 @@ export interface UnitApi {
     createGitBranch: (payload: ChatCreateGitBranchPayload) => Promise<ChatGitState>;
     runProjectAction: (payload: ChatRunProjectActionPayload) => Promise<void>;
     createDocumentIndex: (payload: ChatCreateDocumentIndexPayload) => Promise<ChatState>;
+    updateDocumentIndex: (payload: ChatUpdateDocumentIndexPayload) => Promise<ChatState>;
+    deleteDocumentIndex: (payload: ChatDeleteDocumentIndexPayload) => Promise<ChatState>;
     selectDocumentIndex: (payload: ChatSelectDocumentIndexPayload) => Promise<ChatState>;
     timelineAction: (payload: ChatTimelineActionPayload) => Promise<ChatState>;
     onStateChanged: (callback: (payload: ChatState) => void) => () => void;

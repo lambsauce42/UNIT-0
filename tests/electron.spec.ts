@@ -356,6 +356,32 @@ test("chat project actions and composer menus are backed by persistent state", a
   });
   expect(inlineButtonStyle.backgroundColor).toBe("rgb(43, 58, 86)");
   expect(inlineButtonStyle.borderWidth).toBe("0px");
+  await page.getByLabel("Delete Parity Preset").click();
+  await expect(settingsDropup).toBeVisible();
+  await expect(page.getByLabel("Delete Parity Preset")).toHaveCount(0);
+
+  await app.close();
+});
+
+test("chat dropups close when clicking outside consumed child surfaces", async () => {
+  const app = await launchApp();
+  const page = await firstWindow(app);
+  await expect(page.getByTestId("chat-surface")).toBeVisible();
+
+  const settingsDropup = page.locator(".chat-dropup");
+  await page.getByLabel("Model settings").click();
+  await expect(settingsDropup).toBeVisible();
+  const composerBox = await page.locator(".chat-composer").boundingBox();
+  expect(composerBox).not.toBeNull();
+  await page.mouse.click(composerBox!.x + 12, composerBox!.y + 12);
+  await expect(settingsDropup).toHaveCount(0);
+
+  await page.getByLabel("Model settings").click();
+  await expect(settingsDropup).toBeVisible();
+  const threadBox = await page.getByTestId("chat-message-list").boundingBox();
+  expect(threadBox).not.toBeNull();
+  await page.mouse.click(threadBox!.x + 24, threadBox!.y + 24);
+  await expect(settingsDropup).toHaveCount(0);
 
   await app.close();
 });

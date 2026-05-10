@@ -2261,8 +2261,8 @@ button {
   grid-template-columns: 20px minmax(0, 1fr) 72px;
   align-items: center;
   column-gap: 8px;
-  height: 36px;
-  padding: 3px 8px;
+  height: 32px;
+  padding: 1px 8px;
   border: none;
   border-radius: 12px;
   background: transparent;
@@ -2383,8 +2383,8 @@ button {
   display: grid;
   grid-template-columns: 12px minmax(0, 1fr) 72px;
   align-items: center;
-  height: 36px;
-  padding: 6px 8px 4px 26px;
+  height: 32px;
+  padding: 4px 8px 2px 26px;
   border: none;
   border-radius: 12px;
   background: transparent;
@@ -2988,7 +2988,7 @@ button {
   overflow: hidden;
   padding: 10px 14px;
   border: 1px solid #2a3542;
-  border-radius: 18px;
+  border-radius: 12px;
   background: #171d24;
 }
 

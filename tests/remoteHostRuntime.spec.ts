@@ -17,6 +17,7 @@ const settings: ChatAppSettings = {
     week: { displayMode: "circle", placement: "left", order: 1 },
     five_hour: { displayMode: "circle", placement: "right", order: 1 }
   },
+  actionButtons: [],
   expandedProjectIds: [],
   autoExpandCodexDisclosures: true,
   documentIndexLocation: "local",

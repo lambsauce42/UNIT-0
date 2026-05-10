@@ -147,6 +147,7 @@ const DEFAULT_APP_SETTINGS: ChatAppSettings = {
     week: { displayMode: "circle", placement: "left", order: 1 },
     five_hour: { displayMode: "circle", placement: "right", order: 1 }
   },
+  actionButtons: [],
   expandedProjectIds: [],
   autoExpandCodexDisclosures: true,
   documentIndexLocation: "local",
@@ -239,6 +240,7 @@ export class ChatStore {
     this.markStreamingMessagesInterrupted();
     this.importLegacyHistoryIfEmpty();
     this.seedIfEmpty();
+    this.migrateProjectActionButtonsToAppSettings();
   }
 
   loadState(): Omit<ChatState, "generation"> {
@@ -487,7 +489,7 @@ export class ChatStore {
     this.updateProjectSettings(projectId, title, undefined);
   }
 
-  updateProjectSettings(projectId: string, title: string, directory: string | undefined, actionButtons?: ChatActionButton[]): void {
+  updateProjectSettings(projectId: string, title: string, directory: string | undefined): void {
     const normalizedTitle = normalizeTitle(title, 80);
     if (!normalizedTitle) {
       return;
@@ -497,8 +499,8 @@ export class ChatStore {
       throw new Error(`Chat project does not exist: ${projectId}`);
     }
     this.db
-      .prepare("UPDATE chat_projects SET title = ?, directory = COALESCE(?, directory), action_buttons_json = COALESCE(?, action_buttons_json), updated_at = ? WHERE id = ?")
-      .run(normalizedTitle, directory ?? null, actionButtons ? JSON.stringify(normalizeActionButtons(actionButtons)) : null, timestamp(), project.id);
+      .prepare("UPDATE chat_projects SET title = ?, directory = COALESCE(?, directory), updated_at = ? WHERE id = ?")
+      .run(normalizedTitle, directory ?? null, timestamp(), project.id);
   }
 
   deleteProject(projectId: string): void {
@@ -1059,6 +1061,62 @@ export class ChatStore {
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
       .run(documentIndex.id, documentIndex.projectId, documentIndex.title, documentIndex.sourcePath, documentIndex.state, documentIndex.progress, documentIndex.message, documentIndex.createdAt, documentIndex.updatedAt, this.nextSortOrder("chat_document_indexes"));
     return documentIndex;
+  }
+
+  updateDocumentIndex(documentIndexId: string, title: string, sourcePath: string): ChatDocumentIndex {
+    const current = this.documentIndex(documentIndexId);
+    if (!current) {
+      throw new Error(`Document index does not exist: ${documentIndexId}`);
+    }
+    const normalizedSourcePath = sourcePath.trim();
+    if (!normalizedSourcePath) {
+      throw new Error("Document index requires a source path.");
+    }
+    const sourcePaths = normalizedSourcePath.split(/\r?\n/g).map((item) => item.trim()).filter(Boolean);
+    for (const sourceItem of sourcePaths) {
+      if (!fs.existsSync(sourceItem)) {
+        throw new Error(`Document source does not exist: ${sourceItem}`);
+      }
+    }
+    const normalizedTitle = normalizeTitle(title || path.basename(sourcePaths[0] ?? normalizedSourcePath), 80);
+    if (!normalizedTitle) {
+      throw new Error("Document index requires a title.");
+    }
+    const now = timestamp();
+    this.db
+      .prepare(`UPDATE chat_document_indexes
+        SET title = ?, source_path = ?, state = ?, progress = ?, message = ?, updated_at = ?
+        WHERE id = ?`)
+      .run(normalizedTitle, normalizedSourcePath, "building", 0, "Queued", now, current.id);
+    this.db.prepare("DELETE FROM chat_document_index_chunks WHERE document_index_id = ?").run(current.id);
+    this.db.prepare("UPDATE chat_projects SET updated_at = ? WHERE id = ?").run(now, current.projectId);
+    return {
+      ...current,
+      title: normalizedTitle,
+      sourcePath: normalizedSourcePath,
+      state: "building",
+      progress: 0,
+      message: "Queued",
+      updatedAt: now
+    };
+  }
+
+  deleteDocumentIndex(documentIndexId: string): void {
+    const current = this.documentIndex(documentIndexId);
+    if (!current) {
+      throw new Error(`Document index does not exist: ${documentIndexId}`);
+    }
+    const now = timestamp();
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db.prepare("UPDATE chat_threads SET document_index_id = '', updated_at = ? WHERE document_index_id = ?").run(now, current.id);
+      this.db.prepare("DELETE FROM chat_document_indexes WHERE id = ?").run(current.id);
+      this.db.prepare("UPDATE chat_projects SET updated_at = ? WHERE id = ?").run(now, current.projectId);
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   upsertDocumentIndex(documentIndex: ChatDocumentIndex): void {
@@ -1628,6 +1686,9 @@ export class ChatStore {
         "app_settings_json",
         JSON.stringify(normalizeAppSettings({
           ...DEFAULT_APP_SETTINGS,
+          actionButtons: imported.projects.find((project) => project.id === imported.selectedProjectId)?.actionButtons
+            ?? imported.projects.find((project) => project.actionButtons.length > 0)?.actionButtons
+            ?? [],
           expandedProjectIds: imported.projects.filter((project) => project.expanded).map((project) => project.id)
         }))
       );
@@ -1692,6 +1753,32 @@ export class ChatStore {
     } catch {
       return DEFAULT_APP_SETTINGS;
     }
+  }
+
+  private migrateProjectActionButtonsToAppSettings(): void {
+    const rawSettings = this.setting("app_settings_json");
+    if (!rawSettings) {
+      return;
+    }
+    let parsedSettings: Partial<ChatAppSettings>;
+    try {
+      parsedSettings = JSON.parse(rawSettings) as Partial<ChatAppSettings>;
+    } catch {
+      return;
+    }
+    if (Object.prototype.hasOwnProperty.call(parsedSettings, "actionButtons")) {
+      return;
+    }
+    const selectedProjectId = this.setting("selected_project_id");
+    const rows = this.db
+      .prepare("SELECT id, COALESCE(action_buttons_json, '[]') AS action_buttons_json FROM chat_projects ORDER BY sort_order")
+      .all() as Array<{ id: string; action_buttons_json: string }>;
+    const selectedRow = rows.find((row) => row.id === selectedProjectId);
+    const selectedButtons = selectedRow ? normalizeActionButtons(parseJsonArray<ChatActionButton>(selectedRow.action_buttons_json, [])) : [];
+    const firstButtons = selectedButtons.length > 0
+      ? selectedButtons
+      : rows.map((row) => normalizeActionButtons(parseJsonArray<ChatActionButton>(row.action_buttons_json, []))).find((buttons) => buttons.length > 0) ?? [];
+    this.setSetting("app_settings_json", JSON.stringify(normalizeAppSettings({ ...parsedSettings, actionButtons: firstButtons })));
   }
 
   private markStreamingMessagesInterrupted(): void {
@@ -2233,6 +2320,9 @@ function normalizeAppSettings(value: Partial<ChatAppSettings>): ChatAppSettings 
       ? value.usageIndicatorOrder
       : DEFAULT_APP_SETTINGS.usageIndicatorOrder,
     usageIndicatorPreferences: normalizeUsageIndicatorPreferences(value.usageIndicatorPreferences),
+    actionButtons: Array.isArray(value.actionButtons)
+      ? normalizeActionButtons(value.actionButtons)
+      : DEFAULT_APP_SETTINGS.actionButtons,
     expandedProjectIds: Array.isArray(value.expandedProjectIds) && value.expandedProjectIds.every((item) => typeof item === "string")
       ? value.expandedProjectIds
       : DEFAULT_APP_SETTINGS.expandedProjectIds,

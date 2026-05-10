@@ -108,6 +108,7 @@ test("imports legacy PySide history into a fresh SQLite chat store", () => {
       directory: "C:\\Legacy"
     });
     expect(state.projects[0].actionButtons).toMatchObject([{ label: "Dev", command: "npm run dev", directory: "C:\\Legacy" }]);
+    expect(state.appSettings.actionButtons).toMatchObject([{ label: "Dev", command: "npm run dev", directory: "C:\\Legacy" }]);
     expect(state.threads[0]).toMatchObject({
       id: "legacy-thread",
       projectId: "legacy-project",

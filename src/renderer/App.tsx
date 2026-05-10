@@ -3751,7 +3751,7 @@ type ChatDialogState =
   | { kind: "delete-thread"; threadId: string; title: string }
   | { kind: "app-settings" }
   | { kind: "settings-preset"; presetId?: string }
-  | { kind: "document-index"; projectId: string }
+  | { kind: "document-index"; projectId: string; documentIndexId?: string }
   | { kind: "create-branch"; projectId: string }
   | null;
 
@@ -4135,7 +4135,6 @@ function ChatSurface() {
     ? chatState?.documentIndexes.find((index) => index.id === selectedThread.documentIndexId) ?? null
     : null;
   const documentControlsVisible = Boolean(selectedThread && !threadUsesCodex && selectedBuiltinFramework === "document_analysis");
-  const canCreateDocumentIndex = Boolean(documentControlsVisible && selectedThread?.documentAnalysisEmbeddingModelPath.trim() && (chatState?.appSettings.tokenizerModelPath.trim() || selectedThread?.builtinModelId.trim()));
   const reasoningButtonLabel = selectedThread
     ? (threadUsesCodex ? reasoningLabel(selectedThread.codexReasoningEffort) : runtimeReasoningLabel(activeRuntimeSettings ?? chatState.runtimeSettings))
     : "Medium";
@@ -4172,15 +4171,32 @@ function ChatSurface() {
     "--chat-composer-inset": `${chatLayout.composerInset}px`
   } as CSSProperties;
 
-  const runChatAction = useCallback(async (action: () => Promise<ChatState>) => {
+  const runChatAction = useCallback(async (action: () => Promise<ChatState>, options?: { closeMenu?: boolean }) => {
     setLocalError(null);
-    setChatMenu(null);
+    if (options?.closeMenu !== false) {
+      setChatMenu(null);
+    }
     try {
       setChatState(await action());
     } catch (error: unknown) {
       setLocalError(errorMessage(error));
     }
   }, []);
+
+  useEffect(() => {
+    if (!chatMenu) {
+      return;
+    }
+    const closeOpenChatMenu = (event: PointerEvent) => {
+      const target = event.target instanceof Element ? event.target : null;
+      if (target?.closest(".chat-dropup")) {
+        return;
+      }
+      setChatMenu(null);
+    };
+    document.addEventListener("pointerdown", closeOpenChatMenu, true);
+    return () => document.removeEventListener("pointerdown", closeOpenChatMenu, true);
+  }, [chatMenu]);
 
   const refreshGitState = useCallback(async (projectId = activeProject?.id) => {
     if (!projectId) {
@@ -5096,7 +5112,7 @@ function ChatSurface() {
             <strong>{activeProject?.title ?? "Project"}</strong>
           </div>
           <div className="chat-action-strip">
-            {activeProject?.actionButtons.map((action) => (
+            {activeProject ? chatState.appSettings.actionButtons.map((action) => (
               <button
                 className={["chat-action-manager", projectActionStatuses[action.id] ? `status-${projectActionStatuses[action.id]}` : ""].join(" ")}
                 key={action.id}
@@ -5108,7 +5124,7 @@ function ChatSurface() {
                 <span>{action.label}</span>
                 <span className="chat-action-indicator" aria-hidden="true" />
               </button>
-            ))}
+            )) : null}
             <button
               className="chat-action-manager chat-action-add-button"
               type="button"
@@ -5455,7 +5471,7 @@ function ChatDropUpMenu({
   onAttach: (kind: ChatAttachment["kind"]) => Promise<void>;
   onClose: () => void;
   onDialog: (dialog: ChatDialogState) => void;
-  onRun: (action: () => Promise<ChatState>) => Promise<void>;
+  onRun: (action: () => Promise<ChatState>, options?: { closeMenu?: boolean }) => Promise<void>;
   gitState: ChatGitState | null;
   activeProjectId: string;
   onRefreshGitState: (projectId?: string) => Promise<void>;
@@ -5634,7 +5650,9 @@ function ChatDropUpMenu({
                         className="chat-dropup-inline-action"
                         type="button"
                         aria-label={`Edit ${preset.label}`}
-                        onClick={() => {
+                        onPointerDown={(event) => event.stopPropagation()}
+                        onClick={(event) => {
+                          event.stopPropagation();
                           onClose();
                           onDialog({ kind: "settings-preset", presetId: preset.id });
                         }}
@@ -5647,7 +5665,11 @@ function ChatDropUpMenu({
                         className="chat-dropup-inline-action danger"
                         type="button"
                         aria-label={`Delete ${preset.label}`}
-                        onClick={() => void onRun(() => window.unitApi.chat.deleteSettingsPreset({ presetId: preset.id }))}
+                        onPointerDown={(event) => event.stopPropagation()}
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          void onRun(() => window.unitApi.chat.deleteSettingsPreset({ presetId: preset.id }), { closeMenu: false });
+                        }}
                       >
                         <Trash2 size={12} />
                       </button>
@@ -5853,7 +5875,6 @@ function ChatDialog({
   const [presetIconName, setPresetIconName] = useState(() => initialSettingsPresetIconName(dialog, state));
   const [presetBuiltinFramework, setPresetBuiltinFramework] = useState<"chat" | "document_analysis">(() => initialSettingsPresetBuiltinFramework(dialog, state));
   const [presetEmbeddingModelPath, setPresetEmbeddingModelPath] = useState(() => initialSettingsPresetEmbeddingModelPath(dialog, state));
-  const [projectActionButtons, setProjectActionButtons] = useState<ChatActionButton[]>(() => initialProjectActionButtons(dialog, state));
   const [documentIndexPaths, setDocumentIndexPaths] = useState<string[]>([]);
 
   useEffect(() => {
@@ -5871,7 +5892,6 @@ function ChatDialog({
     setPresetIconName(initialSettingsPresetIconName(dialog, state));
     setPresetBuiltinFramework(initialSettingsPresetBuiltinFramework(dialog, state));
     setPresetEmbeddingModelPath(initialSettingsPresetEmbeddingModelPath(dialog, state));
-    setProjectActionButtons(initialProjectActionButtons(dialog, state));
     setDocumentIndexPaths([]);
   }, [dialog, state]);
 
@@ -5911,7 +5931,7 @@ function ChatDialog({
               if (!projectId) {
                 return created;
               }
-              return window.unitApi.chat.updateProjectSettings({ projectId, title, directory, actionButtons: projectActionButtons });
+              return window.unitApi.chat.updateProjectSettings({ projectId, title, directory });
             }).then(onClose);
           }}
         >
@@ -5927,10 +5947,8 @@ function ChatDialog({
           <ProjectSettingsFields
             title={title}
             directory={directory}
-            actionButtons={projectActionButtons}
             onTitleChange={setTitle}
             onDirectoryChange={setDirectory}
-            onActionButtonsChange={setProjectActionButtons}
           />
           <div className="chat-dialog-actions">
             <button type="button" onClick={onClose}>Cancel</button>
@@ -5975,6 +5993,10 @@ function ChatDialog({
                 <span>Auto-expand reasoning, tools, and diffs</span>
               </label>
               <UsageIndicatorSettingsRow title="Git Diff" indicatorId="git_diff" appSettings={appSettings} displayOptions={[["Text", "bar"]]} placementOptions={[["Bottom", "bottom"], ["Next to Branch", "footer_right"], ["Left Side", "left"], ["Right Side", "right"], ["Hidden", "hidden"]]} onChange={updateUsageIndicatorPreference} />
+            </section>
+            <section className="chat-settings-section">
+              <h3>Action Buttons</h3>
+              <ProjectActionEditor rows={appSettings.actionButtons} onRowsChange={(actionButtons) => setAppSettings({ ...appSettings, actionButtons })} />
             </section>
             <section className="chat-settings-section">
               <h3>Document Analysis</h3>
@@ -6347,7 +6369,7 @@ function ChatDialog({
           onPointerDown={(event) => event.stopPropagation()}
           onSubmit={(event) => {
             event.preventDefault();
-            void onRun(() => window.unitApi.chat.updateProjectSettings({ projectId: dialog.projectId, title, directory, actionButtons: projectActionButtons })).then(onClose);
+            void onRun(() => window.unitApi.chat.updateProjectSettings({ projectId: dialog.projectId, title, directory })).then(onClose);
           }}
         >
           <header className="chat-settings-header">
@@ -6362,10 +6384,8 @@ function ChatDialog({
           <ProjectSettingsFields
             title={title}
             directory={directory}
-            actionButtons={projectActionButtons}
             onTitleChange={setTitle}
             onDirectoryChange={setDirectory}
-            onActionButtonsChange={setProjectActionButtons}
           />
           <div className="chat-dialog-actions">
             <button type="button" onClick={onClose}>Cancel</button>
@@ -6376,7 +6396,6 @@ function ChatDialog({
     );
   }
   if (dialog.kind === "project-actions") {
-    const project = state.projects.find((item) => item.id === dialog.projectId);
     return (
       <div className="chat-dialog-backdrop" role="presentation" onPointerDown={onClose}>
         <form
@@ -6387,23 +6406,13 @@ function ChatDialog({
           onPointerDown={(event) => event.stopPropagation()}
           onSubmit={(event) => {
             event.preventDefault();
-            const project = state.projects.find((item) => item.id === dialog.projectId);
-            if (project) {
-              void onRun(() => window.unitApi.chat.updateProjectSettings({
-                projectId: dialog.projectId,
-                title: project.title,
-                directory: project.directory,
-                actionButtons: projectActionButtons
-              })).then(onClose);
-            } else {
-              onClose();
-            }
+            void onRun(() => window.unitApi.chat.updateAppSettings({ settings: appSettings })).then(onClose);
           }}
         >
           <header className="chat-settings-header">
             <div>
               <strong>Action Buttons</strong>
-              <span>{project?.title ?? "Project"}</span>
+              <span>Global</span>
             </div>
             <button type="button" aria-label="Close action buttons" onClick={onClose}>
               <X size={15} />
@@ -6412,7 +6421,7 @@ function ChatDialog({
           <div className="chat-settings-body">
             <section className="chat-settings-section">
               <h3>Action Buttons</h3>
-              <ProjectActionEditor rows={projectActionButtons} onRowsChange={setProjectActionButtons} />
+              <ProjectActionEditor rows={appSettings.actionButtons} onRowsChange={(actionButtons) => setAppSettings({ ...appSettings, actionButtons })} />
             </section>
           </div>
           <div className="chat-dialog-actions">
@@ -6723,17 +6732,13 @@ function initialChatDialogTitle(dialog: ChatDialogState, state: ChatState) {
 function ProjectSettingsFields({
   title,
   directory,
-  actionButtons,
   onTitleChange,
-  onDirectoryChange,
-  onActionButtonsChange
+  onDirectoryChange
 }: {
   title: string;
   directory: string;
-  actionButtons: ChatActionButton[];
   onTitleChange: (title: string) => void;
   onDirectoryChange: (directory: string) => void;
-  onActionButtonsChange: (actionButtons: ChatActionButton[]) => void;
 }) {
   const chooseDirectory = useCallback(async () => {
     const result = await window.unitApi.fileSystem.selectDirectory({ currentPath: directory });
@@ -6757,10 +6762,6 @@ function ProjectSettingsFields({
             <button type="button" onClick={() => void chooseDirectory()}>Browse</button>
           </div>
         </label>
-      </section>
-      <section className="chat-settings-section">
-        <h3>Action Buttons</h3>
-        <ProjectActionEditor rows={actionButtons} onRowsChange={onActionButtonsChange} />
       </section>
     </div>
   );
@@ -6935,13 +6936,6 @@ function initialSettingsPresetEmbeddingModelPath(dialog: ChatDialogState, state:
   return dialog?.kind === "settings-preset" && dialog.presetId
     ? state.settingsPresets.find((preset) => preset.id === dialog.presetId)?.documentAnalysisEmbeddingModelPath ?? ""
     : "";
-}
-
-function initialProjectActionButtons(dialog: ChatDialogState, state: ChatState): ChatActionButton[] {
-  if (dialog?.kind !== "project-settings" && dialog?.kind !== "project-actions") {
-    return [];
-  }
-  return state.projects.find((project) => project.id === dialog.projectId)?.actionButtons ?? [];
 }
 
 type ChatTimelineActionHandler = (blockId: string, action: "approve" | "deny" | "answer" | "retry" | "retry_new_thread", answer?: string) => Promise<void>;

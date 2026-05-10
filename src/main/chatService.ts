@@ -1,5 +1,4 @@
 import type {
-  ChatActionButton,
   ChatAttachment,
   ChatCodexAccountState,
   ChatCodexModel,
@@ -12,7 +11,9 @@ import type {
   ChatTimelineActionPayload,
   ChatTimelineBlock,
   ChatCreateDocumentIndexPayload,
+  ChatDeleteDocumentIndexPayload,
   ChatSelectDocumentIndexPayload,
+  ChatUpdateDocumentIndexPayload,
   ChatApplySettingsPresetPayload,
   ChatSaveSettingsPresetPayload,
   ChatDeleteSettingsPresetPayload,
@@ -258,8 +259,8 @@ export class ChatService {
     return this.state();
   }
 
-  updateProjectSettings(projectId: string, title: string, directory: string, actionButtons?: ChatActionButton[]): ChatState {
-    this.store.updateProjectSettings(projectId, title, directory, actionButtons);
+  updateProjectSettings(projectId: string, title: string, directory: string): ChatState {
+    this.store.updateProjectSettings(projectId, title, directory);
     this.clearError();
     this.broadcast();
     return this.state();
@@ -1213,7 +1214,7 @@ export class ChatService {
   async runProjectAction(projectId: string, actionId: string): Promise<void> {
     const state = this.store.loadState();
     const project = state.projects.find((item) => item.id === projectId);
-    const action = project?.actionButtons.find((item) => item.id === actionId);
+    const action = state.appSettings.actionButtons.find((item) => item.id === actionId);
     if (!project || !action) {
       throw new Error("Project action does not exist.");
     }
@@ -1275,6 +1276,52 @@ export class ChatService {
     this.clearError();
     this.broadcast();
     void this.buildDocumentIndex(documentIndex.id);
+    return this.state();
+  }
+
+  async updateDocumentIndex(payload: ChatUpdateDocumentIndexPayload): Promise<ChatState> {
+    const state = this.store.loadState();
+    const documentIndex = this.store.documentIndex(payload.documentIndexId);
+    if (!documentIndex) {
+      this.setError("Document index was not found.");
+      this.broadcast();
+      return this.state();
+    }
+    const selectedThread = state.threads.find((thread) => thread.id === state.selectedThreadId && thread.projectId === documentIndex.projectId)
+      ?? state.threads.find((thread) => thread.projectId === documentIndex.projectId);
+    if (!selectedThread || selectedThread.providerMode === "codex" || selectedThread.builtinAgenticFramework !== "document_analysis") {
+      this.setError("Document indexes are only available for built-in document analysis threads.");
+      this.broadcast();
+      return this.state();
+    }
+    if (state.appSettings.documentIndexLocation === "remote" || documentIndex.id.startsWith("remote-doc::")) {
+      this.setError("Remote document indexes cannot be edited by the local document indexer.");
+      this.broadcast();
+      return this.state();
+    }
+    if (!selectedThread.documentAnalysisEmbeddingModelPath.trim()) {
+      this.setError("Document analysis requires an embedding GGUF path before updating an index.");
+      this.broadcast();
+      return this.state();
+    }
+    const tokenizerPath = state.appSettings.tokenizerModelPath.trim() || selectedThread.builtinModelId.trim();
+    if (!tokenizerPath) {
+      this.setError("Document analysis requires a tokenizer GGUF path before updating an index.");
+      this.broadcast();
+      return this.state();
+    }
+    const updated = this.store.updateDocumentIndex(payload.documentIndexId, payload.title, payload.sourcePath);
+    this.store.selectDocumentIndex(selectedThread.id, updated.id);
+    this.clearError();
+    this.broadcast();
+    void this.buildDocumentIndex(updated.id);
+    return this.state();
+  }
+
+  deleteDocumentIndex(payload: ChatDeleteDocumentIndexPayload): ChatState {
+    this.store.deleteDocumentIndex(payload.documentIndexId);
+    this.clearError();
+    this.broadcast();
     return this.state();
   }
 

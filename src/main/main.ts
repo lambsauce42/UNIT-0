@@ -18,6 +18,7 @@ import type {
   ChatCreateDocumentIndexPayload,
   ChatCreateThreadPayload,
   ChatCreateGitBranchPayload,
+  ChatDeleteDocumentIndexPayload,
   ChatDeleteProjectPayload,
   ChatDeleteSettingsPresetPayload,
   ChatDeleteThreadPayload,
@@ -36,6 +37,7 @@ import type {
   ChatSwitchGitBranchPayload,
   ChatSubmitPayload,
   ChatTimelineActionPayload,
+  ChatUpdateDocumentIndexPayload,
   ChatUpdateAppSettingsPayload,
   ChatUpdateProjectSettingsPayload,
   ChatUpdateRuntimeSettingsPayload,
@@ -1646,7 +1648,7 @@ app.whenReady().then(() => {
   ipcMain.handle("chat:selectThread", (_event, payload: ChatSelectThreadPayload) => chatService.selectThread(payload.threadId));
   ipcMain.handle("chat:renameProject", (_event, payload: ChatRenameProjectPayload) => chatService.renameProject(payload.projectId, payload.title));
   ipcMain.handle("chat:updateProjectSettings", (_event, payload: ChatUpdateProjectSettingsPayload) =>
-    chatService.updateProjectSettings(payload.projectId, payload.title, payload.directory, payload.actionButtons));
+    chatService.updateProjectSettings(payload.projectId, payload.title, payload.directory));
   ipcMain.handle("chat:renameThread", (_event, payload: ChatRenameThreadPayload) => chatService.renameThread(payload.threadId, payload.title));
   ipcMain.handle("chat:updateThreadSettings", (_event, payload: ChatUpdateThreadSettingsPayload) => chatService.updateThreadSettings(payload));
   ipcMain.handle("chat:applySettingsPreset", (_event, payload: ChatApplySettingsPresetPayload) => chatService.applySettingsPreset(payload));
@@ -1679,6 +1681,8 @@ app.whenReady().then(() => {
   ipcMain.handle("chat:createGitBranch", (_event, payload: ChatCreateGitBranchPayload) => chatService.createGitBranch(payload.projectId, payload.branch));
   ipcMain.handle("chat:runProjectAction", (_event, payload: ChatRunProjectActionPayload) => chatService.runProjectAction(payload.projectId, payload.actionId));
   ipcMain.handle("chat:createDocumentIndex", (_event, payload: ChatCreateDocumentIndexPayload) => chatService.createDocumentIndex(payload));
+  ipcMain.handle("chat:updateDocumentIndex", (_event, payload: ChatUpdateDocumentIndexPayload) => chatService.updateDocumentIndex(payload));
+  ipcMain.handle("chat:deleteDocumentIndex", (_event, payload: ChatDeleteDocumentIndexPayload) => chatService.deleteDocumentIndex(payload));
   ipcMain.handle("chat:selectDocumentIndex", (_event, payload: ChatSelectDocumentIndexPayload) => chatService.selectDocumentIndex(payload));
   ipcMain.handle("chat:timelineAction", (_event, payload: ChatTimelineActionPayload) => chatService.timelineAction(payload));
   ipcMain.handle("browser:mount", (_event, payload: BrowserMountPayload) => browserViewManager.mount(payload));
