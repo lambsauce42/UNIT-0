@@ -6,6 +6,7 @@ import {
   Brain,
   Bot,
   Bolt,
+  ChevronDown,
   ChevronRight,
   Code2,
   Database,
@@ -70,6 +71,7 @@ import {
   type PointerEvent as ReactPointerEvent,
   type SVGProps
 } from "react";
+import { createPortal } from "react-dom";
 import { THIRD_PARTY_LICENSES } from "./thirdPartyLicenses";
 import { DEFAULT_BROWSER_URL, normalizeBrowserNavigationUrl } from "../shared/browserUrls";
 import type {
@@ -82,6 +84,7 @@ import type {
   BrowserStatusPayload,
   ChatAttachment,
   ChatCodexApprovalMode,
+  ChatCodexRateLimitWindow,
   ChatGitState,
   ChatMessage,
   ChatPermissionMode,
@@ -3662,25 +3665,174 @@ function UsageIndicatorSettingsRow({
   return (
     <div className="chat-usage-settings-row">
       <span>{title}</span>
-      <label>
-        <small>Style</small>
-        <select value={preference.displayMode} onChange={(event) => onChange(indicatorId, { displayMode: event.currentTarget.value as typeof preference.displayMode })}>
-          {displayOptions.map(([label, value]) => <option key={value} value={value}>{label}</option>)}
-        </select>
-      </label>
-      <label>
-        <small>Placement</small>
-        <select value={preference.placement} onChange={(event) => onChange(indicatorId, { placement: event.currentTarget.value as typeof preference.placement })}>
-          {placementOptions.map(([label, value]) => <option key={value} value={value}>{label}</option>)}
-        </select>
-      </label>
-      <label>
-        <small>Order</small>
-        <select value={String(preference.order)} onChange={(event) => onChange(indicatorId, { order: Number.parseInt(event.currentTarget.value, 10) || 1 })}>
-          {[1, 2, 3, 4].map((value) => <option key={value} value={value}>{value}</option>)}
-        </select>
-      </label>
+      <ChatSettingSelect
+        label="Style"
+        labelElement="small"
+        value={preference.displayMode}
+        options={displayOptions.map(([label, value]) => ({ label, value }))}
+        onChange={(value) => onChange(indicatorId, { displayMode: value as typeof preference.displayMode })}
+      />
+      <ChatSettingSelect
+        label="Placement"
+        labelElement="small"
+        value={preference.placement}
+        options={placementOptions.map(([label, value]) => ({ label, value }))}
+        onChange={(value) => onChange(indicatorId, { placement: value as typeof preference.placement })}
+      />
+      <ChatSettingSelect
+        label="Order"
+        labelElement="small"
+        value={String(preference.order)}
+        options={[1, 2, 3, 4].map((value) => ({ label: String(value), value: String(value) }))}
+        onChange={(value) => onChange(indicatorId, { order: Number.parseInt(value, 10) || 1 })}
+      />
     </div>
+  );
+}
+
+type ChatSettingSelectOption = {
+  value: string;
+  label: string;
+  disabled?: boolean;
+};
+
+function contextWindowOptions(includeDefault: boolean): ChatSettingSelectOption[] {
+  const base = [
+    { value: "4096", label: "4K" },
+    { value: "8192", label: "8K" },
+    { value: "16384", label: "16K" },
+    { value: "32768", label: "32K" },
+    { value: "65536", label: "64K" },
+    { value: "131072", label: "128K" }
+  ];
+  return includeDefault ? [{ value: "32768", label: "Default" }, ...base] : base;
+}
+
+function reasoningOptions(efforts: ChatReasoningEffort[]): ChatSettingSelectOption[] {
+  return efforts.map((effort) => ({ value: effort, label: reasoningLabel(effort) }));
+}
+
+function ChatSettingSelect({
+  label,
+  labelElement = "span",
+  value,
+  options,
+  ariaLabel,
+  onChange
+}: {
+  label: string;
+  labelElement?: "span" | "small";
+  value: string;
+  options: ChatSettingSelectOption[];
+  ariaLabel?: string;
+  onChange: (value: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [menuRect, setMenuRect] = useState<{ left: number; top: number; width: number } | null>(null);
+  const buttonRef = useRef<HTMLButtonElement | null>(null);
+  const menuRef = useRef<HTMLDivElement | null>(null);
+  const selected = options.find((option) => option.value === value && !option.disabled) ?? options.find((option) => option.value === value);
+  const LabelTag = labelElement;
+
+  const positionMenu = useCallback(() => {
+    const button = buttonRef.current;
+    if (!button) {
+      return;
+    }
+    const rect = button.getBoundingClientRect();
+    setMenuRect({
+      left: rect.left,
+      top: rect.bottom + 4,
+      width: rect.width
+    });
+  }, []);
+
+  const toggleMenu = () => {
+    if (open) {
+      setOpen(false);
+      return;
+    }
+    positionMenu();
+    setOpen(true);
+  };
+
+  useEffect(() => {
+    if (!open) {
+      return;
+    }
+    const closeIfOutside = (event: PointerEvent) => {
+      const target = event.target as Node | null;
+      if (target && (buttonRef.current?.contains(target) || menuRef.current?.contains(target))) {
+        return;
+      }
+      setOpen(false);
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setOpen(false);
+        buttonRef.current?.focus();
+      }
+    };
+    const onWindowChange = () => setOpen(false);
+    document.addEventListener("pointerdown", closeIfOutside);
+    document.addEventListener("keydown", onKeyDown);
+    window.addEventListener("resize", onWindowChange);
+    window.addEventListener("scroll", onWindowChange, true);
+    return () => {
+      document.removeEventListener("pointerdown", closeIfOutside);
+      document.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("resize", onWindowChange);
+      window.removeEventListener("scroll", onWindowChange, true);
+    };
+  }, [open]);
+
+  return (
+    <label className="chat-setting-select-field">
+      <LabelTag>{label}</LabelTag>
+      <button
+        ref={buttonRef}
+        type="button"
+        className="chat-setting-select-button"
+        aria-label={ariaLabel ?? label}
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        onClick={toggleMenu}
+      >
+        <span>{selected?.label ?? value}</span>
+        <ChevronDown size={15} />
+      </button>
+      {open && menuRect ? createPortal(
+        <div
+          ref={menuRef}
+          className="chat-setting-select-menu"
+          role="listbox"
+          aria-label={ariaLabel ?? label}
+          style={{ left: menuRect.left, top: menuRect.top, width: menuRect.width }}
+          onPointerDown={(event) => event.stopPropagation()}
+        >
+          {options.map((option) => (
+            <button
+              key={option.value}
+              type="button"
+              role="option"
+              aria-selected={option.value === value}
+              disabled={option.disabled}
+              onClick={() => {
+                if (option.disabled) {
+                  return;
+                }
+                onChange(option.value);
+                setOpen(false);
+                buttonRef.current?.focus();
+              }}
+            >
+              <span>{option.label}</span>
+            </button>
+          ))}
+        </div>,
+        document.body
+      ) : null}
+    </label>
   );
 }
 
@@ -3727,8 +3879,10 @@ function ChatSurface() {
   const [projectActionStatuses, setProjectActionStatuses] = useState<Record<string, "running" | "completed" | "error">>({});
   const [draggedChatItem, setDraggedChatItem] = useState<{ kind: "project" | "thread"; id: string } | null>(null);
   const [chatDropTarget, setChatDropTarget] = useState<{ kind: "project" | "thread"; id: string; position: "before" | "after" | "inside" } | null>(null);
+  const [sidebarScrollable, setSidebarScrollable] = useState(false);
   const surfaceRef = useRef<HTMLDivElement | null>(null);
   const composerRef = useRef<HTMLTextAreaElement | null>(null);
+  const projectScrollRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     let mounted = true;
@@ -3764,6 +3918,33 @@ function ChatSurface() {
       removeListener();
     };
   }, []);
+
+  useEffect(() => {
+    if (chatState?.codexAccount.status === "ready") {
+      return;
+    }
+    let cancelled = false;
+    let running = false;
+    const refresh = async () => {
+      if (cancelled || running) {
+        return;
+      }
+      running = true;
+      try {
+        await window.unitApi.chat.refreshCodexAccount();
+      } catch {
+        // The main process stores Codex account errors in chat state; keep retrying until ready.
+      } finally {
+        running = false;
+      }
+    };
+    void refresh();
+    const timer = window.setInterval(() => void refresh(), 10000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [chatState?.codexAccount.status]);
 
   const selectedThread = chatState?.threads.find((thread) => thread.id === chatState.selectedThreadId) ?? null;
   const selectedMessages = chatState
@@ -3910,12 +4091,14 @@ function ChatSurface() {
     const targetRect = event.currentTarget.getBoundingClientRect();
     const surfaceRect = surface?.getBoundingClientRect();
     if (!surfaceRect) {
-      setChatMenu({ ...menu, left: targetRect.left, top: targetRect.top, placement } as NonNullable<ChatMenuState>);
       return;
     }
     const menuWidth = menu.kind === "thread" ? 192 : 270;
-    const left = Math.min(Math.max(8, targetRect.left - surfaceRect.left), Math.max(8, surfaceRect.width - menuWidth - 8));
-    const top = placement === "above" ? targetRect.top - surfaceRect.top : targetRect.bottom - surfaceRect.top;
+    const targetLeft = targetRect.left - surfaceRect.left;
+    const targetRight = targetRect.right - surfaceRect.left;
+    const alignedLeft = targetRight + menuWidth > surfaceRect.width - 8 ? targetRight - menuWidth : targetLeft;
+    const left = Math.min(Math.max(8, alignedLeft), Math.max(8, surfaceRect.width - menuWidth - 8));
+    const top = (placement === "above" ? targetRect.top : targetRect.bottom) - surfaceRect.top;
     setChatMenu({ ...menu, left, top, placement } as NonNullable<ChatMenuState>);
   }, []);
 
@@ -4021,20 +4204,34 @@ function ChatSurface() {
     composer.style.height = `${Math.min(176, Math.max(44, composer.scrollHeight))}px`;
   }, [draft]);
 
-  const usageIndicatorPreferences = chatState?.appSettings.usageIndicatorPreferences;
-  const renderUsageIndicator = (indicatorId: string, displayMode: "bar" | "circle" = "bar") => {
-    if (!chatState) {
-      return null;
+  const updateSidebarScrollable = useCallback(() => {
+    const scrollHost = projectScrollRef.current;
+    const nextScrollable = scrollHost ? scrollHost.scrollHeight > scrollHost.clientHeight + 1 : false;
+    setSidebarScrollable((current) => current === nextScrollable ? current : nextScrollable);
+  }, []);
+
+  useLayoutEffect(() => {
+    updateSidebarScrollable();
+    const scrollHost = projectScrollRef.current;
+    if (!scrollHost) {
+      return;
     }
-    if (indicatorId === "context") {
-      return (
-        <div className={["chat-context-cluster", displayMode === "circle" ? "circle" : ""].join(" ")} key="context">
-          <span className="chat-context-fill" style={{ width: `${contextUsagePercent(chatState)}%` }} aria-hidden="true" />
-          <span>{displayMode === "circle" ? "Ctx" : "Context"}</span>
-          <span>{formatContextLabel((activeRuntimeSettings ?? chatState.runtimeSettings).nCtx)}</span>
-        </div>
-      );
-    }
+    const resizeObserver = new ResizeObserver(updateSidebarScrollable);
+    resizeObserver.observe(scrollHost);
+    Array.from(scrollHost.children).forEach((child) => resizeObserver.observe(child));
+    scrollHost.addEventListener("transitionend", updateSidebarScrollable);
+    return () => {
+      resizeObserver.disconnect();
+      scrollHost.removeEventListener("transitionend", updateSidebarScrollable);
+    };
+  }, [chatState, expandedProjectIds, updateSidebarScrollable]);
+
+  if (!chatState) {
+    return <div className="chat-surface chat-loading" data-testid="chat-surface" />;
+  }
+
+  const usageIndicatorPreferences = chatState.appSettings.usageIndicatorPreferences;
+  const renderUsageIndicator = (indicatorId: string) => {
     if (indicatorId === "git_diff") {
       return (
         <div className={["chat-git-diff-indicator", gitState?.status === "ready" ? "" : "inactive"].join(" ")} aria-label="Git diff" key="git_diff">
@@ -4043,27 +4240,18 @@ function ChatSurface() {
         </div>
       );
     }
-    if (indicatorId === "week") {
-      return <div className={["chat-rate-limit-indicator inline", displayMode === "bar" ? "bar" : ""].join(" ")} aria-label="Weekly rate limit" key="week"><span>{rateLimitIndicatorLabel(chatState, "primary")}</span></div>;
-    }
-    if (indicatorId === "five_hour") {
-      return <div className={["chat-rate-limit-indicator inline", displayMode === "bar" ? "bar" : ""].join(" ")} aria-label="Five hour rate limit" key="five_hour"><span>{rateLimitIndicatorLabel(chatState, "secondary")}</span></div>;
-    }
     return null;
   };
-  const usageItems = (["git_diff", "context", "week", "five_hour"] as const)
+  const usageItems = (["git_diff"] as const)
     .map((id) => ({ id, preference: usageIndicatorPreferences?.[id] }))
-    .filter((item): item is { id: "git_diff" | "context" | "week" | "five_hour"; preference: NonNullable<typeof usageIndicatorPreferences>["git_diff"] } => Boolean(item.preference))
+    .filter((item): item is { id: "git_diff"; preference: NonNullable<typeof usageIndicatorPreferences>["git_diff"] } => Boolean(item.preference))
     .filter((item) => item.preference.placement !== "hidden")
     .sort((left, right) => left.preference.order - right.preference.order);
-  const leftUsageIndicators = usageItems.filter((item) => item.preference.placement === "left").map((item) => renderUsageIndicator(item.id, item.preference.displayMode)).filter(Boolean);
-  const rightUsageIndicators = usageItems.filter((item) => item.preference.placement === "right").map((item) => renderUsageIndicator(item.id, item.preference.displayMode)).filter(Boolean);
-  const composerUsageIndicators = usageItems.filter((item) => item.preference.placement === "bottom").map((item) => renderUsageIndicator(item.id, item.preference.displayMode)).filter(Boolean);
-  const footerRightUsageIndicators = usageItems.filter((item) => item.preference.placement === "footer_right").map((item) => renderUsageIndicator(item.id, item.preference.displayMode)).filter(Boolean);
-
-  if (!chatState) {
-    return <div className="chat-surface chat-loading" data-testid="chat-surface" />;
-  }
+  const leftUsageIndicators = usageItems.filter((item) => item.preference.placement === "left").map((item) => renderUsageIndicator(item.id)).filter(Boolean);
+  const rightUsageIndicators = usageItems.filter((item) => item.preference.placement === "right").map((item) => renderUsageIndicator(item.id)).filter(Boolean);
+  const composerUsageIndicators = usageItems.filter((item) => item.preference.placement === "bottom").map((item) => renderUsageIndicator(item.id)).filter(Boolean);
+  const footerRightUsageIndicators = usageItems.filter((item) => item.preference.placement === "footer_right").map((item) => renderUsageIndicator(item.id)).filter(Boolean);
+  const contextPercent = contextUsagePercent(chatState, (activeRuntimeSettings ?? chatState.runtimeSettings).nCtx);
 
   return (
     <div className="chat-surface" data-testid="chat-surface" ref={surfaceRef} onPointerDown={() => setChatMenu(null)}>
@@ -4074,11 +4262,13 @@ function ChatSurface() {
           aria-label="New chat thread"
           onClick={() => void runChatAction(() => window.unitApi.chat.createThread())}
         >
-          <Plus size={15} />
-          <span>New thread</span>
+          <span className="chat-sidebar-leading-icon" data-testid="chat-new-thread-icon">
+            <Plus size={16} />
+          </span>
+          <span data-testid="chat-new-thread-label">New thread</span>
         </button>
         <div className="chat-list-section-title">
-          <span>Threads</span>
+          <span data-testid="chat-section-threads-label">Threads</span>
           <button
             className="chat-card-action"
             type="button"
@@ -4091,14 +4281,14 @@ function ChatSurface() {
             <FolderPlus size={14} />
           </button>
         </div>
-          <div className="chat-project-scroll">
-          <div className="chat-overlay-scrollbar chat-overlay-scrollbar-sidebar" aria-hidden="true"><span /></div>
-          {chatState.projects.map((project) => {
-            const projectThreads = chatState.threads.filter((thread) => thread.projectId === project.id);
-            const expanded = expandedProjectIds.has(project.id);
-            const active = project.id === chatState.selectedProjectId;
-            return (
-              <section className="chat-project-section" key={project.id}>
+        <div className="chat-project-scroll-shell">
+          <div className="chat-project-scroll" ref={projectScrollRef}>
+            {chatState.projects.map((project) => {
+              const projectThreads = chatState.threads.filter((thread) => thread.projectId === project.id);
+              const expanded = expandedProjectIds.has(project.id);
+              const active = project.id === chatState.selectedProjectId;
+              return (
+                <section className="chat-project-section" key={project.id}>
                 <div
                   className={[
                     "chat-project-card",
@@ -4174,7 +4364,9 @@ function ChatSurface() {
                       toggleProject(project.id);
                     }}
                   >
-                    <ChevronRight className={expanded ? "expanded" : ""} size={15} />
+                    <span className="chat-sidebar-leading-icon" data-testid={`chat-project-caret-${project.id}`}>
+                      <ChevronRight className={expanded ? "expanded" : ""} size={16} />
+                    </span>
                   </button>
                   <span className="chat-project-title">{project.title}</span>
                   <span className="chat-project-actions">
@@ -4342,13 +4534,18 @@ function ChatSurface() {
                       </div>
                     ))}
                 </div>
-              </section>
-            );
-          })}
+                </section>
+              );
+            })}
+          </div>
+          <div className={["chat-overlay-scrollbar chat-overlay-scrollbar-sidebar", sidebarScrollable ? "scrollable" : ""].join(" ")} aria-hidden="true"><span /></div>
         </div>
+        <ChatSidebarLimitBars state={chatState} />
         <button className="chat-settings-button" type="button" onClick={() => setChatDialog({ kind: "app-settings" })}>
-          <Settings size={15} />
-          <span>Settings</span>
+          <span className="chat-sidebar-leading-icon" data-testid="chat-settings-icon">
+            <Settings size={16} />
+          </span>
+          <span data-testid="chat-settings-label">Settings</span>
         </button>
       </aside>
       <section className="chat-main">
@@ -4371,7 +4568,7 @@ function ChatSurface() {
               </button>
             ))}
             <button
-              className="chat-action-manager"
+              className="chat-action-manager chat-action-add-button"
               type="button"
               aria-label="Chat actions"
               onPointerDown={(event) => {
@@ -4382,6 +4579,8 @@ function ChatSurface() {
               }}
             >
               <Plus size={15} />
+              <span className="chat-action-add-divider" aria-hidden="true" />
+              <span className="chat-action-add-label">Add action</span>
             </button>
           </div>
         </header>
@@ -4518,7 +4717,8 @@ function ChatSurface() {
                 type="button"
                 onPointerDown={(event) => openChatMenu(event, { kind: "quality" })}
               >
-                {reasoningButtonLabel}
+                <span>{reasoningButtonLabel}</span>
+                <ChevronRight className="chat-model-caret" size={12} />
               </button>
               <span className={["chat-plan-separator", selectedThread?.planModeEnabled ? "" : "inactive"].join(" ")} aria-hidden="true">|</span>
               <button
@@ -4561,46 +4761,37 @@ function ChatSurface() {
           <div className="chat-composer-side-dock right">{rightUsageIndicators}</div>
           </div>
           <div className="chat-composer-footer">
-            <button
-              className="chat-footer-slot chat-footer-button"
-              type="button"
-              onPointerDown={(event) => openChatMenu(event, { kind: "permissions" })}
-            >
-              <LockOpen size={13} />
-              <span>{permissionButtonLabel}</span>
-            </button>
+            <div className="chat-footer-left-cluster">
+              <button
+                className="chat-footer-slot chat-footer-button"
+                type="button"
+                onPointerDown={(event) => openChatMenu(event, { kind: "permissions" })}
+              >
+                <LockOpen size={13} />
+                <span>{permissionButtonLabel}</span>
+                <ChevronRight className="chat-model-caret" size={12} />
+              </button>
+              <button
+                className="chat-footer-slot chat-footer-button"
+                type="button"
+                onPointerDown={(event) => openChatMenu(event, { kind: "branch" })}
+              >
+                <GitBranch size={13} />
+                <span>{branchButtonLabel}</span>
+                <ChevronRight className="chat-model-caret" size={12} />
+              </button>
+            </div>
             <div className="chat-footer-usage-indicators">{composerUsageIndicators}</div>
             <div className="chat-footer-right-cluster">
               {footerRightUsageIndicators}
               <div className={["chat-document-progress", documentControlsVisible && selectedDocumentIndex ? "visible" : ""].join(" ")} aria-label="Document progress">
                 <span style={{ width: `${Math.round((selectedDocumentIndex?.progress ?? 0) * 100)}%` }} />
               </div>
-              <button
-                className="chat-footer-slot chat-footer-button right"
-                type="button"
-                onPointerDown={(event) => openChatMenu(event, { kind: "branch" })}
-              >
-                <GitBranch size={13} />
-                <span>{branchButtonLabel}</span>
-              </button>
+              <span className="chat-context-tile-label">Context:</span>
+              <ChatContextTileBar usedPercent={contextPercent} nCtx={(activeRuntimeSettings ?? chatState.runtimeSettings).nCtx} />
             </div>
           </div>
         </div>
-        {chatMenu ? (
-          <ChatDropUpMenu
-            chatState={chatState}
-            menu={chatMenu}
-            onAttach={attachFiles}
-            onClose={() => setChatMenu(null)}
-            onDialog={setChatDialog}
-            onRun={runChatAction}
-            gitState={gitState}
-            activeProjectId={activeProject?.id ?? ""}
-            onRefreshGitState={refreshGitState}
-            onError={setLocalError}
-            onStartThreadRename={startInlineThreadRename}
-          />
-        ) : null}
         {chatDialog ? (
           <ChatDialog
             dialog={chatDialog}
@@ -4611,6 +4802,67 @@ function ChatSurface() {
           />
         ) : null}
       </section>
+      {chatMenu ? (
+        <ChatDropUpMenu
+          chatState={chatState}
+          menu={chatMenu}
+          onAttach={attachFiles}
+          onClose={() => setChatMenu(null)}
+          onDialog={setChatDialog}
+          onRun={runChatAction}
+          gitState={gitState}
+          activeProjectId={activeProject?.id ?? ""}
+          onRefreshGitState={refreshGitState}
+          onError={setLocalError}
+          onStartThreadRename={startInlineThreadRename}
+        />
+      ) : null}
+    </div>
+  );
+}
+
+function ChatSidebarLimitBars({ state }: { state: ChatState }) {
+  const windows = codexLimitWindows(state);
+  return (
+    <div className="chat-sidebar-limit-bars" aria-label="Codex limits">
+      {windows.map((window) => (
+        <ChatSidebarLimitBar
+          key={window.id}
+          label={`${window.label}:`}
+          percent={window.leftPercent}
+          title={rateLimitTitle(window)}
+        />
+      ))}
+    </div>
+  );
+}
+
+function ChatSidebarLimitBar({ label, percent, title }: { label: string; percent: number | null; title: string }) {
+  const fillPercent = percent ?? 0;
+  const fillStyle: CSSProperties = {
+    width: `${fillPercent}%`,
+    backgroundSize: fillPercent > 0 ? `${10000 / fillPercent}% 100%` : "100% 100%"
+  };
+  return (
+    <div className="chat-sidebar-limit-row" title={title} aria-label={title || label}>
+      <span className="chat-sidebar-limit-label">{label}</span>
+      <span className="chat-sidebar-limit-track" aria-hidden="true">
+        <span className="chat-sidebar-limit-fill" style={fillStyle} />
+      </span>
+    </div>
+  );
+}
+
+function ChatContextTileBar({ usedPercent, nCtx }: { usedPercent: number; nCtx: number }) {
+  const stripCount = 20;
+  const litStrips = usedPercent <= 0 ? 0 : Math.ceil((usedPercent / 100) * stripCount);
+  const leftPercent = Math.max(0, 100 - usedPercent);
+  const label = `${leftPercent}% context left (${usedPercent}% used of ${formatContextLabel(nCtx)})`;
+  return (
+    <div className="chat-context-tile-bar" title={label} aria-label={label}>
+      {Array.from({ length: stripCount }, (_, index) => (
+        <span className={index < litStrips ? "lit" : ""} key={index} />
+      ))}
     </div>
   );
 }
@@ -4805,28 +5057,32 @@ function ChatDropUpMenu({
                   <Icon size={14} />
                   <span>{preset.label}</span>
                 </button>
-                {preset.editable ? (
-                  <button
-                    className="chat-dropup-inline-action"
-                    type="button"
-                    aria-label={`Edit ${preset.label}`}
-                    onClick={() => {
-                      onClose();
-                      onDialog({ kind: "settings-preset", presetId: preset.id });
-                    }}
-                  >
-                    <Pencil size={12} />
-                  </button>
-                ) : null}
-                {preset.deletable ? (
-                  <button
-                    className="chat-dropup-inline-action danger"
-                    type="button"
-                    aria-label={`Delete ${preset.label}`}
-                    onClick={() => void onRun(() => window.unitApi.chat.deleteSettingsPreset({ presetId: preset.id }))}
-                  >
-                    <Trash2 size={12} />
-                  </button>
+                {preset.editable || preset.deletable ? (
+                  <span className="chat-dropup-action-controls">
+                    {preset.editable ? (
+                      <button
+                        className="chat-dropup-inline-action"
+                        type="button"
+                        aria-label={`Edit ${preset.label}`}
+                        onClick={() => {
+                          onClose();
+                          onDialog({ kind: "settings-preset", presetId: preset.id });
+                        }}
+                      >
+                        <Pencil size={12} />
+                      </button>
+                    ) : null}
+                    {preset.deletable ? (
+                      <button
+                        className="chat-dropup-inline-action danger"
+                        type="button"
+                        aria-label={`Delete ${preset.label}`}
+                        onClick={() => void onRun(() => window.unitApi.chat.deleteSettingsPreset({ presetId: preset.id }))}
+                      >
+                        <Trash2 size={12} />
+                      </button>
+                    ) : null}
+                  </span>
                 ) : null}
               </div>
             );
@@ -5149,9 +5405,6 @@ function ChatDialog({
                 <span>Auto-expand reasoning, tools, and diffs</span>
               </label>
               <UsageIndicatorSettingsRow title="Git Diff" indicatorId="git_diff" appSettings={appSettings} displayOptions={[["Text", "bar"]]} placementOptions={[["Bottom", "bottom"], ["Next to Branch", "footer_right"], ["Left Side", "left"], ["Right Side", "right"], ["Hidden", "hidden"]]} onChange={updateUsageIndicatorPreference} />
-              <UsageIndicatorSettingsRow title="Context" indicatorId="context" appSettings={appSettings} onChange={updateUsageIndicatorPreference} />
-              <UsageIndicatorSettingsRow title="Week" indicatorId="week" appSettings={appSettings} onChange={updateUsageIndicatorPreference} />
-              <UsageIndicatorSettingsRow title="5h" indicatorId="five_hour" appSettings={appSettings} onChange={updateUsageIndicatorPreference} />
             </section>
             <section className="chat-settings-section">
               <h3>Document Analysis</h3>
@@ -5174,28 +5427,20 @@ function ChatDialog({
                     }}>Browse...</button>
                   </div>
                 </label>
-                <label>
-                  <span>Document Indexing</span>
-                  <select
-                    value={appSettings.documentIndexLocation}
-                    aria-label="Document indexing"
-                    onChange={(event) => setAppSettings({ ...appSettings, documentIndexLocation: event.currentTarget.value as ChatAppSettings["documentIndexLocation"] })}
-                  >
-                    <option value="local">Local laptop</option>
-                    <option value="remote">Remote host</option>
-                  </select>
-                </label>
-                <label>
-                  <span>Document Tool Calls</span>
-                  <select
-                    value={appSettings.documentToolExecutionLocation}
-                    aria-label="Document tool calls"
-                    onChange={(event) => setAppSettings({ ...appSettings, documentToolExecutionLocation: event.currentTarget.value as ChatAppSettings["documentToolExecutionLocation"] })}
-                  >
-                    <option value="local">Local laptop</option>
-                    <option value="remote">Remote host</option>
-                  </select>
-                </label>
+                <ChatSettingSelect
+                  label="Document Indexing"
+                  ariaLabel="Document indexing"
+                  value={appSettings.documentIndexLocation}
+                  options={[{ value: "local", label: "Local laptop" }, { value: "remote", label: "Remote host" }]}
+                  onChange={(value) => setAppSettings({ ...appSettings, documentIndexLocation: value as ChatAppSettings["documentIndexLocation"] })}
+                />
+                <ChatSettingSelect
+                  label="Document Tool Calls"
+                  ariaLabel="Document tool calls"
+                  value={appSettings.documentToolExecutionLocation}
+                  options={[{ value: "local", label: "Local laptop" }, { value: "remote", label: "Remote host" }]}
+                  onChange={(value) => setAppSettings({ ...appSettings, documentToolExecutionLocation: value as ChatAppSettings["documentToolExecutionLocation"] })}
+                />
               </div>
             </section>
             <section className="chat-settings-section">
@@ -5286,41 +5531,40 @@ function ChatDialog({
                   <span>Name</span>
                   <input value={title} onChange={(event) => setTitle(event.currentTarget.value)} />
                 </label>
-                <label>
-                  <span>Icon</span>
-                  <select value={presetIconName} onChange={(event) => setPresetIconName(event.currentTarget.value)}>
-                    <option value="sliders">Sliders</option>
-                    <option value="bolt">Bolt</option>
-                    <option value="brain">Brain</option>
-                    <option value="code">Code</option>
-                  </select>
-                </label>
-                <label>
-                  <span>Provider</span>
-                  <select value={threadProviderMode} onChange={(event) => setThreadProviderMode(event.currentTarget.value as ChatProviderMode)}>
-                    <option value="builtin">Built-in</option>
-                    <option value="codex">Codex</option>
-                  </select>
-                </label>
+                <ChatSettingSelect
+                  label="Icon"
+                  value={presetIconName}
+                  options={[
+                    { value: "sliders", label: "Sliders" },
+                    { value: "bolt", label: "Bolt" },
+                    { value: "brain", label: "Brain" },
+                    { value: "code", label: "Code" }
+                  ]}
+                  onChange={setPresetIconName}
+                />
+                <ChatSettingSelect
+                  label="Provider"
+                  value={threadProviderMode}
+                  options={[{ value: "builtin", label: "Built-in" }, { value: "codex", label: "Codex" }]}
+                  onChange={(value) => setThreadProviderMode(value as ChatProviderMode)}
+                />
               </div>
             </section>
             <section className="chat-settings-section">
               <h3>Built-in</h3>
               <div className="chat-settings-row">
-                <label>
-                  <span>Agentic framework</span>
-                  <select value={presetBuiltinFramework} onChange={(event) => setPresetBuiltinFramework(event.currentTarget.value as "chat" | "document_analysis")}>
-                    <option value="chat">Chat</option>
-                    <option value="document_analysis">Document analysis</option>
-                  </select>
-                </label>
-                <label>
-                  <span>Access</span>
-                  <select value={settings.permissionMode} onChange={(event) => setSettings({ ...settings, permissionMode: event.currentTarget.value })}>
-                    <option value="default_permissions">Default</option>
-                    <option value="full_access">Full access</option>
-                  </select>
-                </label>
+                <ChatSettingSelect
+                  label="Agentic framework"
+                  value={presetBuiltinFramework}
+                  options={[{ value: "chat", label: "Chat" }, { value: "document_analysis", label: "Document analysis" }]}
+                  onChange={(value) => setPresetBuiltinFramework(value as "chat" | "document_analysis")}
+                />
+                <ChatSettingSelect
+                  label="Access"
+                  value={settings.permissionMode}
+                  options={[{ value: "default_permissions", label: "Default" }, { value: "full_access", label: "Full access" }]}
+                  onChange={(value) => setSettings({ ...settings, permissionMode: value })}
+                />
               </div>
               <label className="chat-embedding-field">
                 <span>Embedding Model</span>
@@ -5339,45 +5583,40 @@ function ChatDialog({
             <section className="chat-settings-section">
               <h3>Codex</h3>
               <div className="chat-settings-row">
-                <label>
-                  <span>Model</span>
-                  <select value={threadCodexModelId} onChange={(event) => setThreadCodexModelId(event.currentTarget.value)}>
-                    {state.codexModels.map((model) => <option key={model.id} value={model.id}>{model.label}</option>)}
-                  </select>
-                </label>
-                <label>
-                  <span>Reasoning</span>
-                  <select value={threadCodexReasoningEffort} onChange={(event) => setThreadCodexReasoningEffort(event.currentTarget.value as ChatReasoningEffort)}>
-                    <option value="low">Low</option>
-                    <option value="medium">Medium</option>
-                    <option value="high">High</option>
-                    <option value="xhigh">XHigh</option>
-                  </select>
-                </label>
+                <ChatSettingSelect
+                  label="Model"
+                  value={threadCodexModelId}
+                  options={state.codexModels.map((model) => ({ value: model.id, label: model.label }))}
+                  onChange={setThreadCodexModelId}
+                />
+                <ChatSettingSelect
+                  label="Reasoning"
+                  value={threadCodexReasoningEffort}
+                  options={[
+                    { value: "low", label: "Low" },
+                    { value: "medium", label: "Medium" },
+                    { value: "high", label: "High" },
+                    { value: "xhigh", label: "XHigh" }
+                  ]}
+                  onChange={(value) => setThreadCodexReasoningEffort(value as ChatReasoningEffort)}
+                />
               </div>
             </section>
             <section className="chat-settings-section">
               <h3>Runtime</h3>
               <div className="chat-settings-row">
-                <label>
-                  <span>Context Window</span>
-                  <select value={settings.nCtx} onChange={(event) => setSettings({ ...settings, nCtx: event.currentTarget.value })}>
-                    <option value="4096">4K</option>
-                    <option value="8192">8K</option>
-                    <option value="16384">16K</option>
-                    <option value="32768">32K</option>
-                    <option value="65536">64K</option>
-                    <option value="131072">128K</option>
-                  </select>
-                </label>
-                <label>
-                  <span>Reasoning</span>
-                  <select value={settings.reasoningEffort} onChange={(event) => setSettings({ ...settings, reasoningEffort: event.currentTarget.value })}>
-                    <option value="low">Low</option>
-                    <option value="medium">Medium</option>
-                    <option value="high">High</option>
-                  </select>
-                </label>
+                <ChatSettingSelect
+                  label="Context Window"
+                  value={settings.nCtx}
+                  options={contextWindowOptions(false)}
+                  onChange={(value) => setSettings({ ...settings, nCtx: value })}
+                />
+                <ChatSettingSelect
+                  label="Reasoning"
+                  value={settings.reasoningEffort}
+                  options={reasoningOptions(["low", "medium", "high"])}
+                  onChange={(value) => setSettings({ ...settings, reasoningEffort: value })}
+                />
                 <label>
                   <span>Max Tokens</span>
                   <input value={settings.maxTokens} onChange={(event) => setSettings({ ...settings, maxTokens: event.currentTarget.value })} />
@@ -5662,38 +5901,32 @@ function ChatDialog({
                 <span>Title</span>
                 <input name="thread-title" value={title || thread?.title || ""} onChange={(event) => setTitle(event.currentTarget.value)} />
               </label>
-              <label>
-                <span>Runtime</span>
-                <select
-                  value={threadProviderMode}
-                  aria-label="Thread runtime"
-                  onChange={(event) => setThreadProviderMode(event.currentTarget.value as ChatProviderMode)}
-                >
-                  <option value="builtin">Built-in model</option>
-                  <option value="codex">Codex agent</option>
-                </select>
-              </label>
+              <ChatSettingSelect
+                label="Runtime"
+                ariaLabel="Thread runtime"
+                value={threadProviderMode}
+                options={[{ value: "builtin", label: "Built-in model" }, { value: "codex", label: "Codex agent" }]}
+                onChange={(value) => setThreadProviderMode(value as ChatProviderMode)}
+              />
             </section>
             {threadProviderMode === "codex" ? (
             <section className="chat-settings-section">
               <h3>Codex Agent</h3>
               <div className="chat-settings-row">
-                <label>
-                  <span>Model</span>
-                  <select value={threadCodexModelId} aria-label="Thread Codex model" onChange={(event) => setThreadCodexModelId(event.currentTarget.value)}>
-                    {state.codexModels.map((model) => (
-                      <option key={model.id} value={model.id}>{model.label}  [{model.isDefault ? "Default" : "Codex"}]</option>
-                    ))}
-                  </select>
-                </label>
-                <label>
-                  <span>Reasoning</span>
-                  <select value={threadCodexReasoningEffort} aria-label="Thread Codex reasoning" onChange={(event) => setThreadCodexReasoningEffort(event.currentTarget.value as ChatReasoningEffort)}>
-                    {(state.codexModels.find((model) => model.id === threadCodexModelId)?.reasoningEfforts ?? ["low", "medium", "high"]).map((effort) => (
-                      <option key={effort} value={effort}>{reasoningLabel(effort)}</option>
-                    ))}
-                  </select>
-                </label>
+                <ChatSettingSelect
+                  label="Model"
+                  ariaLabel="Thread Codex model"
+                  value={threadCodexModelId}
+                  options={state.codexModels.map((model) => ({ value: model.id, label: `${model.label}  [${model.isDefault ? "Default" : "Codex"}]` }))}
+                  onChange={setThreadCodexModelId}
+                />
+                <ChatSettingSelect
+                  label="Reasoning"
+                  ariaLabel="Thread Codex reasoning"
+                  value={threadCodexReasoningEffort}
+                  options={reasoningOptions(state.codexModels.find((model) => model.id === threadCodexModelId)?.reasoningEfforts ?? ["low", "medium", "high"])}
+                  onChange={(value) => setThreadCodexReasoningEffort(value as ChatReasoningEffort)}
+                />
               </div>
               <div className="chat-settings-row">
                 <label>
@@ -5702,22 +5935,17 @@ function ChatDialog({
                 </label>
               </div>
               <div className="chat-settings-row">
-                <label>
-                  <span>Access</span>
-                  <select
-                    value={codexAccessModeForApprovalMode(threadCodexApprovalMode)}
-                    aria-label="Thread Codex access"
-                    onChange={(event) => {
-                      const nextAccess = event.currentTarget.value as ChatPermissionMode;
-                      setThreadPermissionMode(nextAccess);
-                      setThreadCodexApprovalMode(codexApprovalModeForAccessMode(nextAccess));
-                    }}
-                  >
-                    {CHAT_PERMISSION_OPTIONS.map((option) => (
-                      <option key={option.id} value={option.id}>{option.label}</option>
-                    ))}
-                  </select>
-                </label>
+                <ChatSettingSelect
+                  label="Access"
+                  ariaLabel="Thread Codex access"
+                  value={codexAccessModeForApprovalMode(threadCodexApprovalMode)}
+                  options={CHAT_PERMISSION_OPTIONS.map((option) => ({ value: option.id, label: option.label }))}
+                  onChange={(value) => {
+                    const nextAccess = value as ChatPermissionMode;
+                    setThreadPermissionMode(nextAccess);
+                    setThreadCodexApprovalMode(codexApprovalModeForAccessMode(nextAccess));
+                  }}
+                />
                 <label className="chat-settings-check">
                   <input type="checkbox" checked={threadPlanModeEnabled} onChange={(event) => setThreadPlanModeEnabled(event.currentTarget.checked)} />
                   <span>Plan mode</span>
@@ -5727,62 +5955,59 @@ function ChatDialog({
             ) : (
             <section className="chat-settings-section">
               <h3>Runtime Settings</h3>
-              <label>
-                <span>Model</span>
-                <select value={threadBuiltinModelId} aria-label="Thread built-in model" onChange={(event) => setThreadBuiltinModelId(event.currentTarget.value)}>
-                  {state.models.length === 0 ? <option value="">No built-in model available</option> : null}
-                  {state.models.map((model) => (
-                    <option key={model.id} value={model.id}>{model.label}  [Local GGUF]</option>
-                  ))}
-                </select>
-              </label>
+              <ChatSettingSelect
+                label="Model"
+                ariaLabel="Thread built-in model"
+                value={threadBuiltinModelId}
+                options={state.models.length === 0
+                  ? [{ value: "", label: "No built-in model available", disabled: true }]
+                  : state.models.map((model) => ({ value: model.id, label: `${model.label}  [Local GGUF]` }))}
+                onChange={setThreadBuiltinModelId}
+              />
               <div className="chat-settings-row">
-                <label>
-                  <span>Agentic framework</span>
-                  <select value={presetBuiltinFramework} aria-label="Thread agentic framework" onChange={(event) => setPresetBuiltinFramework(event.currentTarget.value as "chat" | "document_analysis")}>
-                    <option value="chat">Chat</option>
-                    <option value="document_analysis">Document analysis</option>
-                  </select>
-                </label>
-                <label>
-                  <span>Context Window</span>
-                  <select value={settings.nCtx} aria-label="Thread context window" onChange={(event) => setSettings({ ...settings, nCtx: event.currentTarget.value })}>
-                    <option value="32768">Default</option>
-                    <option value="4096">4K</option>
-                    <option value="8192">8K</option>
-                    <option value="16384">16K</option>
-                    <option value="32768">32K</option>
-                    <option value="65536">64K</option>
-                    <option value="131072">128K</option>
-                  </select>
-                </label>
-                <label>
-                  <span>GPU Layers</span>
-                  <select value={settings.nGpuLayers} aria-label="Thread GPU layers" onChange={(event) => setSettings({ ...settings, nGpuLayers: event.currentTarget.value })}>
-                    <option value="-1">Auto</option>
-                    <option value="0">CPU only</option>
-                    <option value="20">20 layers</option>
-                    <option value="40">40 layers</option>
-                    <option value="80">80 layers</option>
-                  </select>
-                </label>
+                <ChatSettingSelect
+                  label="Agentic framework"
+                  ariaLabel="Thread agentic framework"
+                  value={presetBuiltinFramework}
+                  options={[{ value: "chat", label: "Chat" }, { value: "document_analysis", label: "Document analysis" }]}
+                  onChange={(value) => setPresetBuiltinFramework(value as "chat" | "document_analysis")}
+                />
+                <ChatSettingSelect
+                  label="Context Window"
+                  ariaLabel="Thread context window"
+                  value={settings.nCtx}
+                  options={contextWindowOptions(true)}
+                  onChange={(value) => setSettings({ ...settings, nCtx: value })}
+                />
+                <ChatSettingSelect
+                  label="GPU Layers"
+                  ariaLabel="Thread GPU layers"
+                  value={settings.nGpuLayers}
+                  options={[
+                    { value: "-1", label: "Auto" },
+                    { value: "0", label: "CPU only" },
+                    { value: "20", label: "20 layers" },
+                    { value: "40", label: "40 layers" },
+                    { value: "80", label: "80 layers" }
+                  ]}
+                  onChange={(value) => setSettings({ ...settings, nGpuLayers: value })}
+                />
               </div>
               <div className="chat-settings-row">
-                <label>
-                  <span>Reasoning</span>
-                  <select value={settings.reasoningEffort} aria-label="Thread reasoning" onChange={(event) => setSettings({ ...settings, reasoningEffort: event.currentTarget.value })}>
-                    <option value="low">Low</option>
-                    <option value="medium">Medium</option>
-                    <option value="high">High</option>
-                  </select>
-                </label>
-                <label>
-                  <span>Access</span>
-                  <select value={settings.permissionMode} aria-label="Thread permissions" onChange={(event) => setSettings({ ...settings, permissionMode: event.currentTarget.value })}>
-                    <option value="default_permissions">Default</option>
-                    <option value="full_access">Full access</option>
-                  </select>
-                </label>
+                <ChatSettingSelect
+                  label="Reasoning"
+                  ariaLabel="Thread reasoning"
+                  value={settings.reasoningEffort}
+                  options={reasoningOptions(["low", "medium", "high"])}
+                  onChange={(value) => setSettings({ ...settings, reasoningEffort: value })}
+                />
+                <ChatSettingSelect
+                  label="Access"
+                  ariaLabel="Thread permissions"
+                  value={settings.permissionMode}
+                  options={[{ value: "default_permissions", label: "Default" }, { value: "full_access", label: "Full access" }]}
+                  onChange={(value) => setSettings({ ...settings, permissionMode: value })}
+                />
               </div>
               <div className="chat-settings-row">
                 <label>
@@ -6385,25 +6610,51 @@ function formatContextLabel(tokens: number) {
   return String(tokens);
 }
 
-function contextUsagePercent(state: ChatState) {
+function contextUsagePercent(state: ChatState, nCtx: number) {
   const selectedMessages = state.messages.filter((message) => message.threadId === state.selectedThreadId);
   const usedCharacters = selectedMessages.reduce((total, message) => total + message.content.length + (message.reasoning?.length ?? 0), 0);
   const approximateTokens = Math.ceil(usedCharacters / 4);
-  return Math.max(0, Math.min(100, Math.round((approximateTokens / Math.max(1, state.runtimeSettings.nCtx)) * 100)));
+  return Math.max(0, Math.min(100, Math.round((approximateTokens / Math.max(1, nCtx)) * 100)));
 }
 
-function rateLimitIndicatorLabel(state: ChatState, slot: "primary" | "secondary") {
-  if (state.codexAccount.status === "error") {
-    return "Error";
+type CodexLimitWindowView = {
+  id: "weekly" | "five_hour";
+  label: "Weekly" | "5h";
+  leftPercent: number | null;
+  usedPercent: number | null;
+};
+
+function codexLimitWindows(state: ChatState): CodexLimitWindowView[] {
+  const windows = state.codexAccount.status === "ready" && state.codexAccount.rateLimits
+    ? [state.codexAccount.rateLimits.primary, state.codexAccount.rateLimits.secondary].filter((window): window is NonNullable<typeof window> => Boolean(window))
+    : [];
+  const weekly = windows.find((window) => window.windowDurationMins === 10080);
+  const fiveHour = windows.find((window) => window.windowDurationMins === 300);
+  return [
+    rateLimitWindowView("weekly", "Weekly", weekly),
+    rateLimitWindowView("five_hour", "5h", fiveHour)
+  ];
+}
+
+function rateLimitWindowView(id: CodexLimitWindowView["id"], label: CodexLimitWindowView["label"], window: ChatCodexRateLimitWindow | undefined): CodexLimitWindowView {
+  const usedPercent = rateLimitWindowUsedPercent(window);
+  return {
+    id,
+    label,
+    usedPercent,
+    leftPercent: usedPercent === null ? null : 100 - usedPercent
+  };
+}
+
+function rateLimitWindowUsedPercent(window: ChatCodexRateLimitWindow | undefined): number | null {
+  return window ? Math.max(0, Math.min(100, Math.round(window.usedPercent))) : null;
+}
+
+function rateLimitTitle(window: CodexLimitWindowView) {
+  if (window.leftPercent === null || window.usedPercent === null) {
+    return `${window.label} limit unavailable`;
   }
-  if (state.codexAccount.status !== "ready") {
-    return slot === "primary" ? "Week" : "5h";
-  }
-  const window = state.codexAccount.rateLimits?.[slot];
-  if (!window) {
-    return slot === "primary" ? "Week" : "5h";
-  }
-  return `${Math.round(window.usedPercent)}%`;
+  return `${window.label} limit: ${window.leftPercent}% left, ${window.usedPercent}% used`;
 }
 
 function runtimeSettingsToForm(settings: ChatRuntimeSettings): Record<keyof ChatRuntimeSettings, string> {

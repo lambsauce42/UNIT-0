@@ -33,6 +33,40 @@ class ScriptedLlamaRuntime extends LocalLlamaRuntime {
   }
 }
 
+class FlakyAccountCodexRuntime extends MockCodexRuntime {
+  private attempts = 0;
+
+  override async readAccount(force?: boolean): ReturnType<MockCodexRuntime["readAccount"]> {
+    this.attempts += 1;
+    if (this.attempts === 1) {
+      throw new Error("temporary Codex startup failure");
+    }
+    return super.readAccount(force);
+  }
+}
+
+test("Codex account refresh recovers without surfacing a chat generation error", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-codex-account-test-"));
+  const store = new ChatStore(path.join(dir, "chat.sqlite"));
+  const service = new ChatService(store, new LocalLlamaRuntime(), new RemoteHostRuntime(), new FlakyAccountCodexRuntime(), () => undefined);
+  try {
+    const failed = await service.refreshCodexAccount();
+    expect(failed.codexAccount.status).toBe("error");
+    expect(failed.generation.status).toBe("idle");
+
+    const recovered = await service.refreshCodexAccount();
+    expect(recovered.codexAccount.status).toBe("ready");
+    if (recovered.codexAccount.status === "ready") {
+      expect(recovered.codexAccount.rateLimits?.primary?.usedPercent).toBe(12);
+      expect(recovered.codexAccount.rateLimits?.secondary?.usedPercent).toBe(34);
+    }
+    expect(recovered.generation.status).toBe("idle");
+  } finally {
+    service.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("blocks switching a local-history thread to Codex", () => {
   const { service, store, cleanup } = makeService();
   try {

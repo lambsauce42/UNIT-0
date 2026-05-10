@@ -76,6 +76,10 @@ async function layoutRatio(page: Page, workspaceId: string, splitId: string): Pr
   );
 }
 
+function expectPixelAligned(actual: number, expected: number, tolerance = 1): void {
+  expect(Math.abs(actual - expected)).toBeLessThanOrEqual(tolerance);
+}
+
 async function closeTabByTestId(page: Page, testId: string): Promise<void> {
   const tab = page.getByTestId(testId);
   const box = await tab.boundingBox();
@@ -129,6 +133,110 @@ test("renders the initial applet surfaces", async () => {
   const kinds = atlas!.applets.map((applet) => state.appletSessions[applet.sessionId]?.kind);
   expect(kinds).toEqual(expect.arrayContaining(["terminal", "fileViewer", "browser", "chat", "sandbox"]));
   await expect(page.getByTestId("chat-surface")).toBeVisible();
+
+  await app.close();
+});
+
+test("chat sidebar and dropup controls align to rendered trigger bounds", async () => {
+  const app = await launchApp();
+  const page = await firstWindow(app);
+  await expect(page.getByTestId("chat-surface")).toBeVisible();
+
+  const sidebarMetrics = await page.evaluate(() => {
+    const rect = (selector: string) => {
+      const element = document.querySelector(selector);
+      if (!element) {
+        throw new Error(`Missing selector: ${selector}`);
+      }
+      const bounds = element.getBoundingClientRect();
+      return {
+        left: bounds.left,
+        top: bounds.top,
+        right: bounds.right,
+        bottom: bounds.bottom,
+        width: bounds.width,
+        height: bounds.height
+      };
+    };
+    const centerX = (selector: string) => {
+      const bounds = rect(selector);
+      return bounds.left + bounds.width / 2;
+    };
+    const visibleSvgCenterX = (selector: string) => {
+      const svg = document.querySelector(selector);
+      if (!(svg instanceof SVGGraphicsElement)) {
+        throw new Error(`Missing SVG selector: ${selector}`);
+      }
+      const matrix = svg.getScreenCTM();
+      if (!matrix) {
+        throw new Error(`Missing SVG matrix: ${selector}`);
+      }
+      const shapeBounds = Array.from(svg.querySelectorAll<SVGGraphicsElement>("path, line, polyline, circle, rect")).map((shape) => {
+        const box = shape.getBBox();
+        const points = [
+          new DOMPoint(box.x, box.y).matrixTransform(matrix),
+          new DOMPoint(box.x + box.width, box.y).matrixTransform(matrix),
+          new DOMPoint(box.x, box.y + box.height).matrixTransform(matrix),
+          new DOMPoint(box.x + box.width, box.y + box.height).matrixTransform(matrix)
+        ];
+        return {
+          left: Math.min(...points.map((point) => point.x)),
+          right: Math.max(...points.map((point) => point.x))
+        };
+      });
+      return (Math.min(...shapeBounds.map((bounds) => bounds.left)) + Math.max(...shapeBounds.map((bounds) => bounds.right))) / 2;
+    };
+    const threadsLabel = document.querySelector("[data-testid='chat-section-threads-label']");
+    if (!threadsLabel) {
+      throw new Error("Missing Threads label");
+    }
+    const threadsStyle = window.getComputedStyle(threadsLabel);
+    return {
+      newThreadLabel: rect("[data-testid='chat-new-thread-label']"),
+      firstProjectLabel: rect(".chat-project-title"),
+      settingsLabel: rect("[data-testid='chat-settings-label']"),
+      newThreadIconCenterX: centerX("[data-testid='chat-new-thread-icon']"),
+      projectCaretCenterX: centerX(".chat-project-toggle [data-testid^='chat-project-caret-']"),
+      settingsIconCenterX: centerX("[data-testid='chat-settings-icon']"),
+      newThreadSvgCenterX: centerX("[data-testid='chat-new-thread-icon'] svg"),
+      projectCaretSvgCenterX: centerX(".chat-project-toggle [data-testid^='chat-project-caret-'] svg"),
+      settingsSvgCenterX: centerX("[data-testid='chat-settings-icon'] svg"),
+      newThreadVisibleCenterX: visibleSvgCenterX("[data-testid='chat-new-thread-icon'] svg"),
+      projectCaretVisibleCenterX: visibleSvgCenterX(".chat-project-toggle [data-testid^='chat-project-caret-'] svg"),
+      settingsVisibleCenterX: visibleSvgCenterX("[data-testid='chat-settings-icon'] svg"),
+      newThreadButton: rect(".chat-new-thread-button"),
+      threadsLabel: rect("[data-testid='chat-section-threads-label']"),
+      firstProject: rect(".chat-project-card"),
+      threadsFontSize: threadsStyle.fontSize,
+      threadsColor: threadsStyle.color
+    };
+  });
+
+  expectPixelAligned(sidebarMetrics.firstProjectLabel.left, sidebarMetrics.newThreadLabel.left);
+  expectPixelAligned(sidebarMetrics.settingsLabel.left, sidebarMetrics.newThreadLabel.left);
+  expectPixelAligned(sidebarMetrics.projectCaretCenterX, sidebarMetrics.newThreadIconCenterX);
+  expectPixelAligned(sidebarMetrics.settingsIconCenterX, sidebarMetrics.newThreadIconCenterX);
+  expectPixelAligned(sidebarMetrics.newThreadSvgCenterX, sidebarMetrics.newThreadIconCenterX);
+  expectPixelAligned(sidebarMetrics.projectCaretSvgCenterX, sidebarMetrics.newThreadIconCenterX);
+  expectPixelAligned(sidebarMetrics.settingsSvgCenterX, sidebarMetrics.newThreadIconCenterX);
+  expectPixelAligned(sidebarMetrics.newThreadVisibleCenterX, sidebarMetrics.newThreadIconCenterX);
+  expectPixelAligned(sidebarMetrics.projectCaretVisibleCenterX, sidebarMetrics.newThreadIconCenterX);
+  expectPixelAligned(sidebarMetrics.settingsVisibleCenterX, sidebarMetrics.newThreadIconCenterX);
+  expect(sidebarMetrics.threadsFontSize).toBe("14px");
+  expect(sidebarMetrics.threadsColor).toBe("rgb(143, 154, 166)");
+  expect(sidebarMetrics.threadsLabel.top - sidebarMetrics.newThreadButton.bottom).toBeGreaterThanOrEqual(12);
+  expect(sidebarMetrics.firstProject.top - sidebarMetrics.threadsLabel.bottom).toBeLessThanOrEqual(10);
+
+  const trigger = page.locator(".chat-composer-control-row .chat-ghost-button").first();
+  const triggerBox = await trigger.boundingBox();
+  expect(triggerBox).not.toBeNull();
+  await trigger.click();
+  const dropup = page.locator(".chat-dropup");
+  await expect(dropup).toBeVisible();
+  const dropupBox = await dropup.boundingBox();
+  expect(dropupBox).not.toBeNull();
+  expectPixelAligned(dropupBox!.x + dropupBox!.width, triggerBox!.x + triggerBox!.width);
+  expectPixelAligned(dropupBox!.y + dropupBox!.height, triggerBox!.y - 8, 1.5);
 
   await app.close();
 });
@@ -194,6 +302,19 @@ test("chat project actions and composer menus are backed by persistent state", a
   expect(state.runtimeSettings.reasoningEffort).toBe("high");
 
   await page.getByLabel("Model settings").click();
+  const settingsDropup = page.locator(".chat-dropup");
+  await expect(settingsDropup).toBeVisible();
+  const hoveredDropupButton = settingsDropup.locator("button:not([disabled])").first();
+  await hoveredDropupButton.hover();
+  const dropupButtonStyle = await hoveredDropupButton.evaluate((element) => {
+    const style = window.getComputedStyle(element);
+    return {
+      backgroundColor: style.backgroundColor,
+      borderWidth: style.borderWidth
+    };
+  });
+  expect(dropupButtonStyle.backgroundColor).toBe("rgb(31, 45, 72)");
+  expect(dropupButtonStyle.borderWidth).toBe("0px");
   await page.getByRole("menuitem", { name: "New preset..." }).click();
   const presetDialog = page.getByRole("dialog", { name: "Settings preset" });
   await expect(presetDialog).toBeVisible();
@@ -201,6 +322,70 @@ test("chat project actions and composer menus are backed by persistent state", a
   await presetDialog.getByRole("button", { name: "Save" }).click();
   state = await page.evaluate(() => window.unitApi.chat.bootstrap());
   expect(state.settingsPresets.some((preset) => preset.label === "Parity Preset")).toBe(true);
+
+  await page.getByLabel("Model settings").click();
+  const editPresetButton = page.getByLabel("Edit Parity Preset");
+  await expect(editPresetButton).toBeVisible();
+  await editPresetButton.hover();
+  const inlineButtonStyle = await editPresetButton.evaluate((element) => {
+    const style = window.getComputedStyle(element);
+    return {
+      backgroundColor: style.backgroundColor,
+      borderWidth: style.borderWidth
+    };
+  });
+  expect(inlineButtonStyle.backgroundColor).toBe("rgb(43, 58, 86)");
+  expect(inlineButtonStyle.borderWidth).toBe("0px");
+
+  await app.close();
+});
+
+test("chat settings dialogs fit inside applets and use app-styled dropdowns", async () => {
+  const app = await launchApp();
+  const page = await firstWindow(app);
+  await expect(page.getByTestId("chat-surface")).toBeVisible();
+
+  await page.getByTestId("chat-surface").getByRole("button", { name: "Settings", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: "App settings" });
+  await expect(dialog).toBeVisible();
+
+  const bounds = await page.evaluate(() => {
+    const rect = (selector: string) => {
+      const element = document.querySelector(selector);
+      if (!element) {
+        throw new Error(`Missing selector: ${selector}`);
+      }
+      const box = element.getBoundingClientRect();
+      return { left: box.left, top: box.top, right: box.right, bottom: box.bottom, width: box.width, height: box.height };
+    };
+    return {
+      backdrop: rect(".chat-dialog-backdrop"),
+      dialog: rect(".chat-settings-dialog")
+    };
+  });
+  expect(bounds.dialog.left).toBeGreaterThanOrEqual(bounds.backdrop.left);
+  expect(bounds.dialog.top).toBeGreaterThanOrEqual(bounds.backdrop.top);
+  expect(bounds.dialog.right).toBeLessThanOrEqual(bounds.backdrop.right);
+  expect(bounds.dialog.bottom).toBeLessThanOrEqual(bounds.backdrop.bottom);
+
+  await page.getByRole("button", { name: "Document indexing" }).click();
+  const menu = page.locator(".chat-setting-select-menu");
+  await expect(menu).toBeVisible();
+  const menuStyle = await menu.evaluate((element) => {
+    const style = window.getComputedStyle(element);
+    const selected = element.querySelector("[aria-selected='true']");
+    const selectedStyle = selected ? window.getComputedStyle(selected) : null;
+    return {
+      backgroundColor: style.backgroundColor,
+      borderColor: style.borderColor,
+      selectedBackgroundColor: selectedStyle?.backgroundColor,
+      selectedBorderWidth: selectedStyle?.borderWidth
+    };
+  });
+  expect(menuStyle.backgroundColor).toBe("rgb(17, 24, 33)");
+  expect(menuStyle.borderColor).toBe("rgb(52, 66, 84)");
+  expect(menuStyle.selectedBackgroundColor).toBe("rgb(31, 45, 72)");
+  expect(menuStyle.selectedBorderWidth).toBe("0px");
 
   await app.close();
 });
@@ -242,6 +427,33 @@ test("chat Codex mode uses mocked events and provider-aware menus", async () => 
   const assistant = state.messages.find((message) => message.role === "assistant");
   expect(assistant?.sourceLabel).toBe("Codex");
   expect(assistant?.timelineBlocks?.some((block) => block.kind === "tool")).toBe(true);
+
+  await app.close();
+});
+
+test("chat sidebar renders Codex limit usage and remaining hover text", async () => {
+  const app = await launchApp();
+  const page = await firstWindow(app);
+  await expect(page.getByTestId("chat-surface")).toBeVisible();
+
+  await expect(page.locator(".chat-sidebar-limit-row")).toHaveCount(2);
+  const rows = await page.locator(".chat-sidebar-limit-row").evaluateAll((elements) => elements.map((row) => {
+    const fill = row.querySelector<HTMLElement>(".chat-sidebar-limit-fill");
+    return {
+      label: row.querySelector(".chat-sidebar-limit-label")?.textContent?.trim(),
+      title: row.getAttribute("title"),
+      ariaLabel: row.getAttribute("aria-label"),
+      fillWidth: fill?.style.width,
+      backgroundSize: fill?.style.backgroundSize
+    };
+  }));
+
+  expect(rows.map(({ backgroundSize: _backgroundSize, ...row }) => row)).toEqual([
+    { label: "Weekly:", title: "Weekly limit: 88% left, 12% used", ariaLabel: "Weekly limit: 88% left, 12% used", fillWidth: "88%" },
+    { label: "5h:", title: "5h limit: 66% left, 34% used", ariaLabel: "5h limit: 66% left, 34% used", fillWidth: "66%" }
+  ]);
+  expect(parseFloat(rows[0].backgroundSize ?? "")).toBeCloseTo(10000 / 88, 3);
+  expect(parseFloat(rows[1].backgroundSize ?? "")).toBeCloseTo(10000 / 66, 3);
 
   await app.close();
 });

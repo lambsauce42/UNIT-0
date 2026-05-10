@@ -1,4 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import readline from "node:readline";
 import type { ChatCodexAccountState, ChatCodexApprovalMode, ChatCodexModel, ChatCodexRateLimits, ChatReasoningEffort, ChatTimelineBlock } from "../shared/types.js";
 
@@ -202,35 +205,51 @@ type JsonRpcMessage = {
 
 class AsyncMessageQueue<T> {
   private values: T[] = [];
-  private waiters: Array<(value: T) => void> = [];
+  private waiters: Array<{ resolve: (value: T) => void; reject: (error: Error) => void; timer: NodeJS.Timeout }> = [];
+  private failure: Error | null = null;
 
   push(value: T): void {
+    if (this.failure) {
+      return;
+    }
     const waiter = this.waiters.shift();
     if (waiter) {
-      waiter(value);
+      clearTimeout(waiter.timer);
+      waiter.resolve(value);
       return;
     }
     this.values.push(value);
   }
 
   shift(timeoutMs = 60000): Promise<T> {
+    if (this.failure) {
+      return Promise.reject(this.failure);
+    }
     const value = this.values.shift();
     if (value) {
       return Promise.resolve(value);
     }
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
-        const index = this.waiters.indexOf(resolve);
+        const index = this.waiters.findIndex((waiter) => waiter.resolve === resolve);
         if (index >= 0) {
           this.waiters.splice(index, 1);
         }
         reject(new Error("Timed out waiting for Codex app-server events."));
       }, timeoutMs);
-      this.waiters.push((nextValue) => {
-        clearTimeout(timer);
-        resolve(nextValue);
-      });
+      this.waiters.push({ resolve, reject, timer });
     });
+  }
+
+  fail(error: Error): void {
+    if (this.failure) {
+      return;
+    }
+    this.failure = error;
+    for (const waiter of this.waiters.splice(0)) {
+      clearTimeout(waiter.timer);
+      waiter.reject(error);
+    }
   }
 }
 
@@ -241,10 +260,19 @@ class JsonRpcAppServerConnection {
   private nextRequestId = 1;
   private stderr = "";
 
-  constructor(command = "codex") {
+  constructor(command = resolveCodexCommand()) {
     this.child = spawn(command, ["app-server"], {
       env: process.env,
       windowsHide: true
+    });
+    this.child.once("error", (error) => {
+      const startupError = new Error(`Codex app-server failed to start (${command}): ${error.message}`);
+      for (const pending of this.responses.values()) {
+        clearTimeout(pending.timer);
+        pending.reject(startupError);
+      }
+      this.responses.clear();
+      this.notifications.fail(startupError);
     });
     this.child.stderr.on("data", (chunk: Buffer) => {
       this.stderr += chunk.toString("utf8");
@@ -258,12 +286,13 @@ class JsonRpcAppServerConnection {
         pending.reject(new Error(message));
       }
       this.responses.clear();
+      this.notifications.fail(new Error(message));
     });
   }
 
-  request(method: string, params: Record<string, unknown>, timeoutMs = 15000): Promise<Record<string, unknown>> {
+  request(method: string, params?: Record<string, unknown>, timeoutMs = 15000): Promise<Record<string, unknown>> {
     const id = this.nextRequestId++;
-    const payload = { jsonrpc: "2.0", id, method, params };
+    const payload = params === undefined ? { jsonrpc: "2.0", id, method } : { jsonrpc: "2.0", id, method, params };
     const response = new Promise<JsonRpcMessage>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.responses.delete(String(id));
@@ -294,6 +323,9 @@ class JsonRpcAppServerConnection {
   }
 
   private write(payload: Record<string, unknown>): void {
+    if (!this.child.stdin.writable) {
+      throw new Error("Codex app-server stdin is not writable.");
+    }
     this.child.stdin.write(`${JSON.stringify(payload)}\n`);
   }
 
@@ -376,17 +408,27 @@ export class CodexAppServerRuntime implements CodexRuntime {
   }
 
   async readAccount(force = false): Promise<{ account: ChatCodexAccountState; models: ChatCodexModel[] }> {
-    const connection = this.ensureConnection();
-    await this.ensureInitialized(connection);
-    const [accountResponse, rateLimitResponse, modelResponse] = await Promise.all([
-      connection.request("account/read", { refreshToken: force }),
-      connection.request("account/rateLimits/read", {}),
-      connection.request("model/list", { includeHidden: false })
-    ]);
-    return {
-      account: codexAccountFromResponses(accountResponse, rateLimitResponse),
-      models: codexModelsFromResponse(modelResponse)
-    };
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        const connection = this.ensureConnection();
+        await this.ensureInitialized(connection);
+        const [accountResponse, rateLimitResponse, modelResponse] = await Promise.all([
+          connection.request("account/read", { refreshToken: force }),
+          connection.request("account/rateLimits/read"),
+          connection.request("model/list", { includeHidden: false })
+        ]);
+        return {
+          account: codexAccountFromResponses(accountResponse, rateLimitResponse),
+          models: codexModelsFromResponse(modelResponse)
+        };
+      } catch (error) {
+        this.close();
+        if (attempt === 1) {
+          throw error;
+        }
+      }
+    }
+    throw new Error("Codex account read failed.");
   }
 
   async steerCurrentTurn(options: { text: string; imagePaths?: string[] }): Promise<void> {
@@ -457,10 +499,15 @@ export class CodexAppServerRuntime implements CodexRuntime {
     if (this.initialized) {
       return;
     }
-    await connection.request("initialize", {
-      clientInfo: { name: "UNIT-0", version: "0.0.0" }
-    });
-    this.initialized = true;
+    try {
+      await connection.request("initialize", {
+        clientInfo: { name: "UNIT-0", version: "0.0.0" }
+      }, 60000);
+      this.initialized = true;
+    } catch (error) {
+      this.close();
+      throw error;
+    }
   }
 
   private async startThread(connection: JsonRpcAppServerConnection, options: CodexRunOptions): Promise<string> {
@@ -851,7 +898,7 @@ function codexAccountFromResponses(accountResponse: Record<string, unknown>, rat
   if (!account) {
     return requiresOpenaiAuth
       ? { status: "error", error: "Codex requires OpenAI authentication." }
-      : { status: "ready", authMode: null, email: "", planType: null, requiresOpenaiAuth, rateLimits: parseRateLimits(rateLimitResponse.rateLimits) };
+      : { status: "ready", authMode: null, email: "", planType: null, requiresOpenaiAuth, rateLimits: codexRateLimitsFromResponse(rateLimitResponse) };
   }
   return {
     status: "ready",
@@ -859,27 +906,40 @@ function codexAccountFromResponses(accountResponse: Record<string, unknown>, rat
     email: String(account.email ?? ""),
     planType: typeof account.planType === "string" ? account.planType : typeof accountResponse.planType === "string" ? accountResponse.planType : null,
     requiresOpenaiAuth,
-    rateLimits: parseRateLimits(rateLimitResponse.rateLimits)
+    rateLimits: codexRateLimitsFromResponse(rateLimitResponse)
   };
 }
 
 function codexModelsFromResponse(modelResponse: Record<string, unknown>): ChatCodexModel[] {
-  const rawModels = Array.isArray(modelResponse.models) ? modelResponse.models : Array.isArray(modelResponse.availableModels) ? modelResponse.availableModels : [];
+  const rawModels = Array.isArray(modelResponse.models)
+    ? modelResponse.models
+    : Array.isArray(modelResponse.availableModels)
+      ? modelResponse.availableModels
+      : Array.isArray(modelResponse.data)
+        ? modelResponse.data
+        : [];
   const models = rawModels
     .filter(isRecord)
     .map((model, index) => {
       const id = String(model.id ?? model.model ?? model.name ?? "").trim();
-      const label = String(model.name ?? model.label ?? model.displayName ?? id).trim();
-      const rawEfforts = Array.isArray(model.reasoningEfforts) ? model.reasoningEfforts : Array.isArray(model.reasoning_efforts) ? model.reasoning_efforts : [];
+      const label = String(model.displayName ?? model.name ?? model.label ?? id).trim();
+      const rawEfforts = Array.isArray(model.reasoningEfforts)
+        ? model.reasoningEfforts
+        : Array.isArray(model.reasoning_efforts)
+          ? model.reasoning_efforts
+          : Array.isArray(model.supportedReasoningEfforts)
+            ? model.supportedReasoningEfforts
+            : [];
       const reasoningEfforts = rawEfforts
-        .map((effort) => String(effort).toLowerCase())
+        .map((effort) => isRecord(effort) ? String(effort.reasoningEffort ?? effort.id ?? effort.value ?? "").toLowerCase() : String(effort).toLowerCase())
         .filter((effort): effort is ChatReasoningEffort => effort === "low" || effort === "medium" || effort === "high" || effort === "xhigh");
+      const inputModalities = Array.isArray(model.inputModalities) ? model.inputModalities.map((value) => String(value)) : [];
       return id ? {
         id,
         label: label || id,
         isDefault: Boolean(model.isDefault ?? model.default ?? index === 0),
         reasoningEfforts: reasoningEfforts.length ? reasoningEfforts : ["low", "medium", "high"],
-        supportsImageInput: model.supportsImageInput !== false
+        supportsImageInput: inputModalities.length > 0 ? inputModalities.includes("image") : model.supportsImageInput !== false
       } : null;
     })
     .filter((model): model is ChatCodexModel => Boolean(model));
@@ -887,6 +947,22 @@ function codexModelsFromResponse(modelResponse: Record<string, unknown>): ChatCo
     models[0] = { ...models[0], isDefault: true };
   }
   return models;
+}
+
+export function codexRateLimitsFromResponse(rateLimitResponse: Record<string, unknown>): ChatCodexRateLimits | null {
+  const byLimitId = isRecord(rateLimitResponse.rateLimitsByLimitId) ? rateLimitResponse.rateLimitsByLimitId : null;
+  if (byLimitId && isRecord(byLimitId.codex)) {
+    return parseRateLimits(byLimitId.codex);
+  }
+  const singleBucket = isRecord(rateLimitResponse.rateLimits) ? rateLimitResponse.rateLimits : null;
+  if (!singleBucket) {
+    return null;
+  }
+  const limitId = singleBucket.limitId;
+  if (limitId !== undefined && limitId !== null && String(limitId) !== "codex") {
+    return null;
+  }
+  return parseRateLimits(singleBucket);
 }
 
 function parseRateLimits(value: unknown): ChatCodexRateLimits | null {
@@ -912,6 +988,62 @@ function parseRateLimitWindow(value: unknown): ChatCodexRateLimits["primary"] {
     windowDurationMins: Number.isFinite(windowDurationMins) ? windowDurationMins : 0,
     resetsAt: Number.isFinite(resetsAt) ? resetsAt : 0
   };
+}
+
+function resolveCodexCommand(): string {
+  const explicitPath = process.env.CODEX_CLI_PATH?.trim();
+  if (explicitPath) {
+    const resolved = path.resolve(explicitPath);
+    if (isExecutableFile(resolved)) {
+      return resolved;
+    }
+    throw new Error(`CODEX_CLI_PATH does not point to an executable Codex CLI: ${resolved}`);
+  }
+
+  const candidates = process.platform === "win32"
+    ? [
+        path.join(os.homedir(), "AppData", "Local", "OpenAI", "Codex", "bin", "codex.exe"),
+        path.join(os.homedir(), "AppData", "Roaming", "npm", "codex.cmd")
+      ]
+    : [];
+  for (const candidate of candidates) {
+    if (isExecutableFile(candidate)) {
+      return candidate;
+    }
+  }
+
+  const pathCommand = findCodexCommandOnPath();
+  if (pathCommand) {
+    return pathCommand;
+  }
+
+  throw new Error("Codex CLI executable was not found. Install Codex or set CODEX_CLI_PATH to the Codex executable.");
+}
+
+function findCodexCommandOnPath(): string | null {
+  const pathValue = process.env.Path ?? process.env.PATH ?? "";
+  const commandNames = process.platform === "win32" ? ["codex.exe", "codex.cmd"] : ["codex"];
+  for (const entry of pathValue.split(path.delimiter)) {
+    const directory = entry.trim();
+    if (!directory) {
+      continue;
+    }
+    for (const commandName of commandNames) {
+      const candidate = path.join(directory, commandName);
+      if (isExecutableFile(candidate)) {
+        return candidate;
+      }
+    }
+  }
+  return null;
+}
+
+function isExecutableFile(filePath: string): boolean {
+  try {
+    return fs.statSync(filePath).isFile();
+  } catch {
+    return false;
+  }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

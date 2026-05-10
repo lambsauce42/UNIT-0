@@ -179,7 +179,7 @@ export interface ChatRuntimeSettings {
 }
 
 export type ChatUsageIndicatorId = "git_diff" | "context" | "week" | "five_hour";
-export type ChatUsageIndicatorPlacement = "left" | "right" | "bottom" | "footer_right" | "hidden";
+export type ChatUsageIndicatorPlacement = "left" | "right" | "bottom" | "footer_right" | "sidebar" | "hidden";
 export type ChatUsageIndicatorDisplayMode = "bar" | "circle";
 
 export interface ChatUsageIndicatorPreference {

@@ -3,6 +3,7 @@ import {
   buildCodexExecCommand,
   collaborationModePayload,
   codexItemToTimelineBlock,
+  codexRateLimitsFromResponse,
   MockCodexRuntime,
   parseCodexJsonLine
 } from "../src/main/codexRuntime";
@@ -100,6 +101,30 @@ test("mock Codex runtime exposes account, rate limits, and models without shelli
     expect(snapshot.account.rateLimits?.primary?.usedPercent).toBe(12);
   }
   expect(snapshot.models.some((model) => model.isDefault)).toBe(true);
+});
+
+test("parses the Codex CLI rate-limit bucket from app-server responses", () => {
+  const rateLimits = codexRateLimitsFromResponse({
+    rateLimits: {
+      limitId: "other",
+      primary: { usedPercent: 88, windowDurationMins: 300, resetsAt: 1778424330 },
+      secondary: { usedPercent: 77, windowDurationMins: 10080, resetsAt: 1779011130 },
+      rateLimitReachedType: null
+    },
+    rateLimitsByLimitId: {
+      codex: {
+        limitId: "codex",
+        primary: { usedPercent: 9, windowDurationMins: 300, resetsAt: 1778424330 },
+        secondary: { usedPercent: 1, windowDurationMins: 10080, resetsAt: 1779011130 },
+        rateLimitReachedType: null
+      }
+    }
+  });
+
+  expect(rateLimits?.primary?.usedPercent).toBe(9);
+  expect(rateLimits?.primary?.windowDurationMins).toBe(300);
+  expect(rateLimits?.secondary?.usedPercent).toBe(1);
+  expect(rateLimits?.secondary?.windowDurationMins).toBe(10080);
 });
 
 test("builds legacy Codex collaboration mode payload without shelling out", () => {

@@ -237,15 +237,9 @@ export class ChatService {
 
   async refreshCodexAccount(payload?: ChatRefreshCodexAccountPayload): Promise<ChatState> {
     try {
-      const snapshot = await this.codexRuntime.readAccount(Boolean(payload?.force));
-      this.codexAccount = snapshot.account;
-      if (snapshot.models.length > 0) {
-        this.codexModels = snapshot.models;
-      }
-      this.clearError();
+      await this.loadCodexAccountSnapshot(Boolean(payload?.force));
     } catch (error) {
       this.codexAccount = { status: "error", error: errorMessage(error) };
-      this.setError(errorMessage(error));
     }
     this.broadcast();
     return this.state();
@@ -275,8 +269,8 @@ export class ChatService {
         protocolVersion: remote.protocolVersion
       });
       this.clearError();
-    } catch (error) {
-      this.setError(errorMessage(error));
+    } catch {
+      return;
     } finally {
       this.broadcast();
     }
@@ -800,6 +794,7 @@ export class ChatService {
     const selectedCodexModel = state.codexModels.find((model) => model.id === thread.codexModelId) ?? state.codexModels.find((model) => model.isDefault);
     const timelineBlocks: ChatTimelineBlock[] = [];
     let preparedImages: { imagePaths: string[]; cleanup: () => void } | null = null;
+    let completedTurn = false;
     try {
       if (!project?.directory) {
         throw new Error("Select a project directory before running a Codex thread.");
@@ -852,11 +847,15 @@ export class ChatService {
       }
       this.store.updateMessageStatus(options.assistantMessageId, this.cancelRequested ? "interrupted" : "complete");
       this.generation = { status: "idle" };
+      completedTurn = !this.cancelRequested;
     } catch (error) {
       const message = errorMessage(error);
       this.store.updateMessageStatus(options.assistantMessageId, this.cancelRequested ? "interrupted" : "error");
       this.generation = this.cancelRequested ? { status: "idle" } : { status: "error", error: message };
     } finally {
+      if (completedTurn) {
+        await this.refreshCodexAccountAfterTurn();
+      }
       preparedImages?.cleanup();
       this.cancelRequested = false;
       this.broadcast();
@@ -1210,6 +1209,23 @@ export class ChatService {
   private clearError(): void {
     if (this.generation.status === "error") {
       this.generation = { status: "idle" };
+    }
+  }
+
+  private async loadCodexAccountSnapshot(force = false): Promise<void> {
+    const snapshot = await this.codexRuntime.readAccount(force);
+    this.codexAccount = snapshot.account;
+    if (snapshot.models.length > 0) {
+      this.codexModels = snapshot.models;
+    }
+  }
+
+  private async refreshCodexAccountAfterTurn(): Promise<void> {
+    try {
+      await this.loadCodexAccountSnapshot(false);
+    } catch (error) {
+      const message = errorMessage(error);
+      this.codexAccount = { status: "error", error: message };
     }
   }
 }

@@ -2265,7 +2265,7 @@ function normalizeUsageIndicatorPreference(value: Partial<ChatUsageIndicatorPref
   const displayMode = value?.displayMode;
   return {
     displayMode: displayMode === "circle" ? "circle" : "bar",
-    placement: placement === "left" || placement === "right" || placement === "bottom" || placement === "footer_right" || placement === "hidden"
+    placement: placement === "left" || placement === "right" || placement === "bottom" || placement === "footer_right" || placement === "sidebar" || placement === "hidden"
       ? placement
       : fallback.placement,
     order: Math.max(1, Math.min(4, positiveInteger(value?.order, fallback.order)))
