@@ -2,6 +2,7 @@ import { expect, test } from "@playwright/test";
 import {
   buildCodexExecCommand,
   collaborationModePayload,
+  codexAppServerItemEvents,
   codexItemToTimelineBlock,
   codexRateLimitsFromResponse,
   MockCodexRuntime,
@@ -20,6 +21,116 @@ test("parses official Codex JSONL-style thread events", () => {
   expect(() => parseCodexJsonLine('{"event":"missing-type"}')).toThrow(/missing a type/);
 });
 
+test("maps app-server reasoning summaries into one sectioned reasoning item", () => {
+  expect(codexAppServerItemEvents("item.completed", {
+    type: "reasoning",
+    id: "reason-1",
+    summary: ["**Crafting**", "**Finalizing**"],
+    extra_payload: { codex_initially_expanded: false }
+  })).toEqual([{
+    type: "item.completed",
+    item: {
+      id: "reason-1",
+      type: "reasoning",
+      text: "**Crafting**\n\n**Finalizing**",
+      sections: [
+        { key: "reason-1:summary:0", text: "**Crafting**" },
+        { key: "reason-1:summary:1", text: "**Finalizing**" }
+      ],
+      initiallyExpanded: false
+    }
+  }]);
+  expect(codexAppServerItemEvents("item.completed", {
+    type: "reasoning",
+    id: "reason-content",
+    content: ["Inspecting repository"]
+  })).toEqual([{
+    type: "item.completed",
+    item: {
+      id: "reason-content",
+      type: "reasoning",
+      text: "Inspecting repository",
+      sections: [{ key: "reason-content", text: "Inspecting repository" }],
+      initiallyExpanded: undefined
+    }
+  }]);
+});
+
+test("maps app-server command and file-change completion details", () => {
+  expect(codexAppServerItemEvents("item.completed", {
+    type: "commandExecution",
+    id: "cmd-1",
+    command: "npm test",
+    cwd: "C:\\Workspace",
+    aggregatedOutput: "ok\n",
+    exitCode: 0
+  })[0]).toMatchObject({
+    type: "item.completed",
+    item: {
+      id: "cmd-1",
+      type: "command_execution",
+      command: "npm test",
+      directory: "C:\\Workspace",
+      aggregated_output: "ok\n",
+      exit_code: 0,
+      status: "completed"
+    }
+  });
+  expect(codexAppServerItemEvents("item.completed", {
+    type: "commandExecution",
+    id: "cmd-failed",
+    command: "npm test",
+    status: "failed",
+    exitCode: 1
+  })[0]).toMatchObject({
+    item: {
+      type: "command_execution",
+      status: "failed",
+      exit_code: 1
+    }
+  });
+  expect(codexAppServerItemEvents("item.completed", {
+    type: "fileChange",
+    id: "diff-1",
+    path: "src/app.ts",
+    diff: "--- a/src/app.ts\n+++ b/src/app.ts\n-old\n+new"
+  })[0]).toMatchObject({
+    type: "item.completed",
+    item: {
+      id: "diff-1",
+      type: "file_change",
+      summary: "src/app.ts",
+      diff: "--- a/src/app.ts\n+++ b/src/app.ts\n-old\n+new",
+      added_lines: 1,
+      deleted_lines: 1,
+      status: "completed"
+    }
+  });
+  expect(codexAppServerItemEvents("item.completed", {
+    type: "fileChange",
+    id: "diff-structured",
+    status: "failed",
+    changes: [
+      { type: "modified", path: "src/app.ts", addedLines: 3, deletedLines: 1 },
+      { type: "created", path: "src/new.ts", additions: 5, deletions: 0 }
+    ]
+  })[0]).toMatchObject({
+    item: {
+      id: "diff-structured",
+      type: "file_change",
+      diff: "modified: src/app.ts (+3 -1)\ncreated: src/new.ts (+5 -0)",
+      added_lines: 8,
+      deleted_lines: 1,
+      files_changed: 2,
+      status: "failed",
+      changes: [
+        { path: "src/app.ts", kind: "modified", addedLines: 3, deletedLines: 1 },
+        { path: "src/new.ts", kind: "created", addedLines: 5, deletedLines: 0 }
+      ]
+    }
+  });
+});
+
 test("maps Codex command and todo items into chat timeline blocks", () => {
   expect(codexItemToTimelineBlock("item.completed", {
     id: "cmd",
@@ -35,6 +146,16 @@ test("maps Codex command and todo items into chat timeline blocks", () => {
     status: "completed",
     command: "npm test",
     output: "ok\n"
+  });
+  expect(codexItemToTimelineBlock("item.completed", {
+    id: "failed-cmd",
+    type: "command_execution",
+    command: "npm test",
+    status: "failed",
+    exit_code: 1
+  })).toMatchObject({
+    kind: "tool",
+    status: "failed"
   });
   expect(codexItemToTimelineBlock("item.completed", {
     id: "plan",

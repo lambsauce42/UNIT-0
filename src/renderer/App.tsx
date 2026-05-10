@@ -1,5 +1,6 @@
 import {
   Activity,
+  ArrowDown,
   ArrowLeft,
   ArrowRight,
   ArrowUp,
@@ -50,14 +51,15 @@ import markdownItTaskLists from "markdown-it-task-lists";
 import katex from "katex";
 import "katex/dist/katex.min.css";
 import CodeMirror from "@uiw/react-codemirror";
-import { LanguageDescription } from "@codemirror/language";
+import { defaultHighlightStyle, HighlightStyle, LanguageDescription, syntaxHighlighting } from "@codemirror/language";
 import { languages } from "@codemirror/language-data";
 import { type Extension } from "@codemirror/state";
-import { oneDark } from "@codemirror/theme-one-dark";
+import { oneDarkHighlightStyle, oneDarkTheme } from "@codemirror/theme-one-dark";
 import { EditorView, keymap } from "@codemirror/view";
 import { FitAddon } from "@xterm/addon-fit";
 import { Terminal as XTerm } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
+import { tags } from "@lezer/highlight";
 import { Tree, type NodeRendererProps } from "react-arborist";
 import {
   useCallback,
@@ -68,8 +70,11 @@ import {
   useState,
   type CSSProperties,
   type ClipboardEvent as ReactClipboardEvent,
+  type MouseEvent as ReactMouseEvent,
+  type ReactNode,
   type PointerEvent as ReactPointerEvent,
-  type SVGProps
+  type SVGProps,
+  type WheelEvent as ReactWheelEvent
 } from "react";
 import { createPortal } from "react-dom";
 import { THIRD_PARTY_LICENSES } from "./thirdPartyLicenses";
@@ -95,6 +100,7 @@ import type {
   ChatSettingsPreset,
   ChatState,
   ChatUsageIndicatorId,
+  FileViewerSyntaxHighlighting,
   FileTreeEntry,
   ReadFileResult,
   RectLike,
@@ -3216,6 +3222,58 @@ type FileViewerDiscardRequest =
   | { kind: "file"; fileId: string }
   | { kind: "root"; rootPath: string };
 
+const FILE_VIEWER_SYNTAX_OPTIONS: Array<{ value: FileViewerSyntaxHighlighting; label: string }> = [
+  { value: "one-dark", label: "One Dark" },
+  { value: "vscode-dark", label: "VS Code Dark" },
+  { value: "muted", label: "Muted" },
+  { value: "codemirror", label: "CodeMirror Classic" }
+];
+
+const fileViewerVsCodeDarkHighlightStyle = HighlightStyle.define([
+  { tag: [tags.keyword, tags.operatorKeyword, tags.modifier, tags.character], color: "#ff7b72" },
+  { tag: [tags.atom, tags.bool, tags.number, tags.constant(tags.name), tags.standard(tags.name)], color: "#79c0ff" },
+  { tag: [tags.variableName, tags.definition(tags.variableName), tags.propertyName, tags.labelName], color: "#ffa657" },
+  { tag: [tags.function(tags.variableName), tags.definition(tags.propertyName)], color: "#d2a8ff" },
+  { tag: [tags.typeName, tags.className, tags.namespace], color: "#79c0ff" },
+  { tag: [tags.tagName, tags.attributeName], color: "#7ee787" },
+  { tag: [tags.string, tags.special(tags.string), tags.regexp, tags.escape], color: "#a5d6ff" },
+  { tag: [tags.operator, tags.punctuation, tags.separator, tags.brace], color: "#c9d1d9" },
+  { tag: [tags.comment, tags.meta], color: "#8b949e" },
+  { tag: tags.heading, color: "#79c0ff", fontWeight: "bold" },
+  { tag: tags.link, color: "#a5d6ff", textDecoration: "underline" },
+  { tag: tags.quote, color: "#7ee787" },
+  { tag: tags.strong, color: "#c9d1d9", fontWeight: "bold" },
+  { tag: tags.emphasis, color: "#c9d1d9", fontStyle: "italic" },
+  { tag: tags.strikethrough, textDecoration: "line-through" },
+  { tag: tags.invalid, color: "#ffa198", fontStyle: "italic" },
+  { tag: [tags.deleted], color: "#ffa198" },
+  { tag: [tags.inserted], color: "#7ee787" },
+  { tag: [tags.changed], color: "#ffa657" }
+]);
+
+const fileViewerMutedHighlightStyle = HighlightStyle.define([
+  { tag: tags.keyword, color: "#c9a7ff" },
+  { tag: [tags.name, tags.propertyName, tags.labelName], color: "#d9e3ee" },
+  { tag: [tags.function(tags.variableName), tags.definition(tags.propertyName)], color: "#8cc8ff" },
+  { tag: [tags.typeName, tags.className, tags.namespace], color: "#ffd38a" },
+  { tag: [tags.number, tags.bool, tags.atom], color: "#f2c57c" },
+  { tag: [tags.string, tags.special(tags.string), tags.inserted], color: "#95d5a6" },
+  { tag: [tags.operator, tags.operatorKeyword, tags.regexp, tags.escape], color: "#9dc5d6" },
+  { tag: [tags.comment, tags.meta], color: "#7f8a99" },
+  { tag: tags.heading, color: "#f0b7c2", fontWeight: "bold" },
+  { tag: tags.link, color: "#8cc8ff", textDecoration: "underline" },
+  { tag: tags.strong, fontWeight: "bold" },
+  { tag: tags.emphasis, fontStyle: "italic" },
+  { tag: tags.invalid, color: "#ff8a8a" }
+]);
+
+const FILE_VIEWER_HIGHLIGHT_STYLES: Record<FileViewerSyntaxHighlighting, HighlightStyle> = {
+  "one-dark": oneDarkHighlightStyle,
+  "vscode-dark": fileViewerVsCodeDarkHighlightStyle,
+  muted: fileViewerMutedHighlightStyle,
+  codemirror: defaultHighlightStyle
+};
+
 const FILE_TREE_ROOT_ID = "__workspace_root__";
 
 function FileViewerSurface({ session }: { session: AppletSession }) {
@@ -3233,9 +3291,13 @@ function FileViewerSurface({ session }: { session: AppletSession }) {
   const [editorContent, setEditorContent] = useState("");
   const [editorLanguageExtensions, setEditorLanguageExtensions] = useState<Extension[]>([]);
   const [dirty, setDirty] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [localSyntaxHighlightingMode, setLocalSyntaxHighlightingMode] = useState<FileViewerSyntaxHighlighting | null>(null);
   const [discardRequest, setDiscardRequest] = useState<FileViewerDiscardRequest | null>(null);
   const [status, setStatus] = useState<FileViewerStatus>({ state: "loading", label: "Loading files" });
   const configuredRootPath = session.state.fileViewer?.rootPath ?? "";
+  const persistedSyntaxHighlightingMode = session.state.fileViewer?.syntaxHighlighting ?? "one-dark";
+  const syntaxHighlightingMode = localSyntaxHighlightingMode ?? persistedSyntaxHighlightingMode;
 
   useEffect(() => {
     selectedFileRef.current = selectedFile;
@@ -3252,6 +3314,10 @@ function FileViewerSurface({ session }: { session: AppletSession }) {
   useEffect(() => {
     configuredRootPathRef.current = configuredRootPath;
   }, [configuredRootPath]);
+
+  useEffect(() => {
+    setLocalSyntaxHighlightingMode(null);
+  }, [persistedSyntaxHighlightingMode]);
 
   const loadDirectory = useCallback(async (directoryId: string) => {
     setStatus({ state: "loading", label: directoryId ? `Loading ${directoryId}` : "Loading files" });
@@ -3369,7 +3435,8 @@ function FileViewerSurface({ session }: { session: AppletSession }) {
 
   const editorExtensions = useMemo(
     () => [
-      oneDark,
+      oneDarkTheme,
+      syntaxHighlighting(FILE_VIEWER_HIGHLIGHT_STYLES[syntaxHighlightingMode]),
       EditorView.lineWrapping,
       keymap.of([
         {
@@ -3382,7 +3449,7 @@ function FileViewerSurface({ session }: { session: AppletSession }) {
       ]),
       ...editorLanguageExtensions
     ],
-    [editorLanguageExtensions, saveSelectedFile]
+    [editorLanguageExtensions, saveSelectedFile, syntaxHighlightingMode]
   );
 
   const readFileIntoEditor = useCallback(async (fileId: string) => {
@@ -3408,7 +3475,18 @@ function FileViewerSurface({ session }: { session: AppletSession }) {
       sessionId: session.id,
       state: {
         ...session.state,
-        fileViewer: { rootPath: nextRootPath }
+        fileViewer: { ...session.state.fileViewer, rootPath: nextRootPath }
+      }
+    });
+  }, [session.id, session.state]);
+
+  const updateSyntaxHighlighting = useCallback(async (nextSyntaxHighlighting: FileViewerSyntaxHighlighting) => {
+    setLocalSyntaxHighlightingMode(nextSyntaxHighlighting);
+    await window.unitApi.applets.updateAppletSessionState({
+      sessionId: session.id,
+      state: {
+        ...session.state,
+        fileViewer: { ...session.state.fileViewer, syntaxHighlighting: nextSyntaxHighlighting }
       }
     });
   }, [session.id, session.state]);
@@ -3418,6 +3496,7 @@ function FileViewerSurface({ session }: { session: AppletSession }) {
     if (!result.rootPath) {
       return;
     }
+    setSettingsOpen(false);
     if (dirtyRef.current) {
       setDiscardRequest({ kind: "root", rootPath: result.rootPath });
       return;
@@ -3462,7 +3541,7 @@ function FileViewerSurface({ session }: { session: AppletSession }) {
       <aside className="file-tree-panel">
         <div className="file-tree-root">
           <span title={rootPath}>{rootPath || "Workspace"}</span>
-          <button className="icon-button" type="button" aria-label="Change file root" onClick={selectRootDirectory}>
+          <button className="icon-button" type="button" aria-label="File viewer settings" onClick={() => setSettingsOpen(true)}>
             <Settings size={14} />
           </button>
         </div>
@@ -3507,12 +3586,12 @@ function FileViewerSurface({ session }: { session: AppletSession }) {
         {status.state === "error" ? <div className="file-viewer-message">{status.message}</div> : null}
         {selectedFile ? (
           <CodeMirror
-            basicSetup
+            basicSetup={{ syntaxHighlighting: false }}
             className="code-editor"
             editable
             extensions={editorExtensions}
             height="100%"
-            key={selectedFile.id}
+            key={`${selectedFile.id}:${syntaxHighlightingMode}`}
             readOnly={false}
             value={editorContent}
             onChange={(value) => {
@@ -3526,6 +3605,55 @@ function FileViewerSurface({ session }: { session: AppletSession }) {
           <div className="file-viewer-message">Select a file</div>
         ) : null}
       </section>
+      {settingsOpen ? (
+        <div className="file-settings-backdrop" role="presentation" onPointerDown={() => setSettingsOpen(false)}>
+          <section
+            className="file-settings-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="file-settings-title"
+            onPointerDown={(event) => event.stopPropagation()}
+          >
+            <header className="file-settings-header">
+              <h2 id="file-settings-title">File Viewer Settings</h2>
+              <button className="icon-button" type="button" aria-label="Close file viewer settings" onClick={() => setSettingsOpen(false)}>
+                <X size={14} />
+              </button>
+            </header>
+            <div className="file-settings-body">
+              <label className="file-settings-field">
+                <span>Syntax highlighting</span>
+                <select
+                  value={syntaxHighlightingMode}
+                  onChange={(event) => {
+                    void updateSyntaxHighlighting(event.currentTarget.value as FileViewerSyntaxHighlighting)
+                      .catch((error: unknown) => setStatus({ state: "error", message: errorMessage(error) }));
+                  }}
+                >
+                  {FILE_VIEWER_SYNTAX_OPTIONS.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <div className="file-settings-field">
+                <span>Directory</span>
+                <div className="file-settings-directory">
+                  <span title={rootPath}>{rootPath || "Workspace"}</span>
+                  <button
+                    type="button"
+                    onClick={() => void selectRootDirectory().catch((error: unknown) => setStatus({ state: "error", message: errorMessage(error) }))}
+                  >
+                    <FolderOpen size={14} />
+                    <span>Choose</span>
+                  </button>
+                </div>
+              </div>
+            </div>
+          </section>
+        </div>
+      ) : null}
       {discardRequest ? (
         <div className="discard-backdrop" role="presentation" onPointerDown={() => setDiscardRequest(null)}>
           <section
@@ -3836,6 +3964,11 @@ function ChatSettingSelect({
   );
 }
 
+type ChatMarkdownRenderEnv = {
+  copiedCodeBlockIds?: ReadonlySet<string>;
+  footnoteScope: string;
+};
+
 const chatMarkdown = MarkdownIt({
   breaks: false,
   html: false,
@@ -3847,11 +3980,14 @@ const chatMarkdown = MarkdownIt({
 
 chatMarkdown.renderer.rules.fence = (tokens, index, options, env, self) => {
   const token = tokens[index];
+  const renderEnv = env as ChatMarkdownRenderEnv;
   const info = token.info.trim();
   const language = info.split(/\s+/)[0] || "";
   const escapedCode = chatMarkdown.utils.escapeHtml(token.content);
-  const languageLabel = language ? `<figcaption>${chatMarkdown.utils.escapeHtml(language)}</figcaption>` : "";
-  return `<figure class="chat-code-figure">${languageLabel}<pre class="chat-code-block"><code data-language="${chatMarkdown.utils.escapeHtml(language)}">${escapedCode}</code></pre></figure>`;
+  const languageLabel = language ? `<figcaption>${chatMarkdown.utils.escapeHtml(language)}</figcaption>` : "<figcaption></figcaption>";
+  const codeBlockId = `${renderEnv.footnoteScope}:code:${index}`;
+  const copied = renderEnv.copiedCodeBlockIds?.has(codeBlockId) ?? false;
+  return `<figure class="chat-code-figure"><div class="chat-code-header">${languageLabel}<button class="chat-code-copy-button" type="button" aria-label="Copy code" data-code-block-id="${chatMarkdown.utils.escapeHtml(codeBlockId)}" data-copied="${copied ? "1" : "0"}">${copied ? "Copied" : "Copy"}</button></div><pre class="chat-code-block"><code data-language="${chatMarkdown.utils.escapeHtml(language)}">${escapedCode}</code></pre></figure>`;
 };
 
 chatMarkdown.renderer.rules.table_open = () => '<div class="chat-markdown-table-wrap"><table class="chat-markdown-table">';
@@ -3880,9 +4016,26 @@ function ChatSurface() {
   const [draggedChatItem, setDraggedChatItem] = useState<{ kind: "project" | "thread"; id: string } | null>(null);
   const [chatDropTarget, setChatDropTarget] = useState<{ kind: "project" | "thread"; id: string; position: "before" | "after" | "inside" } | null>(null);
   const [sidebarScrollable, setSidebarScrollable] = useState(false);
+  const [threadAtBottom, setThreadAtBottom] = useState(true);
+  const [chatLayout, setChatLayout] = useState({ compact: false, contentWidth: 864, composerInset: 204 });
+  const [threadScrollbar, setThreadScrollbar] = useState({ scrollable: false, thumbTop: 0, thumbHeight: 42 });
+  const [manualEndSlack, setManualEndSlack] = useState(0);
+  const [copiedCodeBlockIds, setCopiedCodeBlockIds] = useState<Set<string>>(() => new Set());
   const surfaceRef = useRef<HTMLDivElement | null>(null);
+  const chatMainRef = useRef<HTMLElement | null>(null);
+  const threadScrollRef = useRef<HTMLDivElement | null>(null);
+  const threadScrollbarTrackRef = useRef<HTMLDivElement | null>(null);
+  const threadContentRef = useRef<HTMLDivElement | null>(null);
+  const manualEndSpacerRef = useRef<HTMLDivElement | null>(null);
+  const composerSectionRef = useRef<HTMLDivElement | null>(null);
   const composerRef = useRef<HTMLTextAreaElement | null>(null);
   const projectScrollRef = useRef<HTMLDivElement | null>(null);
+  const shouldFollowThreadBottomRef = useRef(true);
+  const threadBottomFollowActiveRef = useRef(false);
+  const threadScrollbarDragRef = useRef<{ pointerId: number; startY: number; startScrollTop: number } | null>(null);
+  const manualEndSlackRef = useRef(0);
+  const threadOverscrollAnchorRef = useRef<number | null>(null);
+  const copiedCodeBlockTimersRef = useRef<Map<string, number>>(new Map());
 
   useEffect(() => {
     let mounted = true;
@@ -3946,6 +4099,15 @@ function ChatSurface() {
     };
   }, [chatState?.codexAccount.status]);
 
+  useEffect(() => {
+    return () => {
+      for (const timerId of copiedCodeBlockTimersRef.current.values()) {
+        window.clearTimeout(timerId);
+      }
+      copiedCodeBlockTimersRef.current.clear();
+    };
+  }, []);
+
   const selectedThread = chatState?.threads.find((thread) => thread.id === chatState.selectedThreadId) ?? null;
   const selectedMessages = chatState
     ? chatState.messages.filter((message) => message.threadId === chatState.selectedThreadId)
@@ -3997,6 +4159,18 @@ function ChatSurface() {
     }
     return previews;
   }, [chatState]);
+  const selectedMessageSignature = useMemo(() => selectedMessages.map((message) => [
+    message.id,
+    message.status,
+    message.updatedAt,
+    message.content.length,
+    message.reasoning?.length ?? 0,
+    message.timelineBlocks?.length ?? 0
+  ].join(":")).join("|"), [selectedMessages]);
+  const chatLayoutStyle = {
+    "--chat-content-width": `${chatLayout.contentWidth}px`,
+    "--chat-composer-inset": `${chatLayout.composerInset}px`
+  } as CSSProperties;
 
   const runChatAction = useCallback(async (action: () => Promise<ChatState>) => {
     setLocalError(null);
@@ -4204,6 +4378,368 @@ function ChatSurface() {
     composer.style.height = `${Math.min(176, Math.max(44, composer.scrollHeight))}px`;
   }, [draft]);
 
+  const handleChatSurfaceClick = useCallback((event: ReactMouseEvent<HTMLDivElement>) => {
+    const button = (event.target as Element | null)?.closest<HTMLButtonElement>(".chat-code-copy-button");
+    if (!button || !event.currentTarget.contains(button)) {
+      return;
+    }
+    const figure = button.closest<HTMLElement>(".chat-code-figure");
+    const code = figure?.querySelector<HTMLElement>(".chat-code-block code");
+    const text = code?.textContent ?? "";
+    if (!text) {
+      return;
+    }
+    const codeBlockId = button.dataset.codeBlockId;
+    if (!codeBlockId) {
+      return;
+    }
+    void navigator.clipboard.writeText(text).then(() => {
+      const existingTimer = copiedCodeBlockTimersRef.current.get(codeBlockId);
+      if (existingTimer !== undefined) {
+        window.clearTimeout(existingTimer);
+      }
+      setCopiedCodeBlockIds((current) => {
+        const next = new Set(current);
+        next.add(codeBlockId);
+        return next;
+      });
+      const timerId = window.setTimeout(() => {
+        copiedCodeBlockTimersRef.current.delete(codeBlockId);
+        setCopiedCodeBlockIds((current) => {
+          if (!current.has(codeBlockId)) {
+            return current;
+          }
+          const next = new Set(current);
+          next.delete(codeBlockId);
+          return next;
+        });
+      }, 2200);
+      copiedCodeBlockTimersRef.current.set(codeBlockId, timerId);
+    });
+  }, []);
+
+  const computeBaseManualEndSlackHeight = useCallback(() => {
+    const scrollHost = threadScrollRef.current;
+    const clientHeight = scrollHost?.clientHeight ?? 0;
+    const viewportReserve = Math.max(120, Math.min(320, Math.round(clientHeight * 0.24)));
+    return chatLayout.composerInset + viewportReserve;
+  }, [chatLayout.composerInset]);
+
+  const readThreadScrollMetrics = useCallback(() => {
+    const scrollHost = threadScrollRef.current;
+    if (!scrollHost) {
+      return null;
+    }
+    const spacer = manualEndSpacerRef.current;
+    const scrollTop = scrollHost.scrollTop;
+    const scrollHeight = scrollHost.scrollHeight;
+    const clientHeight = scrollHost.clientHeight;
+    const composerHeight = Math.max(0, Math.ceil(composerSectionRef.current?.getBoundingClientRect().height ?? 0));
+    const effectiveClientHeight = Math.max(1, clientHeight - composerHeight);
+    let contentScrollHeight = scrollHeight;
+    if (spacer) {
+      const hostRect = scrollHost.getBoundingClientRect();
+      const spacerRect = spacer.getBoundingClientRect();
+      const spacerTop = scrollTop + spacerRect.top - hostRect.top;
+      const hostPaddingBottom = Math.max(0, Math.round(parseFloat(getComputedStyle(scrollHost).paddingBottom) || 0));
+      contentScrollHeight = Math.min(scrollHeight, Math.max(0, spacerTop + hostPaddingBottom));
+    }
+    return {
+      scrollTop,
+      scrollHeight,
+      clientHeight,
+      effectiveClientHeight,
+      viewportBottomOcclusion: composerHeight,
+      contentScrollHeight,
+      contentOverflowScroll: contentScrollHeight - clientHeight,
+      maxScroll: Math.max(0, scrollHeight - clientHeight),
+      contentMaxScroll: Math.max(0, contentScrollHeight - effectiveClientHeight)
+    };
+  }, []);
+
+  const applyManualEndSlackHeight = useCallback((nextHeight: number) => {
+    const normalizedHeight = Math.max(0, Math.round(nextHeight || 0));
+    manualEndSlackRef.current = normalizedHeight;
+    if (manualEndSpacerRef.current) {
+      manualEndSpacerRef.current.style.height = `${normalizedHeight}px`;
+    }
+    setManualEndSlack((current) => current === normalizedHeight ? current : normalizedHeight);
+    return normalizedHeight;
+  }, []);
+
+  const ensureManualEndSlackForScrollTop = useCallback((targetScrollTop: number, extraBuffer = 24) => {
+    const metrics = readThreadScrollMetrics();
+    const baseHeight = computeBaseManualEndSlackHeight();
+    if (!metrics) {
+      return applyManualEndSlackHeight(baseHeight);
+    }
+    const requiredHeight = Math.max(
+      baseHeight,
+      Math.ceil(Math.max(0, Number(targetScrollTop) - Number(metrics.contentOverflowScroll || 0)) + Math.max(0, extraBuffer))
+    );
+    return applyManualEndSlackHeight(requiredHeight);
+  }, [applyManualEndSlackHeight, computeBaseManualEndSlackHeight, readThreadScrollMetrics]);
+
+  const syncManualEndSlackHeight = useCallback(() => {
+    const metrics = readThreadScrollMetrics();
+    const baseHeight = computeBaseManualEndSlackHeight();
+    if (!metrics) {
+      return applyManualEndSlackHeight(baseHeight);
+    }
+    const tailReserve = metrics.scrollTop >= metrics.maxScroll - 2 && metrics.scrollTop >= metrics.contentMaxScroll - 6
+      ? Math.max(560, Math.round(metrics.clientHeight * 1.2))
+      : 24;
+    const overscrollReserve = Math.max(0, Math.ceil(metrics.scrollTop - Number(metrics.contentOverflowScroll || 0)) + tailReserve);
+    return applyManualEndSlackHeight(Math.max(baseHeight, overscrollReserve));
+  }, [applyManualEndSlackHeight, computeBaseManualEndSlackHeight, readThreadScrollMetrics]);
+
+  const classifyThreadBottomState = useCallback((metrics: NonNullable<ReturnType<typeof readThreadScrollMetrics>>) => {
+    const bottomDistance = metrics.contentMaxScroll - metrics.scrollTop;
+    const atContentBottom = Math.abs(bottomDistance) <= 8;
+    const aboveContentBottom = bottomDistance > 8;
+    const overscrolledPastContentBottom = bottomDistance < -8;
+    return {
+      atContentBottom,
+      overscrolledPastContentBottom,
+      overscrollAnchor: metrics.scrollTop,
+      showBottomButton: aboveContentBottom,
+      shouldFollowBottom: atContentBottom
+    };
+  }, []);
+
+  const syncThreadFollowState = useCallback(() => {
+    const metrics = readThreadScrollMetrics();
+    if (!metrics) {
+      shouldFollowThreadBottomRef.current = true;
+      setThreadAtBottom((current) => current ? current : true);
+      return;
+    }
+    const bottomState = classifyThreadBottomState(metrics);
+    const nextThreadAtBottom = !bottomState.showBottomButton;
+    if (threadBottomFollowActiveRef.current) {
+      if (bottomState.atContentBottom) {
+        threadBottomFollowActiveRef.current = false;
+      } else {
+        shouldFollowThreadBottomRef.current = true;
+        setThreadAtBottom((current) => current ? current : true);
+        syncManualEndSlackHeight();
+        return;
+      }
+    }
+    shouldFollowThreadBottomRef.current = bottomState.shouldFollowBottom;
+    threadOverscrollAnchorRef.current = bottomState.overscrolledPastContentBottom ? bottomState.overscrollAnchor : null;
+    setThreadAtBottom((current) => current === nextThreadAtBottom ? current : nextThreadAtBottom);
+    syncManualEndSlackHeight();
+  }, [classifyThreadBottomState, readThreadScrollMetrics, syncManualEndSlackHeight]);
+
+  const scrollThreadToBottom = useCallback((behavior: ScrollBehavior = "auto") => {
+    const scrollHost = threadScrollRef.current;
+    if (!scrollHost) {
+      return;
+    }
+    const metrics = readThreadScrollMetrics();
+    const targetTop = metrics ? metrics.contentMaxScroll : Math.max(0, scrollHost.scrollHeight - scrollHost.clientHeight);
+    if (behavior === "smooth") {
+      scrollHost.scrollTo({ top: targetTop, behavior });
+    } else {
+      scrollHost.scrollTop = targetTop;
+    }
+    shouldFollowThreadBottomRef.current = true;
+    setThreadAtBottom((current) => current ? current : true);
+  }, [readThreadScrollMetrics]);
+
+  const resumeThreadTailFollow = useCallback(() => {
+    threadBottomFollowActiveRef.current = true;
+    shouldFollowThreadBottomRef.current = true;
+    setThreadAtBottom((current) => current ? current : true);
+    scrollThreadToBottom("smooth");
+  }, [scrollThreadToBottom]);
+
+  const updateThreadScrollbar = useCallback(() => {
+    const scrollHost = threadScrollRef.current;
+    const track = threadScrollbarTrackRef.current;
+    if (!scrollHost || !track) {
+      setThreadScrollbar((current) => current.scrollable ? { scrollable: false, thumbTop: 0, thumbHeight: 42 } : current);
+      return;
+    }
+    const metrics = readThreadScrollMetrics();
+    const scrollMax = Math.max(0, metrics?.contentMaxScroll ?? scrollHost.scrollHeight - scrollHost.clientHeight);
+    const trackHeight = Math.max(0, track.clientHeight);
+    const scrollable = scrollMax > 1 && trackHeight > 0;
+    if (!scrollable) {
+      setThreadScrollbar((current) => current.scrollable ? { scrollable: false, thumbTop: 0, thumbHeight: 42 } : current);
+      return;
+    }
+    const pageSize = Math.max(1, metrics?.effectiveClientHeight ?? scrollHost.clientHeight);
+    const thumbHeight = Math.max(42, Math.min(trackHeight, Math.round((pageSize / (scrollMax + pageSize)) * trackHeight)));
+    const thumbTravel = Math.max(0, trackHeight - thumbHeight);
+    const displayScrollTop = Math.min(Math.max(0, scrollHost.scrollTop), scrollMax);
+    const thumbTop = thumbTravel <= 0 ? 0 : Math.round((displayScrollTop / scrollMax) * thumbTravel);
+    setThreadScrollbar((current) => (
+      current.scrollable === scrollable &&
+      current.thumbTop === thumbTop &&
+      current.thumbHeight === thumbHeight
+        ? current
+        : { scrollable, thumbTop, thumbHeight }
+    ));
+  }, [readThreadScrollMetrics]);
+
+  const handleThreadWheel = useCallback((event: ReactWheelEvent<HTMLDivElement>) => {
+    if (event.deltaY < 0) {
+      threadBottomFollowActiveRef.current = false;
+    }
+    if (event.deltaY <= 0) {
+      return;
+    }
+    const metrics = readThreadScrollMetrics();
+    if (!metrics) {
+      return;
+    }
+    if (metrics.scrollTop >= metrics.contentMaxScroll - 6 || metrics.scrollTop >= metrics.maxScroll - 6) {
+      ensureManualEndSlackForScrollTop(metrics.scrollTop + event.deltaY + 32);
+    }
+  }, [ensureManualEndSlackForScrollTop, readThreadScrollMetrics]);
+
+  useLayoutEffect(() => {
+    const main = chatMainRef.current;
+    const composerSection = composerSectionRef.current;
+    if (!main || !composerSection) {
+      return;
+    }
+    const updateChatLayout = () => {
+      const mainWidth = Math.max(0, Math.floor(main.getBoundingClientRect().width));
+      const compact = mainWidth < 720;
+      const sideDockReserve = compact ? 0 : 100;
+      const contentWidth = Math.max(0, Math.min(864, mainWidth - sideDockReserve - 36));
+      const composerInset = Math.max(128, Math.ceil(composerSection.getBoundingClientRect().height) + 22);
+      setChatLayout((current) => (
+        current.compact === compact &&
+        current.contentWidth === contentWidth &&
+        current.composerInset === composerInset
+          ? current
+          : { compact, contentWidth, composerInset }
+      ));
+    };
+    updateChatLayout();
+    const resizeObserver = new ResizeObserver(updateChatLayout);
+    resizeObserver.observe(main);
+    resizeObserver.observe(composerSection);
+    return () => resizeObserver.disconnect();
+  }, [chatState, draft, pendingAttachments.length, attachmentStatus]);
+
+  useLayoutEffect(() => {
+    shouldFollowThreadBottomRef.current = true;
+    requestAnimationFrame(scrollThreadToBottom);
+  }, [selectedThread?.id, scrollThreadToBottom]);
+
+  useLayoutEffect(() => {
+    if (!shouldFollowThreadBottomRef.current) {
+      const metrics = readThreadScrollMetrics();
+      const bottomState = metrics ? classifyThreadBottomState(metrics) : null;
+      const overscrollAnchor = threadOverscrollAnchorRef.current;
+      if (metrics && overscrollAnchor !== null && metrics.contentMaxScroll < overscrollAnchor - 8) {
+        ensureManualEndSlackForScrollTop(overscrollAnchor);
+        threadScrollRef.current!.scrollTop = overscrollAnchor;
+        return;
+      }
+      if (bottomState?.atContentBottom || (metrics && overscrollAnchor !== null && metrics.contentMaxScroll >= overscrollAnchor - 8)) {
+        shouldFollowThreadBottomRef.current = true;
+        threadOverscrollAnchorRef.current = null;
+        scrollThreadToBottom();
+        return;
+      }
+      return;
+    }
+    threadOverscrollAnchorRef.current = null;
+    scrollThreadToBottom();
+    const frameId = requestAnimationFrame(scrollThreadToBottom);
+    return () => cancelAnimationFrame(frameId);
+  }, [classifyThreadBottomState, ensureManualEndSlackForScrollTop, readThreadScrollMetrics, selectedMessageSignature, chatLayout.composerInset, scrollThreadToBottom]);
+
+  useLayoutEffect(() => {
+    const scrollHost = threadScrollRef.current;
+    if (!scrollHost) {
+      return;
+    }
+    updateThreadScrollbar();
+    const resizeObserver = new ResizeObserver(updateThreadScrollbar);
+    resizeObserver.observe(scrollHost);
+    if (threadContentRef.current) {
+      resizeObserver.observe(threadContentRef.current);
+    }
+    if (manualEndSpacerRef.current) {
+      resizeObserver.observe(manualEndSpacerRef.current);
+    }
+    scrollHost.addEventListener("scroll", updateThreadScrollbar, { passive: true });
+    return () => {
+      resizeObserver.disconnect();
+      scrollHost.removeEventListener("scroll", updateThreadScrollbar);
+    };
+  }, [chatLayout.composerInset, selectedMessageSignature, updateThreadScrollbar]);
+
+  useLayoutEffect(() => {
+    syncManualEndSlackHeight();
+  }, [chatLayout.composerInset, selectedMessageSignature, syncManualEndSlackHeight]);
+
+  useEffect(() => {
+    const onPointerMove = (event: PointerEvent) => {
+      const drag = threadScrollbarDragRef.current;
+      const scrollHost = threadScrollRef.current;
+      const track = threadScrollbarTrackRef.current;
+      if (!drag || !scrollHost || !track || event.pointerId !== drag.pointerId) {
+        return;
+      }
+      const scrollMax = Math.max(0, readThreadScrollMetrics()?.contentMaxScroll ?? scrollHost.scrollHeight - scrollHost.clientHeight);
+      const thumbTravel = Math.max(1, track.clientHeight - threadScrollbar.thumbHeight);
+      scrollHost.scrollTop = Math.min(scrollMax, Math.max(0, drag.startScrollTop + ((event.clientY - drag.startY) / thumbTravel) * scrollMax));
+      updateThreadScrollbar();
+    };
+    const onPointerUp = (event: PointerEvent) => {
+      if (threadScrollbarDragRef.current?.pointerId === event.pointerId) {
+        threadScrollbarDragRef.current = null;
+      }
+    };
+    window.addEventListener("pointermove", onPointerMove);
+    window.addEventListener("pointerup", onPointerUp);
+    window.addEventListener("pointercancel", onPointerUp);
+    return () => {
+      window.removeEventListener("pointermove", onPointerMove);
+      window.removeEventListener("pointerup", onPointerUp);
+      window.removeEventListener("pointercancel", onPointerUp);
+    };
+  }, [readThreadScrollMetrics, threadScrollbar.thumbHeight, updateThreadScrollbar]);
+
+  const beginThreadScrollbarDrag = useCallback((event: ReactPointerEvent<HTMLSpanElement>) => {
+    const scrollHost = threadScrollRef.current;
+    if (!scrollHost || !threadScrollbar.scrollable) {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    threadBottomFollowActiveRef.current = false;
+    event.currentTarget.setPointerCapture(event.pointerId);
+    threadScrollbarDragRef.current = {
+      pointerId: event.pointerId,
+      startY: event.clientY,
+      startScrollTop: scrollHost.scrollTop
+    };
+  }, [threadScrollbar.scrollable]);
+
+  const jumpThreadScrollbar = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    const scrollHost = threadScrollRef.current;
+    const track = threadScrollbarTrackRef.current;
+    if (!scrollHost || !track || !threadScrollbar.scrollable || event.target !== event.currentTarget) {
+      return;
+    }
+    threadBottomFollowActiveRef.current = false;
+    const rect = track.getBoundingClientRect();
+    const thumbTravel = Math.max(1, track.clientHeight - threadScrollbar.thumbHeight);
+    const targetTop = Math.min(Math.max(0, event.clientY - rect.top - threadScrollbar.thumbHeight / 2), thumbTravel);
+    const scrollMax = Math.max(0, readThreadScrollMetrics()?.contentMaxScroll ?? scrollHost.scrollHeight - scrollHost.clientHeight);
+    scrollHost.scrollTop = (targetTop / thumbTravel) * scrollMax;
+    updateThreadScrollbar();
+  }, [readThreadScrollMetrics, threadScrollbar.scrollable, threadScrollbar.thumbHeight, updateThreadScrollbar]);
+
   const updateSidebarScrollable = useCallback(() => {
     const scrollHost = projectScrollRef.current;
     const nextScrollable = scrollHost ? scrollHost.scrollHeight > scrollHost.clientHeight + 1 : false;
@@ -4254,7 +4790,13 @@ function ChatSurface() {
   const contextPercent = contextUsagePercent(chatState, (activeRuntimeSettings ?? chatState.runtimeSettings).nCtx);
 
   return (
-    <div className="chat-surface" data-testid="chat-surface" ref={surfaceRef} onPointerDown={() => setChatMenu(null)}>
+    <div
+      className={["chat-surface", chatLayout.compact ? "chat-surface-compact" : ""].join(" ")}
+      data-testid="chat-surface"
+      ref={surfaceRef}
+      onClick={handleChatSurfaceClick}
+      onPointerDown={() => setChatMenu(null)}
+    >
       <aside className="chat-list" aria-label="Chat projects and threads">
         <button
           className="chat-new-thread-button"
@@ -4548,7 +5090,7 @@ function ChatSurface() {
           <span data-testid="chat-settings-label">Settings</span>
         </button>
       </aside>
-      <section className="chat-main">
+      <section className="chat-main" ref={chatMainRef} style={chatLayoutStyle}>
         <header className="chat-toolbar">
           <div className="chat-title">
             <strong>{activeProject?.title ?? "Project"}</strong>
@@ -4585,9 +5127,8 @@ function ChatSurface() {
           </div>
         </header>
         <div className="chat-top-fade" aria-hidden="true" />
-        <div className="chat-thread" data-testid="chat-message-list">
-          <div className="chat-overlay-scrollbar chat-overlay-scrollbar-thread" aria-hidden="true"><span /></div>
-          <div className="chat-content-column">
+        <div className="chat-thread" data-testid="chat-message-list" ref={threadScrollRef} onScroll={syncThreadFollowState} onWheel={handleThreadWheel}>
+          <div className="chat-content-column" ref={threadContentRef}>
             {!selectedThread ? (
               <div className="chat-empty">
                 <h2>No Thread Selected</h2>
@@ -4599,14 +5140,41 @@ function ChatSurface() {
               selectedMessages.map((message) => (
                 <ChatMessageBubble
                   key={message.id}
+                  autoExpandDisclosures={chatState.appSettings.autoExpandCodexDisclosures}
+                  copiedCodeBlockIds={copiedCodeBlockIds}
                   message={message}
                   onTimelineAction={(blockId, action, answer) => runChatAction(() => window.unitApi.chat.timelineAction({ messageId: message.id, blockId, action, answer }))}
                 />
               ))
             )}
+            <div
+              className="chat-manual-end-spacer"
+              ref={manualEndSpacerRef}
+              aria-hidden="true"
+              style={{ height: `${manualEndSlack}px` }}
+            />
           </div>
         </div>
-        <div className="chat-composer-section">
+        <div
+          className={["chat-overlay-scrollbar chat-overlay-scrollbar-thread", threadScrollbar.scrollable ? "scrollable" : ""].join(" ")}
+          ref={threadScrollbarTrackRef}
+          aria-hidden="true"
+          onPointerDown={jumpThreadScrollbar}
+        >
+          <span
+            style={{ height: `${threadScrollbar.thumbHeight}px`, transform: `translateY(${threadScrollbar.thumbTop}px)` }}
+            onPointerDown={beginThreadScrollbarDrag}
+          />
+        </div>
+        <button
+          className={["chat-scroll-bottom-button", !threadAtBottom && selectedMessages.length > 0 ? "visible" : ""].join(" ")}
+          type="button"
+          aria-label="Scroll to latest message"
+          onClick={resumeThreadTailFollow}
+        >
+          <ArrowDown size={16} />
+        </button>
+        <div className="chat-composer-section" ref={composerSectionRef}>
           <div className="chat-composer-main-row">
           <div className="chat-composer-side-dock left">{leftUsageIndicators}</div>
           <form
@@ -4855,14 +5423,16 @@ function ChatSidebarLimitBar({ label, percent, title }: { label: string; percent
 
 function ChatContextTileBar({ usedPercent, nCtx }: { usedPercent: number; nCtx: number }) {
   const stripCount = 20;
-  const litStrips = usedPercent <= 0 ? 0 : Math.ceil((usedPercent / 100) * stripCount);
   const leftPercent = Math.max(0, 100 - usedPercent);
   const label = `${leftPercent}% context left (${usedPercent}% used of ${formatContextLabel(nCtx)})`;
   return (
     <div className="chat-context-tile-bar" title={label} aria-label={label}>
-      {Array.from({ length: stripCount }, (_, index) => (
-        <span className={index < litStrips ? "lit" : ""} key={index} />
-      ))}
+      {Array.from({ length: stripCount }, (_, index) => {
+        const stripStartPercent = (index / stripCount) * 100;
+        const stripPercent = Math.max(0, Math.min(100, ((usedPercent - stripStartPercent) / (100 / stripCount)) * 100));
+        const stripStyle = { "--chat-context-strip-fill": `${stripPercent}%` } as CSSProperties;
+        return <span key={index} style={stripStyle} />;
+      })}
     </div>
   );
 }
@@ -6376,9 +6946,96 @@ function initialProjectActionButtons(dialog: ChatDialogState, state: ChatState):
 
 type ChatTimelineActionHandler = (blockId: string, action: "approve" | "deny" | "answer" | "retry" | "retry_new_thread", answer?: string) => Promise<void>;
 
-function ChatMessageBubble({ message, onTimelineAction }: { message: ChatMessage; onTimelineAction: ChatTimelineActionHandler }) {
-  const displayContent = message.content || (message.status === "streaming" ? "..." : "");
-  const html = message.role === "user" ? renderChatUserPromptHtml(displayContent, message.attachments) : renderChatMarkdownHtml(displayContent, message.id);
+function preserveClosestChatScroll(origin: HTMLElement, mutate: () => void) {
+  const scrollHost = origin.closest(".chat-thread") as HTMLElement | null;
+  if (!scrollHost) {
+    mutate();
+    return;
+  }
+  const readOverscrollMetrics = () => {
+    const spacer = scrollHost.querySelector<HTMLElement>(".chat-manual-end-spacer");
+    const composer = scrollHost.parentElement?.querySelector<HTMLElement>(".chat-composer-section") ?? document.querySelector<HTMLElement>(".chat-composer-section");
+    if (!spacer || !composer) {
+      return null;
+    }
+    const hostRect = scrollHost.getBoundingClientRect();
+    const spacerRect = spacer.getBoundingClientRect();
+    const composerHeight = Math.max(0, Math.ceil(composer.getBoundingClientRect().height));
+    const effectiveClientHeight = Math.max(1, scrollHost.clientHeight - composerHeight);
+    const hostPaddingBottom = Math.max(0, Math.round(parseFloat(getComputedStyle(scrollHost).paddingBottom) || 0));
+    const spacerTop = scrollHost.scrollTop + spacerRect.top - hostRect.top;
+    const contentScrollHeight = Math.min(scrollHost.scrollHeight, Math.max(0, spacerTop + hostPaddingBottom));
+    return {
+      spacer,
+      contentOverflowScroll: contentScrollHeight - scrollHost.clientHeight,
+      contentMaxScroll: Math.max(0, contentScrollHeight - effectiveClientHeight)
+    };
+  };
+  const overscrollMetrics = readOverscrollMetrics();
+  const beforeScrollTop = scrollHost.scrollTop;
+  const shouldHoldOverscroll = Boolean(overscrollMetrics && beforeScrollTop > overscrollMetrics.contentMaxScroll + 2);
+  if (shouldHoldOverscroll && overscrollMetrics) {
+    const currentSpacerHeight = Math.max(0, Math.round(parseFloat(overscrollMetrics.spacer.style.height || "") || overscrollMetrics.spacer.getBoundingClientRect().height || 0));
+    const requiredSpacerHeight = Math.max(
+      currentSpacerHeight,
+      Math.ceil(Math.max(0, beforeScrollTop - overscrollMetrics.contentOverflowScroll) + 48)
+    );
+    overscrollMetrics.spacer.style.height = `${requiredSpacerHeight}px`;
+  }
+  if (shouldHoldOverscroll) {
+    mutate();
+    requestAnimationFrame(() => {
+      const nextMetrics = readOverscrollMetrics();
+      if (nextMetrics) {
+        const currentSpacerHeight = Math.max(0, Math.round(parseFloat(nextMetrics.spacer.style.height || "") || nextMetrics.spacer.getBoundingClientRect().height || 0));
+        const requiredSpacerHeight = Math.max(
+          currentSpacerHeight,
+          Math.ceil(Math.max(0, beforeScrollTop - nextMetrics.contentOverflowScroll) + 48)
+        );
+        nextMetrics.spacer.style.height = `${requiredSpacerHeight}px`;
+      }
+      scrollHost.scrollTop = beforeScrollTop;
+    });
+    return;
+  }
+  const hostRect = scrollHost.getBoundingClientRect();
+  const candidates = Array.from(scrollHost.querySelectorAll<HTMLElement>(".chat-message, .reasoning-shell, .codex-event-card, .chat-message-body"));
+  const anchor = candidates.find((candidate) => {
+    const rect = candidate.getBoundingClientRect();
+    return rect.top >= hostRect.top + 1 && rect.top < hostRect.bottom - 1;
+  }) ?? candidates.find((candidate) => {
+    const rect = candidate.getBoundingClientRect();
+    return rect.bottom > hostRect.top + 1 && rect.top < hostRect.bottom - 1;
+  }) ?? origin;
+  const anchorTop = anchor.getBoundingClientRect().top;
+  mutate();
+  requestAnimationFrame(() => {
+    if (!anchor.isConnected) {
+      return;
+    }
+    scrollHost.scrollTop = beforeScrollTop + (anchor.getBoundingClientRect().top - anchorTop);
+  });
+}
+
+function ChatMessageBubble({
+  message,
+  autoExpandDisclosures,
+  copiedCodeBlockIds,
+  onTimelineAction
+}: {
+  message: ChatMessage;
+  autoExpandDisclosures: boolean;
+  copiedCodeBlockIds: ReadonlySet<string>;
+  onTimelineAction: ChatTimelineActionHandler;
+}) {
+  const displayContent = message.content;
+  const html = message.role === "user" ? renderChatUserPromptHtml(displayContent, message.attachments) : renderChatMarkdownHtml(displayContent, message.id, copiedCodeBlockIds);
+  const timelineReasoning = message.role === "assistant" ? chatTimelineReasoningText(message.timelineBlocks) : "";
+  const standaloneReasoning = message.role === "assistant" && message.reasoning
+    ? remainingAssistantReasoning(message.reasoning, timelineReasoning)
+    : "";
+  const codexTimelineOwnsAssistantContent = message.role === "assistant" && message.timelineBlocks?.some((block) => block.kind === "assistant_message");
+  const shouldRenderMessageBody = message.role === "user" || (!codexTimelineOwnsAssistantContent && Boolean(html));
   return (
     <article
       className={[
@@ -6396,63 +7053,328 @@ function ChatMessageBubble({ message, onTimelineAction }: { message: ChatMessage
           <small className="assistant-turn-source">{message.sourceLabel || "Built-in"}</small>
         </section>
       ) : null}
-      {message.role === "assistant" && message.reasoning ? (
-        <details className="assistant-turn-reasoning-shell">
-          <summary>Reasoning</summary>
-          <div dangerouslySetInnerHTML={{ __html: renderChatMarkdownHtml(message.reasoning, `${message.id}-reasoning`) }} />
-        </details>
-      ) : null}
-      <div
-        className={[
-          "chat-message-body",
-          message.role === "user" ? "chat-message-bubble chat-message-bubble-user" : "chat-formatted-view assistant-content-block"
-        ].join(" ")}
-        dangerouslySetInnerHTML={{ __html: html }}
-      />
       {message.role === "assistant" && message.timelineBlocks?.length ? (
-        <ChatTimeline blocks={message.timelineBlocks} messageId={message.id} onTimelineAction={onTimelineAction} />
+        <ChatTimeline
+          blocks={message.timelineBlocks}
+          messageId={message.id}
+          autoExpandDisclosures={autoExpandDisclosures}
+          copiedCodeBlockIds={copiedCodeBlockIds}
+          onTimelineAction={onTimelineAction}
+        />
+      ) : null}
+      {message.role === "assistant" && standaloneReasoning ? (
+        <ChatReasoningDisclosure
+          disclosureId={`${message.id}-reasoning`}
+          status={message.status}
+          reasoning={standaloneReasoning}
+          initiallyExpanded={reasoningInitialExpansion(message, autoExpandDisclosures)}
+          autoExpandDisclosures={autoExpandDisclosures}
+          copiedCodeBlockIds={copiedCodeBlockIds}
+        />
+      ) : null}
+      {shouldRenderMessageBody ? (
+        <div
+          className={[
+            "chat-message-body",
+            message.role === "user" ? "chat-message-bubble chat-message-bubble-user" : "chat-formatted-view assistant-content-block"
+          ].join(" ")}
+          dangerouslySetInnerHTML={{ __html: html }}
+        />
       ) : null}
       {message.status === "interrupted" ? <small>Interrupted</small> : message.status === "error" ? <small>Error</small> : null}
     </article>
   );
 }
 
-function ChatTimeline({ blocks, messageId, onTimelineAction }: { blocks: ChatTimelineBlock[]; messageId: string; onTimelineAction: ChatTimelineActionHandler }) {
+function chatTimelineReasoningText(blocks?: ChatTimelineBlock[]) {
+  return (blocks ?? [])
+    .filter((block): block is Extract<ChatTimelineBlock, { kind: "reasoning" }> => block.kind === "reasoning")
+    .map((block) => block.text.trim())
+    .filter(Boolean)
+    .join("\n\n");
+}
+
+function remainingAssistantReasoning(assistantReasoning: string, timelineReasoning: string) {
+  const normalizedAssistant = assistantReasoning.trim();
+  const normalizedTimeline = timelineReasoning.trim();
+  if (!normalizedAssistant || !normalizedTimeline) {
+    return assistantReasoning;
+  }
+  if (normalizedAssistant === normalizedTimeline) {
+    return "";
+  }
+  const compactAssistant = normalizedAssistant.replace(/\s+/g, " ");
+  const compactTimeline = normalizedTimeline.replace(/\s+/g, " ");
+  if (compactAssistant === compactTimeline) {
+    return "";
+  }
+  const tightAssistant = normalizedAssistant.replace(/\s+/g, "");
+  const tightTimeline = normalizedTimeline.replace(/\s+/g, "");
+  if (tightAssistant === tightTimeline) {
+    return "";
+  }
+  if (!normalizedAssistant.startsWith(normalizedTimeline)) {
+    return assistantReasoning;
+  }
+  return normalizedAssistant.slice(normalizedTimeline.length).trimStart();
+}
+
+function reasoningInitialExpansion(message: ChatMessage, autoExpandDisclosures: boolean) {
+  const metadataValue = message.metadata?.reasoningInitiallyExpanded;
+  return typeof metadataValue === "boolean" ? metadataValue : autoExpandDisclosures;
+}
+
+function ChatReasoningDisclosure({
+  disclosureId,
+  status,
+  reasoning,
+  initiallyExpanded,
+  autoExpandDisclosures,
+  copiedCodeBlockIds
+}: {
+  disclosureId: string;
+  status: ChatMessage["status"] | string;
+  reasoning: string;
+  initiallyExpanded?: boolean;
+  autoExpandDisclosures: boolean;
+  copiedCodeBlockIds: ReadonlySet<string>;
+}) {
+  const autoOpen = initiallyExpanded ?? autoExpandDisclosures;
+  const [expanded, setExpanded] = useState(autoOpen);
+  const [panelShouldFollow, setPanelShouldFollow] = useState(true);
+  const disclosureIdRef = useRef(disclosureId);
+  const detailsRef = useRef<HTMLDetailsElement | null>(null);
+  const panelRef = useRef<HTMLDivElement | null>(null);
+  const reasoningHtml = renderChatMarkdownHtml(reasoning, disclosureId, copiedCodeBlockIds);
+
+  useEffect(() => {
+    if (disclosureIdRef.current !== disclosureId) {
+      disclosureIdRef.current = disclosureId;
+      setExpanded(autoOpen);
+      setPanelShouldFollow(true);
+    }
+  }, [autoOpen, disclosureId]);
+
+  useLayoutEffect(() => {
+    const panel = panelRef.current;
+    if (!panel || !expanded || !panelShouldFollow) {
+      return;
+    }
+    panel.scrollTop = panel.scrollHeight;
+  }, [expanded, panelShouldFollow, reasoning.length]);
+
+  const toggleExpanded = useCallback((event: ReactPointerEvent<HTMLElement> | ReactMouseEvent<HTMLElement>) => {
+    event.preventDefault();
+    const details = detailsRef.current;
+    if (!details) {
+      setExpanded((current) => !current);
+      return;
+    }
+    preserveClosestChatScroll(details, () => setExpanded((current) => !current));
+  }, []);
+
+  return (
+    <details
+      ref={detailsRef}
+      className="reasoning-shell assistant-turn-reasoning-shell mathjax_ignore"
+      data-collapsed={expanded ? "0" : "1"}
+      data-streaming={status === "streaming" || status === "started" || status === "updated" ? "1" : "0"}
+      open={expanded}
+    >
+      <summary className="reasoning-toggle" aria-expanded={expanded} onClick={toggleExpanded}>
+        <span className="reasoning-toggle-label">
+          <Brain className="reasoning-toggle-icon" size={16} />
+          <span className="reasoning-toggle-text-group">
+            <span className="reasoning-toggle-text">Reasoning</span>
+            <span className="reasoning-toggle-ellipsis" aria-hidden="true">
+              <span className="assistant-turn-status-dots">
+                <span className="assistant-turn-status-dot">.</span>
+                <span className="assistant-turn-status-dot">.</span>
+                <span className="assistant-turn-status-dot">.</span>
+              </span>
+            </span>
+          </span>
+        </span>
+        <ChevronDown className="reasoning-toggle-caret" size={14} />
+      </summary>
+      <div
+        className="reasoning-panel mathjax_ignore"
+        ref={panelRef}
+        onScroll={(event) => {
+          const panel = event.currentTarget;
+          setPanelShouldFollow(panel.scrollHeight - panel.clientHeight - panel.scrollTop <= 8);
+        }}
+      >
+        <div className="reasoning-content reasoning-content-stream" dangerouslySetInnerHTML={{ __html: reasoningHtml }} />
+      </div>
+    </details>
+  );
+}
+
+function ChatTimeline({
+  blocks,
+  messageId,
+  autoExpandDisclosures,
+  copiedCodeBlockIds,
+  onTimelineAction
+}: {
+  blocks: ChatTimelineBlock[];
+  messageId: string;
+  autoExpandDisclosures: boolean;
+  copiedCodeBlockIds: ReadonlySet<string>;
+  onTimelineAction: ChatTimelineActionHandler;
+}) {
   return (
     <div className="codex-event-stack" aria-label="Assistant timeline">
-      {blocks.map((block, index) => <ChatTimelineBlockView block={block} key={`${messageId}-${block.kind}-${block.id || index}`} onTimelineAction={onTimelineAction} />)}
+      {blocks.map((block, index) => (
+        <ChatTimelineBlockView
+          block={block}
+          key={`${messageId}-${block.kind}-${block.id || index}`}
+          autoExpandDisclosures={autoExpandDisclosures}
+          copiedCodeBlockIds={copiedCodeBlockIds}
+          onTimelineAction={onTimelineAction}
+        />
+      ))}
     </div>
   );
 }
 
-function ChatTimelineBlockView({ block, onTimelineAction }: { block: ChatTimelineBlock; onTimelineAction: ChatTimelineActionHandler }) {
+function ChatDisclosure({
+  blockKey,
+  className,
+  title,
+  status,
+  initiallyExpanded,
+  autoExpandDisclosures,
+  children
+}: {
+  blockKey: string;
+  className: string;
+  title: ReactNode;
+  status?: string;
+  initiallyExpanded?: boolean;
+  autoExpandDisclosures: boolean;
+  children: ReactNode;
+}) {
+  const shouldOpen = initiallyExpanded ?? autoExpandDisclosures;
+  const [expanded, setExpanded] = useState(shouldOpen);
+  const blockKeyRef = useRef(blockKey);
+  const detailsRef = useRef<HTMLDetailsElement | null>(null);
+
+  useEffect(() => {
+    if (blockKeyRef.current !== blockKey) {
+      blockKeyRef.current = blockKey;
+      setExpanded(shouldOpen);
+      return;
+    }
+  }, [blockKey, shouldOpen]);
+
+  const toggleExpanded = useCallback((event: ReactMouseEvent<HTMLElement>) => {
+    event.preventDefault();
+    const details = detailsRef.current;
+    if (!details) {
+      setExpanded((current) => !current);
+      return;
+    }
+    preserveClosestChatScroll(details, () => setExpanded((current) => !current));
+  }, []);
+
+  return (
+    <details
+      ref={detailsRef}
+      className={["codex-event-card codex-event-disclosure codex-tool-shell", className].join(" ")}
+      data-collapsed={expanded ? "0" : "1"}
+      open={expanded}
+    >
+      <summary className="reasoning-toggle codex-tool-shell-toggle" onClick={toggleExpanded}>
+        <span className="reasoning-toggle-label codex-tool-shell-label">
+          <Bolt className="reasoning-toggle-icon codex-tool-shell-icon" size={16} />
+          <span className="reasoning-toggle-text-group">{title}</span>
+        </span>
+        <span className="codex-event-badge" data-status={status}>{formatTimelineStatus(status ?? "")}</span>
+        <ChevronDown className="reasoning-toggle-caret" size={14} />
+      </summary>
+      <div className="codex-event-disclosure-body-shell">
+        <div className="codex-event-disclosure-body codex-tool-shell-panel-inner">
+          {children}
+        </div>
+      </div>
+    </details>
+  );
+}
+
+function ChatTimelineBlockView({
+  block,
+  autoExpandDisclosures,
+  copiedCodeBlockIds,
+  onTimelineAction
+}: {
+  block: ChatTimelineBlock;
+  autoExpandDisclosures: boolean;
+  copiedCodeBlockIds: ReadonlySet<string>;
+  onTimelineAction: ChatTimelineActionHandler;
+}) {
   const [answer, setAnswer] = useState("");
+  if (block.kind === "assistant_message") {
+    const html = renderChatMarkdownHtml(block.text, block.id, copiedCodeBlockIds);
+    return html ? (
+      <div
+        className="chat-message-body chat-formatted-view assistant-content-block codex-assistant-message-block"
+        dangerouslySetInnerHTML={{ __html: html }}
+      />
+    ) : null;
+  }
+  if (block.kind === "reasoning") {
+    return block.text.trim() ? (
+      <section className="codex-reasoning-block">
+        <ChatReasoningDisclosure
+          disclosureId={block.id}
+          status={block.status}
+          reasoning={block.text}
+          initiallyExpanded={block.initiallyExpanded}
+          autoExpandDisclosures={autoExpandDisclosures}
+          copiedCodeBlockIds={copiedCodeBlockIds}
+        />
+      </section>
+    ) : null;
+  }
   if (block.kind === "tool") {
     const title = block.command || block.summary || formatTimelineTitle(block.toolName || "Tool Call");
     return (
-      <details className="codex-event-card codex-tool-card" open={block.status === "started"}>
-        <summary>
-          <span className="codex-event-title">{title}</span>
-          <span className="codex-event-badge" data-status={block.status}>{formatTimelineStatus(block.status)}</span>
-        </summary>
+      <ChatDisclosure
+        blockKey={block.id}
+        className="codex-tool-card"
+        title={<span className="codex-event-title">{title}</span>}
+        status={block.status}
+        initiallyExpanded={block.initiallyExpanded}
+        autoExpandDisclosures={autoExpandDisclosures}
+      >
         {block.directory ? <div className="codex-event-meta">Directory: {block.directory}</div> : null}
         {block.output ? <pre className="codex-event-pre">{block.output}</pre> : null}
-      </details>
+      </ChatDisclosure>
     );
   }
   if (block.kind === "diff") {
     return (
-      <details className="codex-event-card codex-diff-card">
-        <summary>
-          <span className="codex-event-title">{block.summary}</span>
-          <span className="codex-diff-counts codex-diff-counts-compact">
-            <span className="codex-diff-count codex-diff-count-added">+{block.addedLines ?? 0}</span>
-            <span className="codex-diff-count codex-diff-count-deleted">-{block.deletedLines ?? 0}</span>
+      <ChatDisclosure
+        blockKey={block.id}
+        className="codex-diff-card codex-diff-shell"
+        title={(
+          <span className="codex-event-title codex-diff-header-inline">
+            <span>{block.summary}</span>
+            <span className="codex-diff-counts codex-diff-counts-compact">
+              <span className="codex-diff-count codex-diff-count-added">+{block.addedLines ?? 0}</span>
+              <span className="codex-diff-count codex-diff-count-deleted">-{block.deletedLines ?? 0}</span>
+            </span>
           </span>
-        </summary>
+        )}
+        status={block.status ?? "completed"}
+        initiallyExpanded={block.initiallyExpanded}
+        autoExpandDisclosures={autoExpandDisclosures}
+      >
         {block.branchName ? <div className="codex-event-meta">Branch: {block.branchName}</div> : null}
         {block.preview ? <pre className="codex-event-pre codex-diff-preview">{block.preview}</pre> : null}
-      </details>
+      </ChatDisclosure>
     );
   }
   if (block.kind === "plan") {
@@ -6520,11 +7442,12 @@ function ChatTimelineBlockView({ block, onTimelineAction }: { block: ChatTimelin
       : formatTimelineTitle("level" in block ? block.level : "Status");
   const message = "summary" in block ? block.summary : "message" in block ? block.message : block.status;
   const status = "status" in block ? block.status : "info";
+  const level = "level" in block ? block.level : undefined;
   return (
-    <div className="codex-event-card codex-status-card">
+    <div className="codex-event-card codex-status-card" data-kind={block.kind} data-level={level}>
       <div className="codex-event-card-header">
         <span className="codex-event-title">{title}</span>
-        <span className="codex-event-badge" data-status={status}>{formatTimelineStatus(status)}</span>
+        <span className="codex-event-badge" data-status={status} data-level={level}>{formatTimelineStatus(level ?? status)}</span>
       </div>
       <div className="codex-event-text">{message}</div>
       {"code" in block && block.code ? <pre className="codex-event-pre">{block.code}</pre> : null}
@@ -6614,7 +7537,7 @@ function contextUsagePercent(state: ChatState, nCtx: number) {
   const selectedMessages = state.messages.filter((message) => message.threadId === state.selectedThreadId);
   const usedCharacters = selectedMessages.reduce((total, message) => total + message.content.length + (message.reasoning?.length ?? 0), 0);
   const approximateTokens = Math.ceil(usedCharacters / 4);
-  return Math.max(0, Math.min(100, Math.round((approximateTokens / Math.max(1, nCtx)) * 100)));
+  return Math.max(0, Math.min(100, Math.round((approximateTokens / Math.max(1, nCtx)) * 1000) / 10));
 }
 
 type CodexLimitWindowView = {
@@ -6731,12 +7654,12 @@ function attachmentPreviewSrc(filePath: string) {
   return normalized.startsWith("/") ? `file://${normalized}` : `file:///${normalized}`;
 }
 
-function renderChatMarkdownHtml(markdown: string, footnoteScope: string) {
+function renderChatMarkdownHtml(markdown: string, footnoteScope: string, copiedCodeBlockIds?: ReadonlySet<string>) {
   if (!markdown.trim()) {
     return "";
   }
   const { source, replacements } = extractChatMath(markdown);
-  let html = chatMarkdown.render(source);
+  let html = chatMarkdown.render(source, { copiedCodeBlockIds, footnoteScope } satisfies ChatMarkdownRenderEnv);
   html = scopeChatFootnotes(html, footnoteScope);
   for (const replacement of replacements) {
     if (replacement.kind === "display") {

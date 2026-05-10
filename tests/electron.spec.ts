@@ -27,6 +27,26 @@ async function firstWindow(app: ElectronApplication): Promise<Page> {
   return page;
 }
 
+async function configureMockCodexThread(page: Page, autoExpandCodexDisclosures = true): Promise<void> {
+  await page.evaluate(async ({ autoExpand }) => {
+    const state = await window.unitApi.chat.bootstrap();
+    await window.unitApi.chat.updateAppSettings({ settings: { autoExpandCodexDisclosures: autoExpand } });
+    await window.unitApi.chat.updateProjectSettings({
+      projectId: state.selectedProjectId,
+      title: state.projects.find((project) => project.id === state.selectedProjectId)?.title ?? "Project 1",
+      directory: "C:\\Workspace"
+    });
+    await window.unitApi.chat.updateThreadSettings({
+      threadId: state.selectedThreadId,
+      providerMode: "codex",
+      codexModelId: "gpt-5.3-codex",
+      codexReasoningEffort: "medium",
+      permissionMode: "default_permissions",
+      planModeEnabled: true
+    });
+  }, { autoExpand: autoExpandCodexDisclosures });
+}
+
 async function tabOrder(page: Page): Promise<string[]> {
   return page.locator("[data-workspace-tab]").evaluateAll((tabs) =>
     tabs.map((tab) => tab.textContent?.trim() ?? "")
@@ -427,6 +447,73 @@ test("chat Codex mode uses mocked events and provider-aware menus", async () => 
   const assistant = state.messages.find((message) => message.role === "assistant");
   expect(assistant?.sourceLabel).toBe("Codex");
   expect(assistant?.timelineBlocks?.some((block) => block.kind === "tool")).toBe(true);
+  const assistantRenderOrder = await page.evaluate(() => {
+    const assistantMessage = document.querySelector<HTMLElement>("[data-testid='chat-message-assistant']");
+    const plan = assistantMessage?.querySelector<HTMLElement>(".codex-plan-card");
+    const reasoning = assistantMessage?.querySelector<HTMLElement>(".codex-reasoning-block");
+    const tool = assistantMessage?.querySelector<HTMLElement>(".codex-tool-card");
+    const body = assistantMessage?.querySelector<HTMLElement>(".codex-assistant-message-block");
+    const duplicateStandaloneBody = assistantMessage?.querySelector<HTMLElement>(":scope > .assistant-content-block");
+    const reasoningDetails = assistantMessage?.querySelector<HTMLDetailsElement>(".codex-reasoning-block details.reasoning-shell");
+    const toolDetails = assistantMessage?.querySelector<HTMLDetailsElement>("details.codex-tool-card");
+    const badge = assistantMessage?.querySelector<HTMLElement>(".codex-event-badge[data-status='completed']");
+    if (!assistantMessage || !plan || !reasoning || !tool || !body || !reasoningDetails || !toolDetails || !badge) {
+      throw new Error("Missing Codex assistant render elements");
+    }
+    return {
+      planTop: Math.round(plan.getBoundingClientRect().top),
+      reasoningTop: Math.round(reasoning.getBoundingClientRect().top),
+      toolTop: Math.round(tool.getBoundingClientRect().top),
+      bodyTop: Math.round(body.getBoundingClientRect().top),
+      hasDuplicateStandaloneBody: Boolean(duplicateStandaloneBody),
+      reasoningOpen: reasoningDetails.open,
+      toolOpen: toolDetails.open,
+      badgeColor: getComputedStyle(badge).color
+    };
+  });
+  expect(assistantRenderOrder.planTop).toBeLessThanOrEqual(assistantRenderOrder.reasoningTop);
+  expect(assistantRenderOrder.reasoningTop).toBeLessThanOrEqual(assistantRenderOrder.toolTop);
+  expect(assistantRenderOrder.toolTop).toBeLessThanOrEqual(assistantRenderOrder.bodyTop);
+  expect(assistantRenderOrder.hasDuplicateStandaloneBody).toBe(false);
+  expect(assistantRenderOrder.reasoningOpen).toBe(false);
+  expect(assistantRenderOrder.toolOpen).toBe(false);
+  expect(assistantRenderOrder.badgeColor).toBe("rgb(168, 213, 182)");
+
+  await app.close();
+});
+
+test("chat fenced code blocks can be copied", async () => {
+  const app = await launchApp();
+  const page = await firstWindow(app);
+  await expect(page.getByTestId("chat-surface")).toBeVisible();
+  await configureMockCodexThread(page);
+
+  await page.evaluate(() => {
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: {
+        writeText: async (text: string) => {
+          (window as typeof window & { __unitCopiedCode?: string }).__unitCopiedCode = text;
+        }
+      }
+    });
+  });
+
+  await page.evaluate((text) => window.unitApi.chat.submit({ text }), "show this block\n```ts\nconst value = 42;\n```\n");
+  await expect(page.locator(".chat-code-copy-button").first()).toBeVisible();
+  const widthBeforeCopy = await page.locator(".chat-code-copy-button").first().evaluate((button) => Math.round(button.getBoundingClientRect().width));
+  await page.locator(".chat-code-copy-button").first().click();
+  await expect.poll(() => page.evaluate(() => (window as typeof window & { __unitCopiedCode?: string }).__unitCopiedCode)).toBe("const value = 42;\n");
+  await expect(page.locator(".chat-code-copy-button").first()).toHaveText("Copied");
+  const widthAfterCopy = await page.locator(".chat-code-copy-button").first().evaluate((button) => Math.round(button.getBoundingClientRect().width));
+  expect(widthAfterCopy).toBe(widthBeforeCopy);
+  await page.evaluate(async () => {
+    const state = await window.unitApi.chat.bootstrap();
+    await window.unitApi.chat.updateAppSettings({ settings: { autoExpandCodexDisclosures: !state.appSettings.autoExpandCodexDisclosures } });
+  });
+  await expect(page.locator(".chat-code-copy-button").first()).toHaveText("Copied");
+  await page.waitForTimeout(1500);
+  await expect(page.locator(".chat-code-copy-button").first()).toHaveText("Copied");
 
   await app.close();
 });
@@ -454,6 +541,570 @@ test("chat sidebar renders Codex limit usage and remaining hover text", async ()
   ]);
   expect(parseFloat(rows[0].backgroundSize ?? "")).toBeCloseTo(10000 / 88, 3);
   expect(parseFloat(rows[1].backgroundSize ?? "")).toBeCloseTo(10000 / 66, 3);
+
+  await app.close();
+});
+
+test("chat reasoning fenced code copy state survives rerender", async () => {
+  const app = await launchApp();
+  const page = await firstWindow(app);
+  await expect(page.getByTestId("chat-surface")).toBeVisible();
+  await configureMockCodexThread(page);
+
+  await page.evaluate(() => {
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: {
+        writeText: async (text: string) => {
+          (window as typeof window & { __unitCopiedCode?: string }).__unitCopiedCode = text;
+        }
+      }
+    });
+  });
+
+  await page.evaluate(() => window.unitApi.chat.submit({ text: "[reasoning-code-fixture]" }));
+  await expect(page.getByTestId("chat-message-assistant")).toContainText("Mocked Codex response");
+  await page.locator("details.reasoning-shell summary.reasoning-toggle").first().click();
+
+  await expect(page.locator("details.reasoning-shell .chat-code-copy-button").first()).toBeVisible();
+  const widthBeforeCopy = await page.locator("details.reasoning-shell .chat-code-copy-button").first().evaluate((button) => Math.round(button.getBoundingClientRect().width));
+  await page.locator("details.reasoning-shell .chat-code-copy-button").first().click();
+  await expect.poll(() => page.evaluate(() => (window as typeof window & { __unitCopiedCode?: string }).__unitCopiedCode)).toBe("const reason = 7;\n");
+  await expect(page.locator("details.reasoning-shell .chat-code-copy-button").first()).toHaveText("Copied");
+  const widthAfterCopy = await page.locator("details.reasoning-shell .chat-code-copy-button").first().evaluate((button) => Math.round(button.getBoundingClientRect().width));
+  expect(widthAfterCopy).toBe(widthBeforeCopy);
+  await page.evaluate(async () => {
+    const state = await window.unitApi.chat.bootstrap();
+    await window.unitApi.chat.updateAppSettings({ settings: { autoExpandCodexDisclosures: !state.appSettings.autoExpandCodexDisclosures } });
+  });
+  await expect(page.locator("details.reasoning-shell .chat-code-copy-button").first()).toHaveText("Copied");
+
+  await app.close();
+});
+
+test("chat context bar partially fills each strip left to right", async () => {
+  const app = await launchApp();
+  const page = await firstWindow(app);
+  await expect(page.getByTestId("chat-surface")).toBeVisible();
+  await configureMockCodexThread(page);
+
+  await page.evaluate(async () => {
+    const state = await window.unitApi.chat.bootstrap();
+    await window.unitApi.chat.updateThreadSettings({
+      threadId: state.selectedThreadId,
+      runtimeSettings: { nCtx: 4000 }
+    });
+  });
+  await page.evaluate((text) => window.unitApi.chat.submit({ text }), "x".repeat(100));
+
+  await expect.poll(() => page.locator(".chat-context-tile-bar span").first().evaluate((strip) =>
+    getComputedStyle(strip).getPropertyValue("--chat-context-strip-fill").trim()
+  )).not.toBe("0%");
+
+  const stripState = await page.evaluate(() => {
+    const strips = Array.from(document.querySelectorAll<HTMLElement>(".chat-context-tile-bar span"));
+    const firstStyle = getComputedStyle(strips[0]);
+    const secondStyle = getComputedStyle(strips[1]);
+    return {
+      firstFill: parseFloat(firstStyle.getPropertyValue("--chat-context-strip-fill")),
+      firstBackgroundPosition: firstStyle.backgroundPosition,
+      firstBackgroundFillSize: parseFloat(firstStyle.backgroundSize),
+      secondFill: parseFloat(secondStyle.getPropertyValue("--chat-context-strip-fill"))
+    };
+  });
+  expect(stripState.firstFill).toBeGreaterThan(0);
+  expect(stripState.firstFill).toBeLessThan(100);
+  expect(stripState.secondFill).toBe(0);
+  expect(stripState.firstBackgroundPosition).toContain("0px 0px");
+  expect(stripState.firstBackgroundFillSize).toBeCloseTo(stripState.firstFill, 1);
+
+  await app.close();
+});
+
+test("chat applet recomputes compact transcript geometry from its own width", async () => {
+  const app = await launchApp();
+  const page = await firstWindow(app);
+  await page.setViewportSize({ width: 640, height: 760 });
+  await expect(page.getByTestId("chat-surface")).toBeVisible();
+  await expect(page.locator(".chat-surface")).toHaveClass(/chat-surface-compact/);
+
+  const metrics = await page.evaluate(() => {
+    const main = document.querySelector<HTMLElement>(".chat-main");
+    const column = document.querySelector<HTMLElement>(".chat-content-column");
+    const composer = document.querySelector<HTMLElement>(".chat-composer");
+    const overlay = document.querySelector<HTMLElement>(".chat-composer-section");
+    if (!main || !column || !composer || !overlay) {
+      throw new Error("Chat geometry elements missing");
+    }
+    return {
+      mainWidth: Math.round(main.getBoundingClientRect().width),
+      columnWidth: Math.round(column.getBoundingClientRect().width),
+      composerWidth: Math.round(composer.getBoundingClientRect().width),
+      cssContentWidth: Math.round(parseFloat(getComputedStyle(main).getPropertyValue("--chat-content-width"))),
+      overlayBackground: getComputedStyle(overlay).backgroundColor,
+      overlayZIndex: getComputedStyle(overlay).zIndex
+    };
+  });
+
+  expect(metrics.cssContentWidth).toBeLessThan(metrics.mainWidth);
+  expect(metrics.columnWidth).toBe(metrics.cssContentWidth);
+  expect(metrics.composerWidth).toBe(metrics.cssContentWidth);
+  expect(metrics.overlayBackground).toBe("rgb(12, 16, 20)");
+  expect(metrics.overlayZIndex).toBe("2");
+
+  await app.close();
+});
+
+test("chat transcript scrollbar and latest-message control drive the scroll host", async () => {
+  const app = await launchApp();
+  const page = await firstWindow(app);
+  await page.setViewportSize({ width: 900, height: 560 });
+  await expect(page.getByTestId("chat-surface")).toBeVisible();
+  await configureMockCodexThread(page);
+
+  const longPrompt = Array.from({ length: 120 }, (_, index) => `scrollbar line ${index + 1}`).join("\n");
+  await page.evaluate((text) => window.unitApi.chat.submit({ text }), longPrompt);
+  await expect(page.getByTestId("chat-message-assistant")).toContainText("Mocked Codex response");
+
+  const scrollMetrics = await page.evaluate(async () => {
+    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+    const thread = document.querySelector<HTMLElement>(".chat-thread");
+    const track = document.querySelector<HTMLElement>(".chat-overlay-scrollbar-thread");
+    const thumb = document.querySelector<HTMLElement>(".chat-overlay-scrollbar-thread span");
+    const overlay = document.querySelector<HTMLElement>(".chat-composer-section");
+    const spacer = document.querySelector<HTMLElement>(".chat-manual-end-spacer");
+    const lastMessage = Array.from(document.querySelectorAll<HTMLElement>(".chat-message")).at(-1);
+    if (!thread || !track || !thumb || !overlay || !spacer || !lastMessage) {
+      throw new Error("Missing transcript scrollbar elements");
+    }
+    const hostRect = thread.getBoundingClientRect();
+    const spacerRect = spacer.getBoundingClientRect();
+    const overlayRect = overlay.getBoundingClientRect();
+    const hostPaddingBottom = Math.max(0, Math.round(parseFloat(getComputedStyle(thread).paddingBottom) || 0));
+    const effectiveClientHeight = Math.max(1, thread.clientHeight - Math.ceil(overlayRect.height));
+    const spacerTop = thread.scrollTop + spacerRect.top - hostRect.top;
+    const contentMaxScroll = Math.max(0, Math.min(thread.scrollHeight, spacerTop + hostPaddingBottom) - effectiveClientHeight);
+    const physicalMaxScroll = Math.max(0, thread.scrollHeight - thread.clientHeight);
+    const lastRect = lastMessage.getBoundingClientRect();
+    return {
+      scrollable: track.classList.contains("scrollable"),
+      scrollHeight: thread.scrollHeight,
+      clientHeight: thread.clientHeight,
+      contentMaxScroll,
+      physicalMaxScroll,
+      manualSlack: Math.round(spacerRect.height),
+      thumbHeight: Math.round(thumb.getBoundingClientRect().height),
+      lastMessageAboveOverlay: lastRect.bottom <= overlayRect.top + 2
+    };
+  });
+  expect(scrollMetrics.scrollHeight).toBeGreaterThan(scrollMetrics.clientHeight);
+  expect(scrollMetrics.physicalMaxScroll).toBeGreaterThan(scrollMetrics.contentMaxScroll + 80);
+  expect(scrollMetrics.manualSlack).toBeGreaterThanOrEqual(120);
+  expect(scrollMetrics.scrollable).toBe(true);
+  expect(scrollMetrics.thumbHeight).toBeGreaterThanOrEqual(42);
+  expect(scrollMetrics.lastMessageAboveOverlay).toBe(true);
+
+  await page.evaluate(() => {
+    const thread = document.querySelector<HTMLElement>(".chat-thread");
+    if (!thread) {
+      throw new Error("Missing transcript");
+    }
+    thread.scrollTop = 0;
+    thread.dispatchEvent(new Event("scroll", { bubbles: true }));
+  });
+  await expect(page.locator(".chat-scroll-bottom-button.visible").first()).toBeVisible();
+  const buttonAlignment = await page.evaluate(() => {
+    const button = Array.from(document.querySelectorAll<HTMLElement>(".chat-scroll-bottom-button.visible"))
+      .find((element) => element.getBoundingClientRect().width > 0);
+    const main = button?.closest<HTMLElement>(".chat-main");
+    const content = main?.querySelector<HTMLElement>(".chat-content-column");
+    if (!button || !main || !content) {
+      throw new Error("Missing scroll button alignment elements");
+    }
+    const buttonRect = button.getBoundingClientRect();
+    const mainRect = main.getBoundingClientRect();
+    const contentRect = content.getBoundingClientRect();
+    const contentCenterX = contentRect.width > 0 ? contentRect.left + contentRect.width / 2 : mainRect.left + mainRect.width / 2;
+    return {
+      buttonCenterX: buttonRect.left + buttonRect.width / 2,
+      contentCenterX,
+      mainCenterX: mainRect.left + mainRect.width / 2
+    };
+  });
+  expectPixelAligned(buttonAlignment.buttonCenterX, buttonAlignment.mainCenterX, 1.5);
+  expectPixelAligned(buttonAlignment.buttonCenterX, buttonAlignment.contentCenterX, 1.5);
+  await expect.poll(() => page.evaluate(() => {
+    const track = document.querySelector<HTMLElement>(".chat-overlay-scrollbar-thread");
+    const thumb = document.querySelector<HTMLElement>(".chat-overlay-scrollbar-thread span");
+    if (!track || !thumb) {
+      throw new Error("Missing transcript scrollbar");
+    }
+    return Math.round(thumb.getBoundingClientRect().top - track.getBoundingClientRect().top);
+  })).toBeLessThanOrEqual(2);
+  const thumbBefore = await page.locator(".chat-overlay-scrollbar-thread span").evaluate((thumb) => thumb.getBoundingClientRect().top);
+  const trackBox = await page.locator(".chat-overlay-scrollbar-thread").boundingBox();
+  expect(trackBox).not.toBeNull();
+  await page.mouse.click(trackBox!.x + trackBox!.width / 2, trackBox!.y + trackBox!.height - 6);
+  await expect.poll(() => page.evaluate(() => document.querySelector<HTMLElement>(".chat-thread")?.scrollTop ?? 0)).toBeGreaterThan(20);
+  const trackClickBottomDistance = await page.evaluate(() => {
+    const thread = document.querySelector<HTMLElement>(".chat-thread");
+    const spacer = document.querySelector<HTMLElement>(".chat-manual-end-spacer");
+    const overlay = document.querySelector<HTMLElement>(".chat-composer-section");
+    if (!thread || !spacer || !overlay) {
+      throw new Error("Missing overscroll elements");
+    }
+    const hostRect = thread.getBoundingClientRect();
+    const spacerRect = spacer.getBoundingClientRect();
+    const overlayRect = overlay.getBoundingClientRect();
+    const hostPaddingBottom = Math.max(0, Math.round(parseFloat(getComputedStyle(thread).paddingBottom) || 0));
+    const effectiveClientHeight = Math.max(1, thread.clientHeight - Math.ceil(overlayRect.height));
+    const spacerTop = thread.scrollTop + spacerRect.top - hostRect.top;
+    const contentMaxScroll = Math.max(0, Math.min(thread.scrollHeight, spacerTop + hostPaddingBottom) - effectiveClientHeight);
+    return Math.round(Math.abs(thread.scrollTop - contentMaxScroll));
+  });
+  expect(trackClickBottomDistance).toBeLessThanOrEqual(24);
+  const thumbAfter = await page.locator(".chat-overlay-scrollbar-thread span").evaluate((thumb) => thumb.getBoundingClientRect().top);
+  expect(thumbAfter).toBeGreaterThan(thumbBefore);
+
+  await page.evaluate(() => {
+    const thread = document.querySelector<HTMLElement>(".chat-thread");
+    if (!thread) {
+      throw new Error("Missing transcript");
+    }
+    thread.scrollTop = 0;
+    thread.dispatchEvent(new Event("scroll", { bubbles: true }));
+    const originalScrollTo = thread.scrollTo.bind(thread);
+    (window as unknown as { __chatScrollToBehaviors: Array<ScrollBehavior | undefined> }).__chatScrollToBehaviors = [];
+    thread.scrollTo = ((options?: ScrollToOptions | number, y?: number) => {
+      if (typeof options === "object") {
+        (window as unknown as { __chatScrollToBehaviors: Array<ScrollBehavior | undefined> }).__chatScrollToBehaviors.push(options.behavior);
+        return originalScrollTo(options);
+      }
+      return originalScrollTo(options ?? 0, y ?? 0);
+    }) as typeof thread.scrollTo;
+  });
+  await page.getByLabel("Scroll to latest message").click();
+  expect(await page.evaluate(() => (window as unknown as { __chatScrollToBehaviors?: Array<ScrollBehavior | undefined> }).__chatScrollToBehaviors ?? [])).toContain("smooth");
+  await expect.poll(() => page.evaluate(() => {
+    const thread = document.querySelector<HTMLElement>(".chat-thread");
+    const spacer = document.querySelector<HTMLElement>(".chat-manual-end-spacer");
+    const overlay = document.querySelector<HTMLElement>(".chat-composer-section");
+    if (!thread || !spacer || !overlay) {
+      throw new Error("Missing transcript");
+    }
+    const hostRect = thread.getBoundingClientRect();
+    const spacerRect = spacer.getBoundingClientRect();
+    const overlayRect = overlay.getBoundingClientRect();
+    const hostPaddingBottom = Math.max(0, Math.round(parseFloat(getComputedStyle(thread).paddingBottom) || 0));
+    const effectiveClientHeight = Math.max(1, thread.clientHeight - Math.ceil(overlayRect.height));
+    const spacerTop = thread.scrollTop + spacerRect.top - hostRect.top;
+    const contentMaxScroll = Math.max(0, Math.min(thread.scrollHeight, spacerTop + hostPaddingBottom) - effectiveClientHeight);
+    return Math.round(Math.abs(contentMaxScroll - thread.scrollTop));
+  })).toBeLessThanOrEqual(24);
+
+  await app.close();
+});
+
+test("chat overscroll waits for content bottom before resuming latest follow", async () => {
+  const app = await launchApp();
+  const page = await firstWindow(app);
+  await page.setViewportSize({ width: 900, height: 560 });
+  await expect(page.getByTestId("chat-surface")).toBeVisible();
+  await configureMockCodexThread(page);
+
+  const longPrompt = Array.from({ length: 120 }, (_, index) => `overscroll line ${index + 1}`).join("\n");
+  await page.evaluate((text) => window.unitApi.chat.submit({ text }), longPrompt);
+  await expect(page.getByTestId("chat-message-assistant")).toContainText("Mocked Codex response");
+  await expect.poll(() => page.evaluate(async () => (await window.unitApi.chat.bootstrap()).generation.status)).toBe("idle");
+
+  await page.evaluate(async () => {
+    const readMetrics = () => {
+      const thread = document.querySelector<HTMLElement>(".chat-thread");
+      const spacer = document.querySelector<HTMLElement>(".chat-manual-end-spacer");
+      const overlay = document.querySelector<HTMLElement>(".chat-composer-section");
+      if (!thread || !spacer || !overlay) {
+        throw new Error("Missing overscroll elements");
+      }
+      const hostRect = thread.getBoundingClientRect();
+      const spacerRect = spacer.getBoundingClientRect();
+      const overlayRect = overlay.getBoundingClientRect();
+      const hostPaddingBottom = Math.max(0, Math.round(parseFloat(getComputedStyle(thread).paddingBottom) || 0));
+      const effectiveClientHeight = Math.max(1, thread.clientHeight - Math.ceil(overlayRect.height));
+      const spacerTop = thread.scrollTop + spacerRect.top - hostRect.top;
+      const contentMaxScroll = Math.max(0, Math.min(thread.scrollHeight, spacerTop + hostPaddingBottom) - effectiveClientHeight);
+      return {
+        thread,
+        contentMaxScroll,
+        maxScroll: Math.max(0, thread.scrollHeight - thread.clientHeight),
+        scrollTop: thread.scrollTop
+      };
+    };
+    const metrics = readMetrics();
+    metrics.thread.scrollTop = metrics.contentMaxScroll;
+    metrics.thread.dispatchEvent(new Event("scroll", { bubbles: true }));
+    await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+  });
+
+  await page.evaluate(async () => {
+    const thread = document.querySelector<HTMLElement>(".chat-thread");
+    const spacer = document.querySelector<HTMLElement>(".chat-manual-end-spacer");
+    if (!thread || !spacer) {
+      throw new Error("Missing overscroll elements");
+    }
+    spacer.style.height = `${Math.round(spacer.getBoundingClientRect().height + 900)}px`;
+    await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+  });
+  await expect.poll(() => page.evaluate(() => {
+    const thread = document.querySelector<HTMLElement>(".chat-thread");
+    const spacer = document.querySelector<HTMLElement>(".chat-manual-end-spacer");
+    const overlay = document.querySelector<HTMLElement>(".chat-composer-section");
+    if (!thread || !spacer || !overlay) {
+      throw new Error("Missing overscroll elements");
+    }
+    const hostRect = thread.getBoundingClientRect();
+    const spacerRect = spacer.getBoundingClientRect();
+    const overlayRect = overlay.getBoundingClientRect();
+    const hostPaddingBottom = Math.max(0, Math.round(parseFloat(getComputedStyle(thread).paddingBottom) || 0));
+    const effectiveClientHeight = Math.max(1, thread.clientHeight - Math.ceil(overlayRect.height));
+    const spacerTop = thread.scrollTop + spacerRect.top - hostRect.top;
+    const contentMaxScroll = Math.max(0, Math.min(thread.scrollHeight, spacerTop + hostPaddingBottom) - effectiveClientHeight);
+    const maxScroll = Math.max(0, thread.scrollHeight - thread.clientHeight);
+    return Math.round(maxScroll - contentMaxScroll);
+  })).toBeGreaterThan(500);
+
+  const before = await page.evaluate(async () => {
+    const readMetrics = () => {
+      const thread = document.querySelector<HTMLElement>(".chat-thread");
+      const spacer = document.querySelector<HTMLElement>(".chat-manual-end-spacer");
+      const overlay = document.querySelector<HTMLElement>(".chat-composer-section");
+      if (!thread || !spacer || !overlay) {
+        throw new Error("Missing overscroll elements");
+      }
+      const hostRect = thread.getBoundingClientRect();
+      const spacerRect = spacer.getBoundingClientRect();
+      const overlayRect = overlay.getBoundingClientRect();
+      const hostPaddingBottom = Math.max(0, Math.round(parseFloat(getComputedStyle(thread).paddingBottom) || 0));
+      const effectiveClientHeight = Math.max(1, thread.clientHeight - Math.ceil(overlayRect.height));
+      const spacerTop = thread.scrollTop + spacerRect.top - hostRect.top;
+      const contentMaxScroll = Math.max(0, Math.min(thread.scrollHeight, spacerTop + hostPaddingBottom) - effectiveClientHeight);
+      return {
+        thread,
+        contentMaxScroll,
+        maxScroll: Math.max(0, thread.scrollHeight - thread.clientHeight),
+        scrollTop: thread.scrollTop
+      };
+    };
+    let metrics = readMetrics();
+    metrics = readMetrics();
+    const overscrollTop = Math.min(metrics.contentMaxScroll + 720, metrics.maxScroll - 8);
+    if (overscrollTop <= metrics.contentMaxScroll + 500) {
+      throw new Error(`Manual end slack did not allow enough overscroll: ${overscrollTop - metrics.contentMaxScroll}`);
+    }
+    metrics.thread.scrollTop = overscrollTop;
+    metrics.thread.dispatchEvent(new Event("scroll", { bubbles: true }));
+    await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+    metrics = readMetrics();
+    return {
+      scrollTop: Math.round(metrics.scrollTop),
+      contentMaxScroll: Math.round(metrics.contentMaxScroll),
+      overscrollOffset: Math.round(metrics.scrollTop - metrics.contentMaxScroll),
+      maxScroll: Math.round(metrics.maxScroll)
+    };
+  });
+  expect(before.overscrollOffset).toBeGreaterThan(500);
+
+  await page.evaluate(() => window.unitApi.chat.submit({ text: "short overscroll probe" }));
+  await expect(page.getByTestId("chat-message-assistant").nth(1)).toContainText("Mocked Codex response: short overscroll probe");
+  await expect.poll(() => page.evaluate(async () => (await window.unitApi.chat.bootstrap()).generation.status)).toBe("idle");
+
+  const after = await page.evaluate(async () => {
+    await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+    const thread = document.querySelector<HTMLElement>(".chat-thread");
+    const spacer = document.querySelector<HTMLElement>(".chat-manual-end-spacer");
+    const overlay = document.querySelector<HTMLElement>(".chat-composer-section");
+    const latestButtonVisible = Boolean(document.querySelector<HTMLElement>(".chat-scroll-bottom-button.visible"));
+    if (!thread || !spacer || !overlay) {
+      throw new Error("Missing overscroll elements");
+    }
+    const hostRect = thread.getBoundingClientRect();
+    const spacerRect = spacer.getBoundingClientRect();
+    const overlayRect = overlay.getBoundingClientRect();
+    const hostPaddingBottom = Math.max(0, Math.round(parseFloat(getComputedStyle(thread).paddingBottom) || 0));
+    const effectiveClientHeight = Math.max(1, thread.clientHeight - Math.ceil(overlayRect.height));
+    const spacerTop = thread.scrollTop + spacerRect.top - hostRect.top;
+    const contentMaxScroll = Math.max(0, Math.min(thread.scrollHeight, spacerTop + hostPaddingBottom) - effectiveClientHeight);
+    return {
+      scrollTop: Math.round(thread.scrollTop),
+      contentMaxScroll: Math.round(contentMaxScroll),
+      overscrollOffset: Math.round(thread.scrollTop - contentMaxScroll),
+      latestButtonVisible
+    };
+  });
+  expect(Math.abs(after.scrollTop - before.scrollTop)).toBeLessThanOrEqual(12);
+  expect(after.contentMaxScroll).toBeGreaterThan(before.contentMaxScroll);
+  expect(after.overscrollOffset).toBeLessThan(before.overscrollOffset);
+  expect(after.overscrollOffset).toBeGreaterThan(24);
+  expect(after.latestButtonVisible).toBe(false);
+
+  await app.close();
+});
+
+test("chat disclosure changes preserve the transcript reading position", async () => {
+  const app = await launchApp();
+  const page = await firstWindow(app);
+  await page.setViewportSize({ width: 900, height: 620 });
+  await expect(page.getByTestId("chat-surface")).toBeVisible();
+  await configureMockCodexThread(page, false);
+
+  await page.evaluate(() => window.unitApi.chat.submit({ text: "first disclosure turn" }));
+  await expect(page.getByTestId("chat-message-assistant")).toContainText("Mocked Codex response");
+  await expect.poll(() => page.evaluate(async () => (await window.unitApi.chat.bootstrap()).generation.status)).toBe("idle");
+  const longPrompt = Array.from({ length: 100 }, (_, index) => `second turn line ${index + 1}`).join("\n");
+  await page.evaluate((text) => window.unitApi.chat.submit({ text }), longPrompt);
+  await expect(page.getByTestId("chat-message-assistant").nth(1)).toContainText("Mocked Codex response");
+
+  await expect.poll(() => page.evaluate(() => {
+    const firstDisclosure = document.querySelector<HTMLDetailsElement>("details.codex-event-disclosure");
+    const firstReasoning = document.querySelector<HTMLDetailsElement>("details.reasoning-shell");
+    return {
+      toolOpen: firstDisclosure?.open ?? null,
+      reasoningOpen: firstReasoning?.open ?? null
+    };
+  })).toEqual({ toolOpen: false, reasoningOpen: false });
+
+  await page.evaluate(async () => {
+    const firstDisclosure = document.querySelector<HTMLDetailsElement>("details.codex-event-disclosure");
+    const firstSummary = firstDisclosure?.querySelector<HTMLElement>("summary");
+    const firstDisclosureBody = firstDisclosure?.querySelector<HTMLElement>(".codex-event-disclosure-body-shell");
+    const secondUserMessage = document.querySelectorAll<HTMLElement>("[data-testid='chat-message-user']").item(1);
+    const thread = document.querySelector<HTMLElement>(".chat-thread");
+    if (!firstDisclosure || !firstSummary || !firstDisclosureBody || !secondUserMessage || !thread) {
+      throw new Error("Missing disclosure preservation elements");
+    }
+    if (firstDisclosure.open) {
+      throw new Error("Timeline disclosure should not auto-expand when auto-expand is disabled");
+    }
+    firstDisclosureBody.style.minHeight = "720px";
+    secondUserMessage.scrollIntoView({ block: "start" });
+    thread.scrollTop += 18;
+    thread.dispatchEvent(new Event("scroll", { bubbles: true }));
+    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+  });
+
+  const before = await page.evaluate(() => {
+    const secondUserMessage = document.querySelectorAll<HTMLElement>("[data-testid='chat-message-user']").item(1);
+    const thread = document.querySelector<HTMLElement>(".chat-thread");
+    if (!secondUserMessage || !thread) {
+      throw new Error("Missing second user message");
+    }
+    return {
+      top: Math.round(secondUserMessage.getBoundingClientRect().top),
+      scrollTop: Math.round(thread.scrollTop)
+    };
+  });
+
+  await page.evaluate(async () => {
+    const firstSummary = document.querySelector<HTMLElement>("details.codex-event-disclosure summary");
+    if (!firstSummary) {
+      throw new Error("Missing disclosure summary");
+    }
+    firstSummary.click();
+    await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+  });
+
+  const after = await page.evaluate(() => {
+    const secondUserMessage = document.querySelectorAll<HTMLElement>("[data-testid='chat-message-user']").item(1);
+    const thread = document.querySelector<HTMLElement>(".chat-thread");
+    if (!secondUserMessage || !thread) {
+      throw new Error("Missing second user message");
+    }
+    return {
+      top: Math.round(secondUserMessage.getBoundingClientRect().top),
+      scrollTop: Math.round(thread.scrollTop)
+    };
+  });
+  expect(Math.abs(after.top - before.top)).toBeLessThanOrEqual(3);
+  expect(after.scrollTop).toBeGreaterThan(before.scrollTop + 600);
+
+  await app.close();
+});
+
+test("chat reasoning collapse preserves manual overscroll position", async () => {
+  const app = await launchApp();
+  const page = await firstWindow(app);
+  await page.setViewportSize({ width: 900, height: 620 });
+  await expect(page.getByTestId("chat-surface")).toBeVisible();
+  await configureMockCodexThread(page, false);
+
+  const longPrompt = Array.from({ length: 120 }, (_, index) => `reasoning overscroll line ${index + 1}`).join("\n");
+  await page.evaluate((text) => window.unitApi.chat.submit({ text }), longPrompt);
+  await expect(page.getByTestId("chat-message-assistant")).toContainText("Mocked Codex response");
+  await expect.poll(() => page.evaluate(async () => (await window.unitApi.chat.bootstrap()).generation.status)).toBe("idle");
+
+  await page.evaluate(async () => {
+    const reasoning = document.querySelector<HTMLDetailsElement>("details.reasoning-shell");
+    const summary = reasoning?.querySelector<HTMLElement>("summary.reasoning-toggle");
+    const panel = reasoning?.querySelector<HTMLElement>(".reasoning-panel");
+    const spacer = document.querySelector<HTMLElement>(".chat-manual-end-spacer");
+    const thread = document.querySelector<HTMLElement>(".chat-thread");
+    const overlay = document.querySelector<HTMLElement>(".chat-composer-section");
+    if (!reasoning || !summary || !panel || !spacer || !thread || !overlay) {
+      throw new Error("Missing reasoning overscroll elements");
+    }
+    if (!reasoning.open) {
+      summary.click();
+      await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+    }
+    panel.style.minHeight = "760px";
+    spacer.style.height = `${Math.round(spacer.getBoundingClientRect().height + 900)}px`;
+    await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+    const hostRect = thread.getBoundingClientRect();
+    const spacerRect = spacer.getBoundingClientRect();
+    const overlayRect = overlay.getBoundingClientRect();
+    const hostPaddingBottom = Math.max(0, Math.round(parseFloat(getComputedStyle(thread).paddingBottom) || 0));
+    const effectiveClientHeight = Math.max(1, thread.clientHeight - Math.ceil(overlayRect.height));
+    const spacerTop = thread.scrollTop + spacerRect.top - hostRect.top;
+    const contentMaxScroll = Math.max(0, Math.min(thread.scrollHeight, spacerTop + hostPaddingBottom) - effectiveClientHeight);
+    thread.scrollTop = Math.min(contentMaxScroll + 260, Math.max(0, thread.scrollHeight - thread.clientHeight - 8));
+    thread.dispatchEvent(new Event("scroll", { bubbles: true }));
+    await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+  });
+
+  const before = await page.evaluate(() => {
+    const thread = document.querySelector<HTMLElement>(".chat-thread");
+    const reasoning = document.querySelector<HTMLDetailsElement>("details.reasoning-shell");
+    if (!thread || !reasoning) {
+      throw new Error("Missing reasoning overscroll state");
+    }
+    return {
+      open: reasoning.open,
+      scrollTop: Math.round(thread.scrollTop)
+    };
+  });
+  expect(before.open).toBe(true);
+
+  await page.evaluate(async () => {
+    const summary = document.querySelector<HTMLElement>("details.reasoning-shell summary.reasoning-toggle");
+    if (!summary) {
+      throw new Error("Missing reasoning summary");
+    }
+    summary.click();
+    await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+  });
+
+  const after = await page.evaluate(() => {
+    const thread = document.querySelector<HTMLElement>(".chat-thread");
+    const reasoning = document.querySelector<HTMLDetailsElement>("details.reasoning-shell");
+    if (!thread || !reasoning) {
+      throw new Error("Missing reasoning overscroll state");
+    }
+    return {
+      open: reasoning.open,
+      scrollTop: Math.round(thread.scrollTop)
+    };
+  });
+  expect(after.open).toBe(false);
+  expect(Math.abs(after.scrollTop - before.scrollTop)).toBeLessThanOrEqual(3);
 
   await app.close();
 });

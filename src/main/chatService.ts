@@ -26,7 +26,7 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { PDFParse } from "pdf-parse";
-import { codexItemToTimelineBlock, type CodexRuntime } from "./codexRuntime.js";
+import { codexItemToTimelineBlock, type CodexRuntime, type CodexThreadEvent, type CodexThreadItem } from "./codexRuntime.js";
 import { ChatStore, DEFAULT_CODEX_MODELS, type ChatDocumentSearchEntry } from "./chatStore.js";
 import { LocalLlamaRuntime } from "./localLlamaRuntime.js";
 import { RemoteHostRuntime, type RemoteStreamMetrics } from "./remoteHostRuntime.js";
@@ -34,6 +34,167 @@ import { RemoteHostRuntime, type RemoteStreamMetrics } from "./remoteHostRuntime
 const execFileAsync = promisify(execFile);
 const CODEX_ATTACHMENT_TEMP_PREFIX = "unit0-codex-attachments-";
 type RemoteDocumentSearchResult = { document_id?: string; entries?: unknown[] };
+type CodexTextTimelineBlock = Extract<ChatTimelineBlock, { kind: "assistant_message" | "reasoning" }>;
+
+function mergeStreamingTimelineBlock(
+  prior: ChatTimelineBlock,
+  block: ChatTimelineBlock,
+  eventType: Extract<CodexThreadEvent["type"], "item.started" | "item.updated" | "item.completed">
+): ChatTimelineBlock {
+  if (prior.kind === "tool" && block.kind === "tool") {
+    const previousOutput = prior.output ?? "";
+    const incomingOutput = block.output ?? "";
+    const output = eventType === "item.updated"
+      ? `${previousOutput}${incomingOutput}`
+      : incomingOutput
+        ? incomingOutput.startsWith(previousOutput) ? incomingOutput : `${previousOutput}${incomingOutput}`
+        : previousOutput || undefined;
+    return {
+      ...prior,
+      ...block,
+      command: block.command ?? prior.command,
+      directory: block.directory ?? prior.directory,
+      summary: block.summary ?? prior.summary,
+      output,
+      initiallyExpanded: block.initiallyExpanded ?? prior.initiallyExpanded
+    };
+  }
+  if (prior.kind === "diff" && block.kind === "diff") {
+    const previousPreview = prior.preview ?? "";
+    const incomingPreview = block.preview ?? "";
+    const hasFinalStructuredSnapshot = eventType === "item.completed" && Boolean(block.changes?.length);
+    const preview = hasFinalStructuredSnapshot
+      ? incomingPreview || previousPreview || undefined
+      : eventType === "item.updated"
+      ? `${previousPreview}${incomingPreview}`
+      : incomingPreview
+        ? incomingPreview.startsWith(previousPreview) ? incomingPreview : `${previousPreview}${incomingPreview}`
+        : previousPreview || undefined;
+    return {
+      ...prior,
+      ...block,
+      summary: block.summary ?? prior.summary,
+      branchName: block.branchName ?? prior.branchName,
+      preview,
+      addedLines: block.addedLines ?? prior.addedLines,
+      deletedLines: block.deletedLines ?? prior.deletedLines,
+      filesChanged: block.filesChanged ?? prior.filesChanged,
+      changes: block.changes ?? prior.changes,
+      initiallyExpanded: block.initiallyExpanded ?? prior.initiallyExpanded
+    };
+  }
+  const existing = prior as ChatTimelineBlock & { initiallyExpanded?: boolean };
+  const next = block as ChatTimelineBlock & { initiallyExpanded?: boolean };
+  return {
+    ...block,
+    initiallyExpanded: next.initiallyExpanded ?? existing.initiallyExpanded
+  } as ChatTimelineBlock;
+}
+
+function upsertCodexTimelineBlock(
+  blocks: ChatTimelineBlock[],
+  eventType: Extract<CodexThreadEvent["type"], "item.started" | "item.updated" | "item.completed">,
+  block: ChatTimelineBlock
+): void {
+  const existingIndex = blocks.findIndex((item) => item.id === block.id && item.kind === block.kind);
+  if (existingIndex >= 0) {
+    blocks[existingIndex] = mergeStreamingTimelineBlock(blocks[existingIndex], block, eventType);
+  } else {
+    blocks.push(block);
+  }
+}
+
+function upsertCodexTextTimelineBlock(
+  blocks: ChatTimelineBlock[],
+  eventType: Extract<CodexThreadEvent["type"], "item.started" | "item.updated" | "item.completed">,
+  item: Extract<CodexThreadItem, { type: "agent_message" | "reasoning" }>,
+  options?: { timelineId?: string; text?: string }
+): void {
+  const kind = item.type === "agent_message" ? "assistant_message" : "reasoning";
+  const id = options?.timelineId ?? item.id ?? `${kind}-${blocks.length}`;
+  const existingIndex = blocks.findIndex((block) => block.kind === kind && block.id === id);
+  const prior = existingIndex >= 0 ? blocks[existingIndex] as CodexTextTimelineBlock : null;
+  const incomingText = options?.text ?? item.text ?? "";
+  const status = eventType === "item.completed" ? "completed" : eventType === "item.started" ? "started" : "updated";
+  if (item.type === "reasoning") {
+    const sections = mergeCodexReasoningSections(prior?.kind === "reasoning" ? prior : null, item, incomingText, eventType);
+    const text = sections.length > 0
+      ? sections.map((section) => section.text.trim()).filter(Boolean).join("\n\n")
+      : incomingText;
+    const block = {
+      kind,
+      id,
+      status,
+      text,
+      sections: sections.length > 0 ? sections : undefined,
+      initiallyExpanded: prior?.kind === "reasoning" ? prior.initiallyExpanded ?? item.initiallyExpanded : item.initiallyExpanded
+    } satisfies CodexTextTimelineBlock;
+    if (existingIndex >= 0) {
+      blocks[existingIndex] = block;
+    } else {
+      blocks.push(block);
+    }
+    return;
+  }
+  const text = prior
+    ? eventType === "item.completed"
+      ? incomingText
+        ? incomingText.startsWith(prior.text) ? incomingText : `${prior.text}${incomingText}`
+        : prior.text
+      : `${prior.text}${incomingText}`
+    : incomingText;
+  const block = kind === "assistant_message"
+    ? { kind, id, status, text } satisfies CodexTextTimelineBlock
+    : {
+      kind,
+      id,
+      status,
+      text,
+      initiallyExpanded: prior?.kind === "reasoning" ? prior.initiallyExpanded ?? item.initiallyExpanded : item.initiallyExpanded
+    } satisfies CodexTextTimelineBlock;
+  if (existingIndex >= 0) {
+    blocks[existingIndex] = block;
+  } else {
+    blocks.push(block);
+  }
+}
+
+function mergeCodexReasoningSections(
+  prior: Extract<ChatTimelineBlock, { kind: "reasoning" }> | null,
+  item: Extract<CodexThreadItem, { type: "reasoning" }>,
+  incomingText: string,
+  eventType: Extract<CodexThreadEvent["type"], "item.started" | "item.updated" | "item.completed">
+) {
+  const sections = prior?.sections?.length
+    ? prior.sections.map((section) => ({ ...section }))
+    : prior?.text
+      ? [{ key: prior.id, text: prior.text }]
+      : [];
+  const applySection = (key: string, text: string) => {
+    const existingIndex = sections.findIndex((section) => section.key === key);
+    if (existingIndex < 0) {
+      sections.push({ key, text });
+      return;
+    }
+    const priorText = sections[existingIndex].text;
+    sections[existingIndex] = {
+      key,
+      text: eventType === "item.completed"
+        ? text
+          ? text.startsWith(priorText) ? text : `${priorText}${text}`
+          : priorText
+        : `${priorText}${text}`
+    };
+  };
+  if (item.sections?.length) {
+    for (const section of item.sections) {
+      applySection(section.key, section.text);
+    }
+  } else if (incomingText || item.section_key) {
+    applySection(item.section_key ?? item.id ?? "reasoning", incomingText);
+  }
+  return sections;
+}
 
 export class ChatService {
   private generation: ChatGenerationState = { status: "idle" };
@@ -793,8 +954,17 @@ export class ChatService {
     }
     const selectedCodexModel = state.codexModels.find((model) => model.id === thread.codexModelId) ?? state.codexModels.find((model) => model.isDefault);
     const timelineBlocks: ChatTimelineBlock[] = [];
+    const assistantSourceTotals = new Map<string, string>();
+    const reasoningSourceTotals = new Map<string, string>();
+    let activeAssistantSourceId: string | null = null;
+    let activeAssistantTimelineId: string | null = null;
+    let assistantSegmentIndex = 0;
     let preparedImages: { imagePaths: string[]; cleanup: () => void } | null = null;
     let completedTurn = false;
+    const resetActiveAssistant = () => {
+      activeAssistantSourceId = null;
+      activeAssistantTimelineId = null;
+    };
     try {
       if (!project?.directory) {
         throw new Error("Select a project directory before running a Codex thread.");
@@ -823,18 +993,51 @@ export class ChatService {
           this.broadcast();
         } else if ((event.type === "item.started" || event.type === "item.updated" || event.type === "item.completed") && event.item) {
           if (event.item.type === "agent_message") {
-            this.store.appendToMessage(options.assistantMessageId, event.item.text ?? "");
+            const sourceId = event.item.id ?? "assistant";
+            const incomingText = event.item.text ?? "";
+            const previousTotal = assistantSourceTotals.get(sourceId) ?? "";
+            const textDelta = previousTotal && incomingText.startsWith(previousTotal)
+              ? incomingText.slice(previousTotal.length)
+              : incomingText;
+            if (!activeAssistantTimelineId || activeAssistantSourceId !== sourceId) {
+              activeAssistantSourceId = sourceId;
+              activeAssistantTimelineId = `${sourceId}:assistant:${assistantSegmentIndex}`;
+              assistantSegmentIndex += 1;
+            }
+            if (textDelta) {
+              this.store.appendToMessage(options.assistantMessageId, textDelta);
+            }
+            assistantSourceTotals.set(sourceId, previousTotal && incomingText.startsWith(previousTotal) ? incomingText : `${previousTotal}${textDelta}`);
+            upsertCodexTextTimelineBlock(timelineBlocks, event.type, event.item, { timelineId: activeAssistantTimelineId, text: textDelta });
+            this.store.updateMessageTimelineBlocks(options.assistantMessageId, timelineBlocks);
           } else if (event.item.type === "reasoning") {
-            this.store.appendToMessageReasoning(options.assistantMessageId, event.item.text ?? "");
+            resetActiveAssistant();
+            let hasStoredReasoningText = reasoningSourceTotals.size > 0;
+            const appendReasoningSection = (sectionKey: string, incomingText: string) => {
+              const previousTotal = reasoningSourceTotals.get(sectionKey) ?? "";
+              const textDelta = previousTotal && incomingText.startsWith(previousTotal)
+                ? incomingText.slice(previousTotal.length)
+                : incomingText;
+              if (textDelta) {
+                this.store.appendToMessageReasoning(options.assistantMessageId, `${!previousTotal && hasStoredReasoningText ? "\n\n" : ""}${textDelta}`);
+                hasStoredReasoningText = true;
+              }
+              reasoningSourceTotals.set(sectionKey, previousTotal && incomingText.startsWith(previousTotal) ? incomingText : `${previousTotal}${textDelta}`);
+            };
+            if (event.item.sections?.length) {
+              for (const section of event.item.sections) {
+                appendReasoningSection(section.key, section.text);
+              }
+            } else {
+              appendReasoningSection(event.item.section_key ?? event.item.id ?? "reasoning", event.item.text ?? "");
+            }
+            upsertCodexTextTimelineBlock(timelineBlocks, event.type, event.item);
+            this.store.updateMessageTimelineBlocks(options.assistantMessageId, timelineBlocks);
           } else {
+            resetActiveAssistant();
             const block = codexItemToTimelineBlock(event.type, event.item);
             if (block) {
-              const existingIndex = timelineBlocks.findIndex((item) => item.id === block.id);
-              if (existingIndex >= 0) {
-                timelineBlocks[existingIndex] = block;
-              } else {
-                timelineBlocks.push(block);
-              }
+              upsertCodexTimelineBlock(timelineBlocks, event.type, block);
               this.store.updateMessageTimelineBlocks(options.assistantMessageId, timelineBlocks);
             }
           }

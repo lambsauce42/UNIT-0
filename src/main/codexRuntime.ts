@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
-import type { ChatCodexAccountState, ChatCodexApprovalMode, ChatCodexModel, ChatCodexRateLimits, ChatReasoningEffort, ChatTimelineBlock } from "../shared/types.js";
+import type { ChatCodexAccountState, ChatCodexApprovalMode, ChatCodexModel, ChatCodexRateLimits, ChatReasoningEffort, ChatTimelineBlock, ChatTimelineFileChange, ChatTimelineReasoningSection } from "../shared/types.js";
 
 const DEFAULT_COLLABORATION_INSTRUCTIONS = [
   "# Collaboration Mode: Default",
@@ -44,16 +44,16 @@ const PLAN_COLLABORATION_INSTRUCTIONS = [
 ].join("\n");
 
 export type CodexThreadItem =
-  | { id?: string; type: "agent_message"; text?: string }
-  | { id?: string; type: "reasoning"; text?: string }
-  | { id?: string; type: "command_execution"; command?: string; aggregated_output?: string; exit_code?: number | null; status?: string }
-  | { id?: string; type: "file_change"; path?: string; summary?: string; diff?: string; status?: string }
+  | { id?: string; type: "agent_message"; text?: string; initiallyExpanded?: boolean }
+  | { id?: string; type: "reasoning"; text?: string; section_key?: string; sections?: ChatTimelineReasoningSection[]; initiallyExpanded?: boolean }
+  | { id?: string; type: "command_execution"; command?: string; directory?: string; aggregated_output?: string; exit_code?: number | null; status?: string; initiallyExpanded?: boolean }
+  | { id?: string; type: "file_change"; path?: string; summary?: string; diff?: string; added_lines?: number; deleted_lines?: number; files_changed?: number; changes?: ChatTimelineFileChange[]; status?: string; initiallyExpanded?: boolean }
   | { id?: string; type: "mcp_tool_call"; tool_name?: string; arguments?: unknown; result?: unknown; status?: string }
   | { id?: string; type: "web_search"; query?: string; status?: string }
   | { id?: string; type: "todo_list"; items?: Array<{ text?: string; status?: string }>; status?: string }
   | { id?: string; type: "approval_request"; title?: string; details?: string; status?: string; request_method?: string; tool_call_id?: string }
   | { id?: string; type: "user_question"; title?: string; question?: string; status?: string; questions?: Array<{ id: string; label: string; options?: string[]; allowsCustomAnswer?: boolean }>; answers?: Record<string, string> }
-  | { id?: string; type: "status"; level?: string; message?: string; code?: string }
+  | { id?: string; type: "status"; level?: string; message?: string; code?: string; initiallyExpanded?: boolean }
   | { id?: string; type: "error"; message?: string };
 
 export type CodexThreadEvent =
@@ -113,17 +113,21 @@ export class MockCodexRuntime implements CodexRuntime {
         }
       };
     }
+    const reasoningCodeFixture = options.prompt.includes("[reasoning-code-fixture]")
+      ? "\n```ts\nconst reason = 7;\n```\n"
+      : "";
     yield {
       type: "item.completed",
       item: {
         id: "mock-reasoning",
         type: "reasoning",
-        text: `Using ${options.model} with ${options.reasoningEffort} reasoning, ${options.approvalMode} approvals, and ${options.imagePaths?.length ?? 0} image attachment(s) in mocked Codex mode.\n`
+        text: `Using ${options.model} with ${options.reasoningEffort} reasoning, ${options.approvalMode} approvals, and ${options.imagePaths?.length ?? 0} image attachment(s) in mocked Codex mode.\n${reasoningCodeFixture}`,
+        initiallyExpanded: false
       }
     };
     yield {
       type: "item.started",
-      item: { id: "mock-command", type: "command_execution", command: "npm test", aggregated_output: "", exit_code: null, status: "in_progress" }
+      item: { id: "mock-command", type: "command_execution", command: "npm test", aggregated_output: "", exit_code: null, status: "in_progress", initiallyExpanded: false }
     };
     await delay(10);
     if (this.cancelled) {
@@ -606,7 +610,11 @@ export class CodexAppServerRuntime implements CodexRuntime {
       return { completed: false, events: [{ type: "item.updated", item: { id: String(params.itemId ?? "assistant"), type: "agent_message", text: String(params.delta ?? "") } }] };
     }
     if (method === "item/reasoning/textDelta" || method === "item/reasoning/summaryTextDelta" || method === "item/reasoning/summaryPartAdded") {
-      return { completed: false, events: [{ type: "item.updated", item: { id: String(params.itemId ?? "reasoning"), type: "reasoning", text: String(params.delta ?? "") } }] };
+      const baseId = String(params.itemId ?? "reasoning");
+      const summaryIndex = Number(params.summaryIndex);
+      const sectionKey = method === "item/reasoning/textDelta" || !Number.isInteger(summaryIndex) ? baseId : `${baseId}:summary:${summaryIndex}`;
+      const text = String(params.delta ?? "");
+      return { completed: false, events: [{ type: "item.updated", item: { id: baseId, type: "reasoning", section_key: sectionKey, text, sections: method === "item/reasoning/summaryPartAdded" ? [{ key: sectionKey, text }] : undefined } }] };
     }
     if (method === "item/commandExecution/outputDelta") {
       return { completed: false, events: [{ type: "item.updated", item: { id: String(params.itemId ?? "command"), type: "command_execution", aggregated_output: String(params.delta ?? ""), status: "in_progress" } }] };
@@ -630,10 +638,10 @@ export class CodexAppServerRuntime implements CodexRuntime {
       return { completed: false, events: [{ type: "item.updated", item: { id: String(params.itemId ?? `${threadId}:${turnId}:diff`), type: "file_change", summary: "Updated diff", diff: String(params.diff ?? params.delta ?? ""), status: "updated" } }] };
     }
     if (method === "item/started" && isRecord(params.item)) {
-      return { completed: false, events: [codexAppServerItemEvent("item.started", params.item)] };
+      return { completed: false, events: codexAppServerItemEvents("item.started", params.item) };
     }
     if (method === "item/completed" && isRecord(params.item)) {
-      return { completed: false, events: [codexAppServerItemEvent("item.completed", params.item)] };
+      return { completed: false, events: codexAppServerItemEvents("item.completed", params.item) };
     }
     if (method === "thread/compacted") {
       return { completed: false, events: [{ type: "item.completed", item: { id: `${threadId}:${turnId}:compaction`, type: "status", level: "info", message: "Context compacted.", code: "context_compacted" } }] };
@@ -736,7 +744,7 @@ export function parseCodexJsonLine(line: string): CodexThreadEvent {
 export function codexItemToTimelineBlock(eventType: CodexThreadEvent["type"], item: CodexThreadItem): ChatTimelineBlock | null {
   const id = item.id ?? `${item.type}-${eventType}`;
   const itemStatus = "status" in item ? item.status : undefined;
-  const status = eventType === "item.completed" ? "completed" : eventType === "item.started" ? "started" : itemStatus ?? "updated";
+  const status = itemStatus ?? (eventType === "item.completed" ? "completed" : eventType === "item.started" ? "started" : "updated");
   if (item.type === "command_execution") {
     return {
       kind: "tool",
@@ -744,8 +752,10 @@ export function codexItemToTimelineBlock(eventType: CodexThreadEvent["type"], it
       toolName: "command",
       status,
       command: item.command,
+      directory: item.directory,
       output: item.aggregated_output,
-      summary: item.exit_code === null || item.exit_code === undefined ? item.command : `${item.command ?? "Command"} exited ${item.exit_code}`
+      summary: item.exit_code === null || item.exit_code === undefined ? item.command : `${item.command ?? "Command"} exited ${item.exit_code}`,
+      initiallyExpanded: item.initiallyExpanded
     };
   }
   if (item.type === "file_change") {
@@ -754,7 +764,12 @@ export function codexItemToTimelineBlock(eventType: CodexThreadEvent["type"], it
       id,
       status,
       summary: item.summary ?? item.path ?? "File change",
-      preview: item.diff
+      preview: item.diff,
+      addedLines: item.added_lines,
+      deletedLines: item.deleted_lines,
+      filesChanged: item.files_changed,
+      changes: item.changes,
+      initiallyExpanded: item.initiallyExpanded
     };
   }
   if (item.type === "mcp_tool_call") {
@@ -811,7 +826,8 @@ export function codexItemToTimelineBlock(eventType: CodexThreadEvent["type"], it
       id,
       level: item.level ?? "info",
       message: item.message ?? "",
-      code: item.code
+      code: item.code,
+      initiallyExpanded: item.initiallyExpanded
     };
   }
   if (item.type === "error") {
@@ -851,25 +867,173 @@ function codexInputItemsFrom(prompt: string, imagePaths: string[]): Array<Record
   return items;
 }
 
-function codexAppServerItemEvent(type: Extract<CodexThreadEvent["type"], "item.started" | "item.completed">, item: Record<string, unknown>): CodexThreadEvent {
+export function codexAppServerItemEvents(type: Extract<CodexThreadEvent["type"], "item.started" | "item.completed">, item: Record<string, unknown>): CodexThreadEvent[] {
   const itemType = String(item.type ?? "");
   const id = String(item.id ?? item.itemId ?? `${itemType}-${type}`);
+  const initiallyExpanded = codexInitiallyExpanded(item);
+  const status = String(item.status ?? (type === "item.completed" ? "completed" : "started"));
   if (itemType === "commandExecution") {
-    return { type, item: { id, type: "command_execution", command: String(item.command ?? ""), status: type === "item.completed" ? "completed" : "started" } };
+    return [{
+      type,
+      item: {
+        id,
+        type: "command_execution",
+        command: String(item.command ?? ""),
+        directory: String(item.cwd ?? item.directory ?? ""),
+        aggregated_output: String(item.aggregatedOutput ?? item.aggregated_output ?? item.output ?? ""),
+        exit_code: typeof item.exitCode === "number" ? item.exitCode : typeof item.exit_code === "number" ? item.exit_code : null,
+        status,
+        initiallyExpanded
+      }
+    }];
   }
   if (itemType === "fileChange") {
-    return { type, item: { id, type: "file_change", summary: "File change", diff: JSON.stringify(item.changes ?? ""), status: type === "item.completed" ? "completed" : "started" } };
+    const structured = structuredFileChangeDetails(item.changes);
+    const diff = fileChangeDiffText(item, structured.preview);
+    const hasPatchText = typeof item.diff === "string" || typeof item.delta === "string" || typeof item.patch === "string";
+    const counts = hasPatchText ? countDiffLines(diff) : { added: structured.addedLines, deleted: structured.deletedLines };
+    return [{
+      type,
+      item: {
+        id,
+        type: "file_change",
+        path: typeof item.path === "string" ? item.path : undefined,
+        summary: String(item.summary ?? item.path ?? "File change"),
+        diff,
+        added_lines: numericField(item.addedLines, item.added_lines) ?? counts.added,
+        deleted_lines: numericField(item.deletedLines, item.deleted_lines) ?? counts.deleted,
+        files_changed: numericField(item.filesChanged, item.files_changed) ?? structured.filesChanged,
+        changes: structured.changes,
+        status,
+        initiallyExpanded
+      }
+    }];
   }
   if (itemType === "mcpToolCall") {
-    return { type, item: { id, type: "mcp_tool_call", tool_name: [item.server, item.tool].map((value) => String(value ?? "")).filter(Boolean).join(":") || "mcp", result: item.result, status: type === "item.completed" ? "completed" : "started" } };
+    return [{ type, item: { id, type: "mcp_tool_call", tool_name: [item.server, item.tool].map((value) => String(value ?? "")).filter(Boolean).join(":") || "mcp", result: item.result, status } }];
   }
   if (itemType === "assistantMessage") {
-    return { type, item: { id, type: "agent_message", text: String(item.text ?? item.content ?? "") } };
+    return [{ type, item: { id, type: "agent_message", text: String(item.text ?? item.content ?? ""), initiallyExpanded } }];
   }
   if (itemType === "reasoning") {
-    return { type, item: { id, type: "reasoning", text: String(item.text ?? item.summary ?? "") } };
+    const summarySections = reasoningSectionsFromValue(item.summary, id, "summary");
+    const contentSections = reasoningSectionsFromValue(item.content, id, "content");
+    const sections = summarySections.length > 0 ? summarySections : contentSections;
+    const text = sections.length > 0
+      ? sections.map((section) => section.text.trim()).filter(Boolean).join("\n\n")
+      : String(item.text ?? item.summary ?? item.content ?? "");
+    return [{ type, item: { id, type: "reasoning", text, sections: sections.length > 0 ? sections : undefined, initiallyExpanded } }];
   }
-  return { type, item: { id, type: "status", level: "info", message: itemType || "Codex event" } };
+  return [{ type, item: { id, type: "status", level: "info", message: itemType || "Codex event" } }];
+}
+
+function reasoningSectionsFromValue(value: unknown, id: string, fieldName: "summary" | "content"): ChatTimelineReasoningSection[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.map((entry, index) => {
+    const text = isRecord(entry)
+      ? String(entry.text ?? entry.content ?? entry.summary ?? "")
+      : String(entry ?? "");
+    const defaultKey = fieldName === "content" && index === 0 ? id : `${id}:${fieldName}:${index}`;
+    const key = isRecord(entry)
+      ? String(entry.id ?? entry.key ?? defaultKey)
+      : defaultKey;
+    return { key, text };
+  });
+}
+
+function codexInitiallyExpanded(item: Record<string, unknown>): boolean | undefined {
+  const direct = item.codex_initially_expanded ?? item.initiallyExpanded ?? item.initially_expanded;
+  if (typeof direct === "boolean") {
+    return direct;
+  }
+  const extraPayload = isRecord(item.extra_payload) ? item.extra_payload : isRecord(item.extraPayload) ? item.extraPayload : null;
+  const nested = extraPayload?.codex_initially_expanded;
+  return typeof nested === "boolean" ? nested : undefined;
+}
+
+function fileChangeDiffText(item: Record<string, unknown>, structuredPreview = ""): string {
+  if (typeof item.diff === "string") {
+    return item.diff;
+  }
+  if (typeof item.delta === "string") {
+    return item.delta;
+  }
+  if (typeof item.patch === "string") {
+    return item.patch;
+  }
+  return structuredPreview;
+}
+
+function countDiffLines(diff: string): { added: number; deleted: number } {
+  let added = 0;
+  let deleted = 0;
+  for (const line of diff.split(/\r?\n/)) {
+    if (line.startsWith("+") && !line.startsWith("+++")) {
+      added += 1;
+    } else if (line.startsWith("-") && !line.startsWith("---")) {
+      deleted += 1;
+    }
+  }
+  return { added, deleted };
+}
+
+function numericField(...values: unknown[]): number | undefined {
+  for (const value of values) {
+    if (typeof value === "number" && Number.isFinite(value)) {
+      return value;
+    }
+  }
+  return undefined;
+}
+
+function structuredFileChangeDetails(value: unknown): {
+  preview: string;
+  addedLines: number;
+  deletedLines: number;
+  filesChanged: number;
+  changes: ChatTimelineFileChange[] | undefined;
+} {
+  if (!Array.isArray(value)) {
+    return { preview: "", addedLines: 0, deletedLines: 0, filesChanged: 0, changes: undefined };
+  }
+  const changes: ChatTimelineFileChange[] = [];
+  const previewLines: string[] = [];
+  let addedLines = 0;
+  let deletedLines = 0;
+  value.forEach((entry, index) => {
+    if (!isRecord(entry)) {
+      return;
+    }
+    const path = textField(entry.path, entry.file, entry.filePath, entry.relativePath);
+    const kind = textField(entry.kind, entry.type, entry.action, entry.status) ?? "modified";
+    const summary = textField(entry.summary, entry.description);
+    const added = numericField(entry.addedLines, entry.added_lines, entry.additions) ?? 0;
+    const deleted = numericField(entry.deletedLines, entry.deleted_lines, entry.deletions) ?? 0;
+    addedLines += added;
+    deletedLines += deleted;
+    changes.push({ path, kind, summary, addedLines: added, deletedLines: deleted });
+    const label = path || summary || `change-${index + 1}`;
+    const countSuffix = added || deleted ? ` (+${added} -${deleted})` : "";
+    previewLines.push(`${kind}: ${label}${countSuffix}`);
+  });
+  return {
+    preview: previewLines.join("\n"),
+    addedLines,
+    deletedLines,
+    filesChanged: changes.length,
+    changes: changes.length ? changes : undefined
+  };
+}
+
+function textField(...values: unknown[]): string | undefined {
+  for (const value of values) {
+    if (typeof value === "string" && value.trim()) {
+      return value;
+    }
+  }
+  return undefined;
 }
 
 function parseQuestions(value: unknown): Array<{ id: string; label: string; options?: string[]; allowsCustomAnswer?: boolean }> {

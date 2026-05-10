@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { ChatService } from "../src/main/chatService";
 import { ChatStore } from "../src/main/chatStore";
-import { MockCodexRuntime } from "../src/main/codexRuntime";
+import { MockCodexRuntime, type CodexRunOptions, type CodexThreadEvent } from "../src/main/codexRuntime";
 import { LocalLlamaRuntime } from "../src/main/localLlamaRuntime";
 import { RemoteHostRuntime } from "../src/main/remoteHostRuntime";
 import type { ChatMessage, ChatModel, ChatRuntimeSettings } from "../src/shared/types";
@@ -44,6 +44,161 @@ class FlakyAccountCodexRuntime extends MockCodexRuntime {
     return super.readAccount(force);
   }
 }
+
+class OrderedCodexRuntime extends MockCodexRuntime {
+  override async *runTurn(_options: CodexRunOptions): AsyncIterable<CodexThreadEvent> {
+    yield { type: "thread.started", thread_id: "thread-ordered" };
+    yield { type: "turn.started" };
+    yield { type: "item.updated", item: { id: "answer", type: "agent_message", text: "First answer.\n" } };
+    yield { type: "item.completed", item: { id: "reasoning", type: "reasoning", text: "Checked the next step.", initiallyExpanded: false } };
+    yield { type: "item.completed", item: { id: "answer", type: "agent_message", text: "First answer.\nSecond answer." } };
+    yield { type: "turn.completed", usage: { input_tokens: 1, output_tokens: 1 } };
+  }
+}
+
+class StreamingDetailsCodexRuntime extends MockCodexRuntime {
+  override async *runTurn(_options: CodexRunOptions): AsyncIterable<CodexThreadEvent> {
+    yield { type: "thread.started", thread_id: "thread-streaming-details" };
+    yield { type: "turn.started" };
+    yield { type: "item.updated", item: { id: "reasoning", type: "reasoning", section_key: "reasoning:summary:0", text: "Plan " } };
+    yield { type: "item.completed", item: { id: "reasoning", type: "reasoning", sections: [{ key: "reasoning:summary:0", text: "Plan done." }, { key: "reasoning:summary:1", text: "Checked output." }], text: "Plan done.\n\nChecked output.", initiallyExpanded: false } };
+    yield { type: "item.updated", item: { id: "cmd", type: "command_execution", command: "npm test", aggregated_output: "first\n", status: "in_progress" } };
+    yield { type: "item.updated", item: { id: "cmd", type: "command_execution", aggregated_output: "second\n", status: "in_progress" } };
+    yield { type: "item.completed", item: { id: "cmd", type: "command_execution", command: "npm test", exit_code: 0, status: "completed" } };
+    yield { type: "item.updated", item: { id: "diff", type: "file_change", summary: "Updated diff", diff: "+one\n", status: "updated" } };
+    yield { type: "item.updated", item: { id: "diff", type: "file_change", summary: "Updated diff", diff: "+two\n", status: "updated" } };
+    yield { type: "item.completed", item: { id: "diff", type: "file_change", summary: "Updated diff", added_lines: 2, deleted_lines: 0, status: "completed" } };
+    yield { type: "item.completed", item: { id: "answer", type: "agent_message", text: "done" } };
+    yield { type: "turn.completed", usage: { input_tokens: 1, output_tokens: 1 } };
+  }
+}
+
+class CompletedContentReasoningCodexRuntime extends MockCodexRuntime {
+  override async *runTurn(_options: CodexRunOptions): AsyncIterable<CodexThreadEvent> {
+    yield { type: "thread.started", thread_id: "thread-content-reasoning" };
+    yield { type: "turn.started" };
+    yield { type: "item.updated", item: { id: "reason", type: "reasoning", section_key: "reason", text: "Inspecting" } };
+    yield { type: "item.completed", item: { id: "reason", type: "reasoning", sections: [{ key: "reason", text: "Inspecting repository" }], text: "Inspecting repository" } };
+    yield { type: "item.updated", item: { id: "diff", type: "file_change", summary: "Updated diff", diff: "+raw patch\n", status: "updated" } };
+    yield { type: "item.completed", item: { id: "diff", type: "file_change", summary: "File change", diff: "modified: src/app.ts (+1 -0)", changes: [{ path: "src/app.ts", kind: "modified", addedLines: 1, deletedLines: 0 }], status: "completed" } };
+    yield { type: "item.completed", item: { id: "answer", type: "agent_message", text: "done" } };
+    yield { type: "turn.completed", usage: { input_tokens: 1, output_tokens: 1 } };
+  }
+}
+
+class EmptySummaryPartCodexRuntime extends MockCodexRuntime {
+  override async *runTurn(_options: CodexRunOptions): AsyncIterable<CodexThreadEvent> {
+    yield { type: "thread.started", thread_id: "thread-summary-parts" };
+    yield { type: "turn.started" };
+    yield { type: "item.updated", item: { id: "reason", type: "reasoning", section_key: "reason:summary:1", text: "", sections: [{ key: "reason:summary:1", text: "" }] } };
+    yield { type: "item.updated", item: { id: "reason", type: "reasoning", section_key: "reason:summary:0", text: "", sections: [{ key: "reason:summary:0", text: "" }] } };
+    yield { type: "item.updated", item: { id: "reason", type: "reasoning", section_key: "reason:summary:1", text: "Second" } };
+    yield { type: "item.updated", item: { id: "reason", type: "reasoning", section_key: "reason:summary:0", text: "First" } };
+    yield { type: "item.completed", item: { id: "answer", type: "agent_message", text: "done" } };
+    yield { type: "turn.completed", usage: { input_tokens: 1, output_tokens: 1 } };
+  }
+}
+
+test("keeps Codex assistant and reasoning timeline blocks in stream order", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-codex-order-test-"));
+  const store = new ChatStore(path.join(dir, "chat.sqlite"));
+  const service = new ChatService(store, new LocalLlamaRuntime(), new RemoteHostRuntime(), new OrderedCodexRuntime(), () => undefined);
+  try {
+    let state = store.loadState();
+    store.updateProjectSettings(state.selectedProjectId, "Codex Project", dir);
+    store.updateThreadSettings(state.selectedThreadId, { providerMode: "codex" });
+
+    await service.submit({ text: "stream ordering" });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    state = service.state();
+    const assistant = state.messages.filter((message) => message.role === "assistant").at(-1);
+
+    expect(assistant?.content).toBe("First answer.\nSecond answer.");
+    expect(assistant?.timelineBlocks?.map((block) => block.kind)).toEqual(["assistant_message", "reasoning", "assistant_message"]);
+    expect(assistant?.timelineBlocks?.[0]).toMatchObject({ kind: "assistant_message", text: "First answer.\n" });
+    expect(assistant?.timelineBlocks?.[2]).toMatchObject({ kind: "assistant_message", text: "Second answer." });
+  } finally {
+    service.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("accumulates streamed Codex details without duplicating completed snapshots", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-codex-stream-details-test-"));
+  const store = new ChatStore(path.join(dir, "chat.sqlite"));
+  const service = new ChatService(store, new LocalLlamaRuntime(), new RemoteHostRuntime(), new StreamingDetailsCodexRuntime(), () => undefined);
+  try {
+    let state = store.loadState();
+    store.updateProjectSettings(state.selectedProjectId, "Codex Project", dir);
+    store.updateThreadSettings(state.selectedThreadId, { providerMode: "codex" });
+
+    await service.submit({ text: "stream details" });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    state = service.state();
+    const assistant = state.messages.filter((message) => message.role === "assistant").at(-1);
+    const tool = assistant?.timelineBlocks?.find((block) => block.kind === "tool");
+    const diff = assistant?.timelineBlocks?.find((block) => block.kind === "diff");
+
+    expect(assistant?.reasoning).toBe("Plan done.\n\nChecked output.");
+    expect(tool).toMatchObject({ kind: "tool", output: "first\nsecond\n", status: "completed" });
+    expect(diff).toMatchObject({ kind: "diff", preview: "+one\n+two\n", status: "completed", addedLines: 2 });
+  } finally {
+    service.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("completed Codex reasoning content and structured file snapshots replace matching streams", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-codex-content-reasoning-test-"));
+  const store = new ChatStore(path.join(dir, "chat.sqlite"));
+  const service = new ChatService(store, new LocalLlamaRuntime(), new RemoteHostRuntime(), new CompletedContentReasoningCodexRuntime(), () => undefined);
+  try {
+    let state = store.loadState();
+    store.updateProjectSettings(state.selectedProjectId, "Codex Project", dir);
+    store.updateThreadSettings(state.selectedThreadId, { providerMode: "codex" });
+
+    await service.submit({ text: "content reasoning" });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    state = service.state();
+    const assistant = state.messages.filter((message) => message.role === "assistant").at(-1);
+    const diff = assistant?.timelineBlocks?.find((block) => block.kind === "diff");
+
+    expect(assistant?.reasoning).toBe("Inspecting repository");
+    expect(diff).toMatchObject({ kind: "diff", preview: "modified: src/app.ts (+1 -0)", status: "completed" });
+  } finally {
+    service.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("empty Codex reasoning summary parts preserve stream section order", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-codex-summary-order-test-"));
+  const store = new ChatStore(path.join(dir, "chat.sqlite"));
+  const service = new ChatService(store, new LocalLlamaRuntime(), new RemoteHostRuntime(), new EmptySummaryPartCodexRuntime(), () => undefined);
+  try {
+    let state = store.loadState();
+    store.updateProjectSettings(state.selectedProjectId, "Codex Project", dir);
+    store.updateThreadSettings(state.selectedThreadId, { providerMode: "codex" });
+
+    await service.submit({ text: "summary order" });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    state = service.state();
+    const assistant = state.messages.filter((message) => message.role === "assistant").at(-1);
+    const reasoning = assistant?.timelineBlocks?.find((block) => block.kind === "reasoning");
+
+    expect(reasoning).toMatchObject({
+      kind: "reasoning",
+      sections: [
+        { key: "reason:summary:1", text: "Second" },
+        { key: "reason:summary:0", text: "First" }
+      ],
+      text: "Second\n\nFirst"
+    });
+  } finally {
+    service.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 test("Codex account refresh recovers without surfacing a chat generation error", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-codex-account-test-"));

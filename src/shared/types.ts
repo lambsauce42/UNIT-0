@@ -13,8 +13,11 @@ export interface AppletSessionState {
   browser?: BrowserSessionState;
 }
 
+export type FileViewerSyntaxHighlighting = "one-dark" | "vscode-dark" | "codemirror" | "muted";
+
 export interface FileViewerSessionState {
   rootPath?: string;
+  syntaxHighlighting?: FileViewerSyntaxHighlighting;
 }
 
 export interface BrowserSessionState {
@@ -46,11 +49,26 @@ export interface ChatAttachment {
   sizeBytes?: number;
 }
 
+export interface ChatTimelineFileChange {
+  path?: string;
+  kind?: string;
+  summary?: string;
+  addedLines?: number;
+  deletedLines?: number;
+}
+
+export interface ChatTimelineReasoningSection {
+  key: string;
+  text: string;
+}
+
 export type ChatTimelineBlock =
-  | { kind: "tool"; id: string; toolName: string; status: string; summary?: string; command?: string; directory?: string; output?: string }
+  | { kind: "assistant_message"; id: string; status: string; text: string }
+  | { kind: "reasoning"; id: string; status: string; text: string; sections?: ChatTimelineReasoningSection[]; initiallyExpanded?: boolean }
+  | { kind: "tool"; id: string; toolName: string; status: string; summary?: string; command?: string; directory?: string; output?: string; initiallyExpanded?: boolean }
   | { kind: "approval"; id: string; status: string; title: string; decision?: string; details?: string; requestMethod?: string; toolCallId?: string }
-  | { kind: "diff"; id: string; status?: string; summary: string; branchName?: string; preview?: string; addedLines?: number; deletedLines?: number }
-  | { kind: "status"; id: string; level: string; message: string; code?: string }
+  | { kind: "diff"; id: string; status?: string; summary: string; branchName?: string; preview?: string; addedLines?: number; deletedLines?: number; filesChanged?: number; changes?: ChatTimelineFileChange[]; initiallyExpanded?: boolean }
+  | { kind: "status"; id: string; level: string; message: string; code?: string; initiallyExpanded?: boolean }
   | { kind: "plan"; id: string; status: string; explanation?: string; markdown?: string; steps?: Array<{ status: string; text: string }> }
   | { kind: "question"; id: string; status: string; title: string; question?: string; questions?: Array<{ id: string; label: string; options?: string[]; allowsCustomAnswer?: boolean }>; answers?: Record<string, string> }
   | { kind: "delegated"; id: string; status: string; summary: string }

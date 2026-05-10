@@ -1020,8 +1020,12 @@ function parseAppletSessionState(stateJson: string): AppletSessionState {
 function normalizeAppletSessionState(state: AppletSessionState): AppletSessionState {
   const nextState: AppletSessionState = {};
   const rootPath = state.fileViewer?.rootPath;
+  const syntaxHighlighting = state.fileViewer?.syntaxHighlighting;
   if (typeof rootPath === "string" && rootPath.trim()) {
     nextState.fileViewer = { rootPath: rootPath.trim() };
+  }
+  if (syntaxHighlighting === "one-dark" || syntaxHighlighting === "vscode-dark" || syntaxHighlighting === "codemirror" || syntaxHighlighting === "muted") {
+    nextState.fileViewer = { ...nextState.fileViewer, syntaxHighlighting };
   }
   const browserUrl = state.browser?.url;
   if (typeof browserUrl === "string" && browserUrl.trim()) {
