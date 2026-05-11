@@ -809,6 +809,8 @@ let registry: TabRegistry;
 let terminalManager: TerminalManager;
 let browserViewManager: BrowserViewManager;
 let chatService: ChatService;
+let shutdownStarted = false;
+let appQuitting = false;
 const defaultFileViewerRoot = path.resolve(process.cwd());
 
 function workspaceDatabasePath(): string {
@@ -818,6 +820,17 @@ function workspaceDatabasePath(): string {
 
 function payloadFor(windowId: number): BootstrapPayload {
   return { windowId, state: registry.snapshot() };
+}
+
+function disposeRuntimeManagersForShutdown(): void {
+  if (shutdownStarted) {
+    return;
+  }
+  shutdownStarted = true;
+  terminalManager?.disposeAll();
+  chatService?.close();
+  browserViewManager?.disposeAll();
+  destroyCaptureOverlays();
 }
 
 function workspaceAppletCloseSummary(workspace: Workspace | undefined): object {
@@ -1623,9 +1636,7 @@ app.whenReady().then(() => {
       for (const detachedId of registry.beginShutdown()) {
         windows.get(detachedId)?.close();
       }
-      terminalManager.disposeAll();
-      chatService.close();
-      destroyCaptureOverlays();
+      disposeRuntimeManagersForShutdown();
     }
   });
   ipcMain.handle("terminal:start", (_event, payload: TerminalStartPayload) => terminalManager.start(payload));
@@ -1703,13 +1714,19 @@ app.whenReady().then(() => {
   createWindow({ primary: true });
 });
 
+app.on("before-quit", () => {
+  appQuitting = true;
+  disposeRuntimeManagersForShutdown();
+});
+
 app.on("window-all-closed", () => {
-  terminalManager?.disposeAll();
-  chatService?.close();
-  browserViewManager?.disposeAll();
-  destroyCaptureOverlays();
   if (process.platform !== "darwin") {
+    disposeRuntimeManagersForShutdown();
     app.quit();
+    return;
+  }
+  if (appQuitting) {
+    disposeRuntimeManagersForShutdown();
   }
 });
 

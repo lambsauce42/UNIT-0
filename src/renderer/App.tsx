@@ -7,6 +7,7 @@ import {
   Brain,
   Bot,
   Bolt,
+  Check,
   ChevronDown,
   ChevronRight,
   Code2,
@@ -19,6 +20,7 @@ import {
   Grid2X2,
   Image,
   Layers3,
+  List,
   LayoutDashboard,
   LayoutTemplate,
   LockOpen,
@@ -43,7 +45,8 @@ import {
   SquareTerminal,
   Square,
   Trash2,
-  X
+  X,
+  type LucideIcon
 } from "lucide-react";
 import MarkdownIt from "markdown-it";
 import markdownItFootnote from "markdown-it-footnote";
@@ -88,8 +91,10 @@ import type {
   ChatAppSettings,
   BrowserStatusPayload,
   ChatAttachment,
+  ChatBuiltinAgenticFramework,
   ChatCodexApprovalMode,
   ChatCodexRateLimitWindow,
+  ChatDocumentIndex,
   ChatGitState,
   ChatMessage,
   ChatPermissionMode,
@@ -131,6 +136,7 @@ import { WORKSPACE_TAB_SIZE } from "../shared/tabMetrics";
 import { planWorkspaceTemplate } from "../shared/templatePlanner";
 import { workspaceTemplateById, workspaceTemplates } from "../shared/workspaceTemplates";
 import { closeHitRectForTab } from "./tabGeometry";
+import { extractShellWrappedCommand } from "./timelineDisplay";
 
 type PendingDrag = {
   tabId: string;
@@ -151,6 +157,20 @@ type WorkspaceNameDialogState =
   | { mode: "create"; title: string }
   | { mode: "rename"; workspaceId: string; title: string };
 
+function CodexToolShellIcon({ size = 16, ...props }: SVGProps<SVGSVGElement> & { size?: string | number }) {
+  return (
+    <svg {...props} width={size} height={size} viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <path
+        d="M11.4194 15.1694L17.25 21C18.2855 22.0355 19.9645 22.0355 21 21C22.0355 19.9645 22.0355 18.2855 21 17.25L15.1233 11.3733M11.4194 15.1694L13.9155 12.1383C14.2315 11.7546 14.6542 11.5132 15.1233 11.3733M11.4194 15.1694L6.76432 20.8219C6.28037 21.4096 5.55897 21.75 4.79768 21.75C3.39064 21.75 2.25 20.6094 2.25 19.2023C2.25 18.441 2.59044 17.7196 3.1781 17.2357L10.0146 11.6056M15.1233 11.3733C15.6727 11.2094 16.2858 11.1848 16.8659 11.2338C16.9925 11.2445 17.1206 11.25 17.25 11.25C19.7353 11.25 21.75 9.23528 21.75 6.75C21.75 6.08973 21.6078 5.46268 21.3523 4.89779L18.0762 8.17397C16.9605 7.91785 16.0823 7.03963 15.8262 5.92397L19.1024 2.64774C18.5375 2.39223 17.9103 2.25 17.25 2.25C14.7647 2.25 12.75 4.26472 12.75 6.75C12.75 6.87938 12.7555 7.00749 12.7662 7.13411C12.8571 8.20956 12.6948 9.39841 11.8617 10.0845L11.7596 10.1686M10.0146 11.6056L5.90901 7.5H4.5L2.25 3.75L3.75 2.25L7.5 4.5V5.90901L11.7596 10.1686M10.0146 11.6056L11.7596 10.1686M18.375 18.375L15.75 15.75M4.86723 19.125H4.87473V19.1325H4.86723V19.125Z"
+        stroke="currentColor"
+        strokeWidth="1.5"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
 const iconByKind: Record<AppletKind, typeof SquareTerminal> = {
   terminal: SquareTerminal,
   wslTerminal: SquareTerminal,
@@ -168,6 +188,45 @@ const appletCatalog: Array<{ kind: AppletKind; label: string }> = [
   { kind: "chat", label: "Chat" },
   { kind: "sandbox", label: "Sandbox" }
 ];
+
+const BrandPresetIcon = (({ size = 24, ...props }: SVGProps<SVGSVGElement> & { size?: string | number }) => (
+  <svg {...props} width={size} height={size} viewBox="0 0 24 24" fill="none" aria-hidden="true">
+    <rect x="2" y="2" width="20" height="20" rx="6" fill="currentColor" />
+    <path d="M12 6l1.7 3.7L18 11.4l-3.2 3 0.8 4.4L12 16.8 8.4 18.8l0.8-4.4-3.2-3 4.3-1.7L12 6z" fill="#fffaf2" />
+  </svg>
+)) as LucideIcon;
+
+const OpenAIPresetIcon = (({ size = 24, ...props }: SVGProps<SVGSVGElement> & { size?: string | number }) => (
+  <svg {...props} width={size} height={size} viewBox="136 217 288 286" fill="none" aria-hidden="true">
+    <path d="M249.176 323.434V298.276C249.176 296.158 249.971 294.569 251.825 293.509L302.406 264.381C309.29 260.409 317.5 258.555 325.973 258.555C357.75 258.555 377.877 283.185 377.877 309.399C377.877 311.253 377.877 313.371 377.611 315.49L325.178 284.771C322.001 282.919 318.822 282.919 315.645 284.771L249.176 323.434ZM367.283 421.415V361.301C367.283 357.592 365.694 354.945 362.516 353.092L296.048 314.43L317.763 301.982C319.617 300.925 321.206 300.925 323.058 301.982L373.639 331.112C388.205 339.586 398.003 357.592 398.003 375.069C398.003 395.195 386.087 413.733 367.283 421.412V421.415ZM233.553 368.452L211.838 355.742C209.986 354.684 209.19 353.095 209.19 350.975V292.718C209.19 264.383 230.905 242.932 260.301 242.932C271.423 242.932 281.748 246.641 290.49 253.26L238.321 283.449C235.146 285.303 233.555 287.951 233.555 291.659V368.455L233.553 368.452ZM280.292 395.462L249.176 377.985V340.913L280.292 323.436L311.407 340.913V377.985L280.292 395.462ZM300.286 475.968C289.163 475.968 278.837 472.259 270.097 465.64L322.264 435.449C325.441 433.597 327.03 430.949 327.03 427.239V350.445L349.011 363.155C350.865 364.213 351.66 365.802 351.66 367.922V426.179C351.66 454.514 329.679 475.965 300.286 475.965V475.968ZM237.525 416.915L186.944 387.785C172.378 379.31 162.582 343.827C162.582 323.436 174.763 305.164 193.563 297.485V357.861C193.563 361.571 195.154 364.217 198.33 366.071L264.535 404.467L242.82 416.915C240.967 417.972 239.377 417.972 237.525 416.915ZM234.614 460.343C204.689 460.343 182.71 437.833 182.71 410.028C182.71 407.91 182.976 405.792 183.238 403.672L235.405 433.863C238.582 435.715 241.763 435.715 244.938 433.863L311.407 395.466V420.622C311.407 422.742 310.612 424.331 308.758 425.389L258.179 454.519C251.293 458.491 243.083 460.343 234.611 460.343H234.614ZM300.286 491.854C332.329 491.854 359.073 469.082 365.167 438.892C394.825 431.211 413.892 403.406 413.892 375.073C413.892 356.535 405.948 338.529 391.648 325.552C392.972 319.991 393.766 314.43 393.766 308.87C393.766 271.003 363.048 242.666 327.562 242.666C320.413 242.666 313.528 243.723 306.644 246.109C294.725 234.457 278.307 227.042 260.301 227.042C228.258 227.042 201.513 249.815 195.42 280.004C165.761 287.685 146.694 315.49 146.694 343.824C146.694 362.362 154.638 380.368 168.938 393.344C167.613 398.906 166.819 404.467 166.819 410.027C166.819 447.894 197.538 476.231 233.024 476.231C240.172 476.231 247.058 475.173 253.943 472.788C265.859 484.441 282.278 491.854 300.286 491.854Z" fill="currentColor" />
+  </svg>
+)) as LucideIcon;
+
+const SETTINGS_PRESET_ICON_OPTIONS = [
+  { value: "sliders", label: "Sliders" },
+  { value: "openai", label: "OpenAI" },
+  { value: "bolt", label: "Bolt" },
+  { value: "brain", label: "Brain" },
+  { value: "brand", label: "Brand" },
+  { value: "settings", label: "Gear" },
+  { value: "list", label: "List" },
+  { value: "folder", label: "Folder" },
+  { value: "git_branch", label: "Branch" }
+] as const;
+
+type SettingsPresetIconName = typeof SETTINGS_PRESET_ICON_OPTIONS[number]["value"];
+
+const SETTINGS_PRESET_ICONS: Record<SettingsPresetIconName, LucideIcon> = {
+  sliders: SlidersHorizontal,
+  openai: OpenAIPresetIcon,
+  bolt: Bolt,
+  brain: Brain,
+  brand: BrandPresetIcon,
+  settings: Settings,
+  list: List,
+  folder: FolderOpen,
+  git_branch: GitBranch
+};
 
 type AppletDropTarget = {
   targetLeafId?: string;
@@ -3729,16 +3788,17 @@ type ChatMenuAnchor = {
   placement: "above" | "below";
 };
 
-type ChatMenuState =
-  | (ChatMenuAnchor & { kind: "model" })
-  | (ChatMenuAnchor & { kind: "add" })
-  | (ChatMenuAnchor & { kind: "settings" })
-  | (ChatMenuAnchor & { kind: "quality" })
-  | (ChatMenuAnchor & { kind: "permissions" })
-  | (ChatMenuAnchor & { kind: "branch" })
-  | (ChatMenuAnchor & { kind: "document" })
-  | (ChatMenuAnchor & { kind: "thread"; threadId: string })
-  | null;
+type ChatMenuTarget =
+  | { kind: "model" }
+  | { kind: "add" }
+  | { kind: "settings" }
+  | { kind: "quality" }
+  | { kind: "permissions" }
+  | { kind: "branch" }
+  | { kind: "document" }
+  | { kind: "thread"; threadId: string };
+
+type ChatMenuState = (ChatMenuAnchor & ChatMenuTarget) | null;
 
 type ChatDialogState =
   | { kind: "new-project" }
@@ -3748,7 +3808,6 @@ type ChatDialogState =
   | { kind: "rename-project"; projectId: string; title: string }
   | { kind: "rename-thread"; threadId: string; title: string }
   | { kind: "delete-project"; projectId: string; title: string }
-  | { kind: "delete-thread"; threadId: string; title: string }
   | { kind: "app-settings" }
   | { kind: "settings-preset"; presetId?: string }
   | { kind: "document-index"; projectId: string; documentIndexId?: string }
@@ -3822,6 +3881,7 @@ type ChatSettingSelectOption = {
   value: string;
   label: string;
   disabled?: boolean;
+  icon?: ReactNode;
 };
 
 function contextWindowOptions(includeDefault: boolean): ChatSettingSelectOption[] {
@@ -3926,8 +3986,11 @@ function ChatSettingSelect({
         aria-expanded={open}
         onClick={toggleMenu}
       >
-        <span>{selected?.label ?? value}</span>
-        <ChevronDown size={15} />
+        <span className={["chat-setting-select-value", selected?.icon ? "has-icon" : ""].filter(Boolean).join(" ")}>
+          {selected?.icon ? <span className="chat-setting-select-option-icon">{selected.icon}</span> : null}
+          <span>{selected?.label ?? value}</span>
+        </span>
+        <ChevronDown className="chat-setting-select-caret" size={15} />
       </button>
       {open && menuRect ? createPortal(
         <div
@@ -3942,6 +4005,7 @@ function ChatSettingSelect({
             <button
               key={option.value}
               type="button"
+              className={option.icon ? "has-icon" : undefined}
               role="option"
               aria-selected={option.value === value}
               disabled={option.disabled}
@@ -3954,6 +4018,7 @@ function ChatSettingSelect({
                 buttonRef.current?.focus();
               }}
             >
+              {option.icon ? <span className="chat-setting-select-option-icon">{option.icon}</span> : null}
               <span>{option.label}</span>
             </button>
           ))}
@@ -4129,19 +4194,29 @@ function ChatSurface() {
     : !threadUsesCodex && !selectedModel
       ? "Add and select a local GGUF model before sending."
       : "";
-  const statusMessage = localError ?? (chatState?.generation.status === "error" ? chatState.generation.error : "");
+  const latestSelectedMessage = selectedMessages.at(-1) ?? null;
+  const generationErrorMessage = chatState?.generation.status === "error" ? chatState.generation.error : "";
+  const generationErrorBelongsToTranscript = Boolean(
+    generationErrorMessage
+    && latestSelectedMessage?.role === "assistant"
+    && latestSelectedMessage.status === "error"
+  );
+  const statusMessage = localError ?? (generationErrorBelongsToTranscript ? "" : generationErrorMessage);
   const activeProject = chatState?.projects.find((project) => project.id === chatState.selectedProjectId) ?? null;
   const selectedDocumentIndex = selectedThread
     ? chatState?.documentIndexes.find((index) => index.id === selectedThread.documentIndexId) ?? null
     : null;
   const documentControlsVisible = Boolean(selectedThread && !threadUsesCodex && selectedBuiltinFramework === "document_analysis");
-  const reasoningButtonLabel = selectedThread
-    ? (threadUsesCodex ? reasoningLabel(selectedThread.codexReasoningEffort) : runtimeReasoningLabel(activeRuntimeSettings ?? chatState.runtimeSettings))
+  const fallbackRuntimeSettings = activeRuntimeSettings ?? chatState?.runtimeSettings;
+  const reasoningButtonLabel = selectedThread && fallbackRuntimeSettings
+    ? (threadUsesCodex ? reasoningLabel(selectedThread.codexReasoningEffort) : runtimeReasoningLabel(fallbackRuntimeSettings))
     : "Medium";
-  const permissionButtonLabel = selectedThread
-    ? (threadUsesCodex ? permissionLabel(codexAccessModeForApprovalMode(selectedThread.codexApprovalMode)) : permissionLabel((activeRuntimeSettings ?? chatState.runtimeSettings).permissionMode))
+  const permissionButtonLabel = selectedThread && fallbackRuntimeSettings
+    ? (threadUsesCodex ? permissionLabel(codexAccessModeForApprovalMode(selectedThread.codexApprovalMode)) : permissionLabel(fallbackRuntimeSettings.permissionMode))
     : "Full access";
   const settingsPresetButtonLabel = selectedThread ? selectedSettingsPreset?.label ?? "Custom" : "Default";
+  const documentButtonLabel = selectedDocumentIndex?.title ?? "Documents";
+  const documentStatusLabel = selectedDocumentIndex ? documentIndexStatusLabel(selectedDocumentIndex) : "No document group selected";
   const modelButtonLabel = threadUsesCodex ? selectedCodexModel?.label ?? "Codex model" : selectedModel?.label ?? "No model";
   const branchButtonLabel = gitState?.status === "ready"
     ? `${gitState.currentBranch}${gitState.dirty ? "*" : ""}`
@@ -4164,7 +4239,19 @@ function ChatSurface() {
     message.updatedAt,
     message.content.length,
     message.reasoning?.length ?? 0,
-    message.timelineBlocks?.length ?? 0
+    message.timelineBlocks?.map((block) => [
+      block.kind,
+      "id" in block ? block.id : "",
+      "status" in block ? block.status ?? "" : "",
+      "level" in block ? block.level ?? "" : "",
+      "summary" in block ? block.summary ?? "" : "",
+      "command" in block ? block.command ?? "" : "",
+      "output" in block ? block.output?.length ?? 0 : "",
+      "text" in block ? block.text?.length ?? 0 : "",
+      "message" in block ? block.message?.length ?? 0 : "",
+      "details" in block ? block.details?.length ?? 0 : "",
+      "preview" in block ? block.preview?.length ?? 0 : ""
+    ].join("~")).join(",") ?? ""
   ].join(":")).join("|"), [selectedMessages]);
   const chatLayoutStyle = {
     "--chat-content-width": `${chatLayout.contentWidth}px`,
@@ -4177,9 +4264,12 @@ function ChatSurface() {
       setChatMenu(null);
     }
     try {
-      setChatState(await action());
+      const nextState = await action();
+      setChatState(nextState);
+      return nextState;
     } catch (error: unknown) {
       setLocalError(errorMessage(error));
+      return null;
     }
   }, []);
 
@@ -4273,7 +4363,7 @@ function ChatSurface() {
 
   const openChatMenu = useCallback((
     event: ReactPointerEvent<HTMLElement>,
-    menu: Omit<NonNullable<ChatMenuState>, keyof ChatMenuAnchor>,
+    menu: ChatMenuTarget,
     placement: ChatMenuAnchor["placement"] = "above"
   ) => {
     event.stopPropagation();
@@ -4645,7 +4735,7 @@ function ChatSurface() {
 
   useLayoutEffect(() => {
     shouldFollowThreadBottomRef.current = true;
-    requestAnimationFrame(scrollThreadToBottom);
+    requestAnimationFrame(() => scrollThreadToBottom());
   }, [selectedThread?.id, scrollThreadToBottom]);
 
   useLayoutEffect(() => {
@@ -4668,7 +4758,7 @@ function ChatSurface() {
     }
     threadOverscrollAnchorRef.current = null;
     scrollThreadToBottom();
-    const frameId = requestAnimationFrame(scrollThreadToBottom);
+    const frameId = requestAnimationFrame(() => scrollThreadToBottom());
     return () => cancelAnimationFrame(frameId);
   }, [classifyThreadBottomState, ensureManualEndSlackForScrollTop, readThreadScrollMetrics, selectedMessageSignature, chatLayout.composerInset, scrollThreadToBottom]);
 
@@ -5023,8 +5113,7 @@ function ChatSurface() {
                         <span
                           className={[
                             "chat-thread-state",
-                            chatState.generation.status === "running" && chatState.generation.threadId === thread.id ? "loading" : "",
-                            thread.id !== chatState.selectedThreadId && messagePreviewByThreadId.has(thread.id) ? "unread" : ""
+                            chatState.generation.status === "running" && chatState.generation.threadId === thread.id ? "loading" : ""
                           ].join(" ")}
                           aria-hidden="true"
                         />
@@ -5069,7 +5158,7 @@ function ChatSurface() {
                               className="chat-project-action"
                               type="button"
                               aria-label={`More actions for ${thread.title}`}
-                              onClick={(event) => {
+                              onPointerDown={(event) => {
                                 event.stopPropagation();
                                 openChatMenu(event, { kind: "thread", threadId: thread.id }, "below");
                               }}
@@ -5082,7 +5171,7 @@ function ChatSurface() {
                               aria-label={`Delete ${thread.title}`}
                               onClick={(event) => {
                                 event.stopPropagation();
-                                setChatDialog({ kind: "delete-thread", threadId: thread.id, title: thread.title });
+                                void runChatAction(() => window.unitApi.chat.deleteThread({ threadId: thread.id }));
                               }}
                             >
                               <X size={13} />
@@ -5159,7 +5248,9 @@ function ChatSurface() {
                   autoExpandDisclosures={chatState.appSettings.autoExpandCodexDisclosures}
                   copiedCodeBlockIds={copiedCodeBlockIds}
                   message={message}
-                  onTimelineAction={(blockId, action, answer) => runChatAction(() => window.unitApi.chat.timelineAction({ messageId: message.id, blockId, action, answer }))}
+                  onTimelineAction={async (blockId, action, answer) => {
+                    await runChatAction(() => window.unitApi.chat.timelineAction({ messageId: message.id, blockId, action, answer }));
+                  }}
                 />
               ))
             )}
@@ -5255,12 +5346,6 @@ function ChatSurface() {
               >
                 <Plus size={18} />
               </button>
-              {documentControlsVisible ? (
-                <button className="chat-document-button composer-document-button" type="button" aria-label="Document" onPointerDown={(event) => openChatMenu(event, { kind: "document" })}>
-                  <FileText size={13} />
-                  <span>Document</span>
-                </button>
-              ) : null}
               <button
                 className="chat-settings-menu-button"
                 type="button"
@@ -5271,6 +5356,14 @@ function ChatSurface() {
                 <span>{settingsPresetButtonLabel}</span>
                 <ChevronRight className="chat-model-caret" size={12} />
               </button>
+              {documentControlsVisible ? (
+                <button className="chat-document-menu composer-document-button" type="button" aria-label="Document groups" title={documentStatusLabel} onPointerDown={(event) => openChatMenu(event, { kind: "document" })}>
+                  <FileText size={13} />
+                  <span className="chat-document-menu-label">{documentButtonLabel}</span>
+                  <DocumentIndexStatusMark index={selectedDocumentIndex} />
+                  <ChevronRight className="chat-model-caret" size={12} />
+                </button>
+              ) : null}
               <button
                 className="chat-model-menu"
                 type="button"
@@ -5368,9 +5461,6 @@ function ChatSurface() {
             <div className="chat-footer-usage-indicators">{composerUsageIndicators}</div>
             <div className="chat-footer-right-cluster">
               {footerRightUsageIndicators}
-              <div className={["chat-document-progress", documentControlsVisible && selectedDocumentIndex ? "visible" : ""].join(" ")} aria-label="Document progress">
-                <span style={{ width: `${Math.round((selectedDocumentIndex?.progress ?? 0) * 100)}%` }} />
-              </div>
               <span className="chat-context-tile-label">Context:</span>
               <ChatContextTileBar usedPercent={contextPercent} nCtx={(activeRuntimeSettings ?? chatState.runtimeSettings).nCtx} />
             </div>
@@ -5471,7 +5561,7 @@ function ChatDropUpMenu({
   onAttach: (kind: ChatAttachment["kind"]) => Promise<void>;
   onClose: () => void;
   onDialog: (dialog: ChatDialogState) => void;
-  onRun: (action: () => Promise<ChatState>, options?: { closeMenu?: boolean }) => Promise<void>;
+  onRun: (action: () => Promise<ChatState>, options?: { closeMenu?: boolean }) => Promise<ChatState | null>;
   gitState: ChatGitState | null;
   activeProjectId: string;
   onRefreshGitState: (projectId?: string) => Promise<void>;
@@ -5492,6 +5582,7 @@ function ChatDropUpMenu({
   const activeAccessMode = activeUsesCodex && activeThread ? codexAccessModeForApprovalMode(activeThread.codexApprovalMode) : activePermissionMode;
   const activeReasoningEffort = activeUsesCodex ? activeThread?.codexReasoningEffort : activeRuntimeSettings.reasoningEffort;
   const selectedThread = menu.kind === "thread" ? chatState.threads.find((thread) => thread.id === menu.threadId) : null;
+  const projectDocumentIndexes = chatState.documentIndexes.filter((index) => index.projectId === activeThread?.projectId);
   return (
     <div
       className={["chat-dropup", `placement-${menu.placement}`, menu.kind === "thread" ? "sidebar-menu" : ""].join(" ")}
@@ -5768,42 +5859,86 @@ function ChatDropUpMenu({
       ) : null}
       {menu.kind === "document" ? (
         <>
-          <div className="chat-dropup-section-label">Document Analysis</div>
-          {chatState.documentIndexes.filter((index) => index.projectId === activeThread?.projectId && (index.state === "ready" || index.state === "building")).length === 0 ? <div className="chat-dropup-empty">No document indexes</div> : null}
-          {chatState.documentIndexes
-            .filter((index) => index.projectId === activeThread?.projectId && (index.state === "ready" || index.state === "building"))
-            .map((index) => (
-              <button
-                className={index.id === activeThread?.documentIndexId ? "selected" : ""}
-                key={index.id}
-                type="button"
-                role="menuitemradio"
-                aria-checked={index.id === activeThread?.documentIndexId}
-                onClick={() => {
-                  if (activeThread) {
-                    void onRun(() => window.unitApi.chat.selectDocumentIndex({ threadId: activeThread.id, documentIndexId: index.id }));
-                  }
-                }}
-              >
-                <FileText size={14} />
-                <span>{index.title}  [{formatTimelineStatus(index.state)}]</span>
-              </button>
-            ))}
+          <div className="chat-dropup-section-label">Document Groups</div>
+          {projectDocumentIndexes.length === 0 ? <div className="chat-dropup-empty">No document groups</div> : null}
+          {projectDocumentIndexes.map((index) => {
+            const localEditableIndex = chatState.appSettings.documentIndexLocation === "local" && !index.id.startsWith("remote-doc::");
+            const statusLabel = documentIndexStatusLabel(index);
+            const progressPercent = documentIndexProgressPercent(index);
+            return (
+              <div className="chat-dropup-action-row" key={index.id}>
+                <button
+                  className={index.id === activeThread?.documentIndexId ? "selected" : ""}
+                  type="button"
+                  role="menuitemradio"
+                  aria-checked={index.id === activeThread?.documentIndexId}
+                  onClick={() => {
+                    if (activeThread) {
+                      void onRun(() => window.unitApi.chat.selectDocumentIndex({ threadId: activeThread.id, documentIndexId: index.id }));
+                    }
+                  }}
+                >
+                  <FileText size={14} />
+                  <span className="chat-document-index-menu-copy">
+                    <span className="chat-document-index-menu-title">
+                      <span>{index.title}</span>
+                      <DocumentIndexStatusMark index={index} />
+                    </span>
+                    {index.state === "ready" ? null : <span className="chat-document-index-menu-status">{statusLabel}</span>}
+                    {index.state === "building" ? (
+                      <span className="chat-document-index-menu-progress" aria-hidden="true">
+                        <span style={{ width: `${progressPercent}%` }} />
+                      </span>
+                    ) : null}
+                  </span>
+                </button>
+                <span className="chat-dropup-action-controls">
+                  {localEditableIndex ? (
+                    <button
+                      className="chat-dropup-inline-action"
+                      type="button"
+                      aria-label={`Edit ${index.title}`}
+                      onPointerDown={(event) => event.stopPropagation()}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        onClose();
+                        onDialog({ kind: "document-index", projectId: index.projectId, documentIndexId: index.id });
+                      }}
+                    >
+                      <Pencil size={12} />
+                    </button>
+                  ) : null}
+                  <button
+                    className="chat-dropup-inline-action danger"
+                    type="button"
+                    aria-label={`Delete ${index.title}`}
+                    onPointerDown={(event) => event.stopPropagation()}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      void onRun(() => window.unitApi.chat.deleteDocumentIndex({ documentIndexId: index.id }), { closeMenu: false });
+                    }}
+                  >
+                    <Trash2 size={12} />
+                  </button>
+                </span>
+              </div>
+            );
+          })}
           {activeThread?.documentIndexId ? (
             <button type="button" role="menuitem" onClick={() => void onRun(() => window.unitApi.chat.selectDocumentIndex({ threadId: activeThread.id, documentIndexId: "" }))}>
               <X size={14} />
-              <span>Clear document index</span>
+              <span>Clear selected group</span>
             </button>
           ) : null}
           <div className="chat-dropup-divider" />
-          <button type="button" role="menuitem" disabled={!canCreateDocumentIndex} onClick={() => {
+          <button type="button" role="menuitem" onClick={() => {
             onClose();
             if (activeProjectId) {
               onDialog({ kind: "document-index", projectId: activeProjectId });
             }
           }}>
             <Plus size={14} />
-            <span>Create document index...</span>
+            <span>New group...</span>
           </button>
         </>
       ) : null}
@@ -5836,7 +5971,7 @@ function ChatDropUpMenu({
             role="menuitem"
             onClick={() => {
               onClose();
-              onDialog({ kind: "delete-thread", threadId: selectedThread.id, title: selectedThread.title });
+              void onRun(() => window.unitApi.chat.deleteThread({ threadId: selectedThread.id }));
             }}
           >
             <Trash2 size={14} />
@@ -5859,7 +5994,7 @@ function ChatDialog({
   state: ChatState;
   onClose: () => void;
   onDialog: (dialog: ChatDialogState) => void;
-  onRun: (action: () => Promise<ChatState>) => Promise<void>;
+  onRun: (action: () => Promise<ChatState>) => Promise<ChatState | null>;
 }) {
   const [title, setTitle] = useState(initialChatDialogTitle(dialog, state));
   const [directory, setDirectory] = useState(initialChatDialogDirectory(dialog, state));
@@ -5872,10 +6007,10 @@ function ChatDialog({
   const [threadPermissionMode, setThreadPermissionMode] = useState<ChatPermissionMode>(() => initialThreadPermissionMode(dialog, state));
   const [threadCodexApprovalMode, setThreadCodexApprovalMode] = useState<ChatCodexApprovalMode>(() => initialThreadCodexApprovalMode(dialog, state));
   const [threadPlanModeEnabled, setThreadPlanModeEnabled] = useState(() => initialThreadPlanModeEnabled(dialog, state));
-  const [presetIconName, setPresetIconName] = useState(() => initialSettingsPresetIconName(dialog, state));
-  const [presetBuiltinFramework, setPresetBuiltinFramework] = useState<"chat" | "document_analysis">(() => initialSettingsPresetBuiltinFramework(dialog, state));
+  const [presetIconName, setPresetIconName] = useState<string>(() => initialSettingsPresetIconName(dialog, state));
+  const [presetBuiltinFramework, setPresetBuiltinFramework] = useState<ChatBuiltinAgenticFramework>(() => initialSettingsPresetBuiltinFramework(dialog, state));
   const [presetEmbeddingModelPath, setPresetEmbeddingModelPath] = useState(() => initialSettingsPresetEmbeddingModelPath(dialog, state));
-  const [documentIndexPaths, setDocumentIndexPaths] = useState<string[]>([]);
+  const [documentIndexPaths, setDocumentIndexPaths] = useState<string[]>(() => initialDocumentIndexPaths(dialog, state));
 
   useEffect(() => {
     setTitle(initialChatDialogTitle(dialog, state));
@@ -5892,7 +6027,7 @@ function ChatDialog({
     setPresetIconName(initialSettingsPresetIconName(dialog, state));
     setPresetBuiltinFramework(initialSettingsPresetBuiltinFramework(dialog, state));
     setPresetEmbeddingModelPath(initialSettingsPresetEmbeddingModelPath(dialog, state));
-    setDocumentIndexPaths([]);
+    setDocumentIndexPaths(initialDocumentIndexPaths(dialog, state));
   }, [dialog, state]);
 
   const updateUsageIndicatorPreference = (
@@ -6098,7 +6233,7 @@ function ChatDialog({
               runtimeSettings: parseRuntimeSettingsForm(settings),
               providerMode: threadProviderMode,
               iconName: presetIconName,
-              builtinModelId: state.selectedModelId,
+              builtinModelId: threadBuiltinModelId,
               builtinAgenticFramework: presetBuiltinFramework,
               documentAnalysisEmbeddingModelPath: presetEmbeddingModelPath,
               codexModelId: threadCodexModelId,
@@ -6125,39 +6260,89 @@ function ChatDialog({
                 </label>
                 <ChatSettingSelect
                   label="Icon"
-                  value={presetIconName}
-                  options={[
-                    { value: "sliders", label: "Sliders" },
-                    { value: "bolt", label: "Bolt" },
-                    { value: "brain", label: "Brain" },
-                    { value: "code", label: "Code" }
-                  ]}
+                  value={normalizeSettingsPresetIconName(presetIconName, threadProviderMode)}
+                  options={SETTINGS_PRESET_ICON_OPTIONS.map((option) => ({
+                    value: option.value,
+                    label: option.label,
+                    icon: <SettingsPresetIcon iconName={option.value} providerMode={threadProviderMode} size={14} />
+                  }))}
                   onChange={setPresetIconName}
-                />
-                <ChatSettingSelect
-                  label="Provider"
-                  value={threadProviderMode}
-                  options={[{ value: "builtin", label: "Built-in" }, { value: "codex", label: "Codex" }]}
-                  onChange={(value) => setThreadProviderMode(value as ChatProviderMode)}
                 />
               </div>
             </section>
             <section className="chat-settings-section">
-              <h3>Built-in</h3>
+              <h3>Provider</h3>
+              <ChatSettingSelect
+                label="Provider"
+                value={threadProviderMode}
+                options={[{ value: "builtin", label: "Local model" }, { value: "codex", label: "Codex" }]}
+                onChange={(value) => setThreadProviderMode(value as ChatProviderMode)}
+              />
+            </section>
+            <section className="chat-settings-section">
+              <h3>Harness</h3>
+              {threadProviderMode === "codex" ? (
+                <ChatSettingSelect
+                  label="Harness"
+                  value="codex"
+                  options={[{ value: "codex", label: "Codex" }]}
+                  onChange={() => undefined}
+                />
+              ) : (
+                <ChatSettingSelect
+                  label="Harness"
+                  value={presetBuiltinFramework}
+                  options={[
+                    { value: "chat", label: "Chat" },
+                    { value: "document_analysis", label: "Document analysis" },
+                    { value: "opencode", label: "OpenCode" }
+                  ]}
+                  onChange={(value) => setPresetBuiltinFramework(value as ChatBuiltinAgenticFramework)}
+                />
+              )}
+            </section>
+            {threadProviderMode === "codex" ? (
+            <section className="chat-settings-section">
+              <h3>Defaults</h3>
               <div className="chat-settings-row">
                 <ChatSettingSelect
-                  label="Agentic framework"
-                  value={presetBuiltinFramework}
-                  options={[{ value: "chat", label: "Chat" }, { value: "document_analysis", label: "Document analysis" }]}
-                  onChange={(value) => setPresetBuiltinFramework(value as "chat" | "document_analysis")}
+                  label="Model"
+                  value={threadCodexModelId}
+                  options={state.codexModels.map((model) => ({ value: model.id, label: model.label }))}
+                  onChange={setThreadCodexModelId}
+                />
+                <ChatSettingSelect
+                  label="Reasoning"
+                  value={threadCodexReasoningEffort}
+                  options={reasoningOptions(state.codexModels.find((model) => model.id === threadCodexModelId)?.reasoningEfforts ?? ["low", "medium", "high"])}
+                  onChange={(value) => setThreadCodexReasoningEffort(value as ChatReasoningEffort)}
                 />
                 <ChatSettingSelect
                   label="Access"
-                  value={settings.permissionMode}
-                  options={[{ value: "default_permissions", label: "Default" }, { value: "full_access", label: "Full access" }]}
-                  onChange={(value) => setSettings({ ...settings, permissionMode: value })}
+                  value={codexAccessModeForApprovalMode(threadCodexApprovalMode)}
+                  options={CHAT_PERMISSION_OPTIONS.map((option) => ({ value: option.id, label: option.label }))}
+                  onChange={(value) => {
+                    const nextAccess = value as ChatPermissionMode;
+                    setThreadPermissionMode(nextAccess);
+                    setThreadCodexApprovalMode(codexApprovalModeForAccessMode(nextAccess));
+                    setSettings({ ...settings, permissionMode: nextAccess });
+                  }}
                 />
               </div>
+            </section>
+            ) : (
+            <>
+            <section className="chat-settings-section">
+              <h3>Defaults</h3>
+              <ChatSettingSelect
+                label="Model"
+                value={threadBuiltinModelId}
+                options={state.models.length === 0
+                  ? [{ value: "", label: "No local model available", disabled: true }]
+                  : state.models.map((model) => ({ value: model.id, label: `${model.label}  [${model.providerId === "remote" ? "Remote" : "Local GGUF"}]` }))}
+                onChange={setThreadBuiltinModelId}
+              />
+              {presetBuiltinFramework === "document_analysis" ? (
               <label className="chat-embedding-field">
                 <span>Embedding Model</span>
                 <div className="chat-directory-row">
@@ -6171,31 +6356,7 @@ function ChatDialog({
                   }}>Browse...</button>
                 </div>
               </label>
-            </section>
-            <section className="chat-settings-section">
-              <h3>Codex</h3>
-              <div className="chat-settings-row">
-                <ChatSettingSelect
-                  label="Model"
-                  value={threadCodexModelId}
-                  options={state.codexModels.map((model) => ({ value: model.id, label: model.label }))}
-                  onChange={setThreadCodexModelId}
-                />
-                <ChatSettingSelect
-                  label="Reasoning"
-                  value={threadCodexReasoningEffort}
-                  options={[
-                    { value: "low", label: "Low" },
-                    { value: "medium", label: "Medium" },
-                    { value: "high", label: "High" },
-                    { value: "xhigh", label: "XHigh" }
-                  ]}
-                  onChange={(value) => setThreadCodexReasoningEffort(value as ChatReasoningEffort)}
-                />
-              </div>
-            </section>
-            <section className="chat-settings-section">
-              <h3>Runtime</h3>
+              ) : null}
               <div className="chat-settings-row">
                 <ChatSettingSelect
                   label="Context Window"
@@ -6209,12 +6370,52 @@ function ChatDialog({
                   options={reasoningOptions(["low", "medium", "high"])}
                   onChange={(value) => setSettings({ ...settings, reasoningEffort: value })}
                 />
+                <ChatSettingSelect
+                  label="Access"
+                  value={settings.permissionMode}
+                  options={[{ value: "default_permissions", label: "Default" }, { value: "full_access", label: "Full access" }]}
+                  onChange={(value) => setSettings({ ...settings, permissionMode: value })}
+                />
+              </div>
+              <div className="chat-settings-row">
+                <label>
+                  <span>Temperature</span>
+                  <input value={settings.temperature} onChange={(event) => setSettings({ ...settings, temperature: event.currentTarget.value })} />
+                </label>
+                <label>
+                  <span>Repeat Penalty</span>
+                  <input value={settings.repeatPenalty} onChange={(event) => setSettings({ ...settings, repeatPenalty: event.currentTarget.value })} />
+                </label>
                 <label>
                   <span>Max Tokens</span>
                   <input value={settings.maxTokens} onChange={(event) => setSettings({ ...settings, maxTokens: event.currentTarget.value })} />
                 </label>
               </div>
+              <div className="chat-settings-row chat-settings-row-four">
+                <label>
+                  <span>Trim Reserve Tokens</span>
+                  <input value={settings.trimReserveTokens} onChange={(event) => setSettings({ ...settings, trimReserveTokens: event.currentTarget.value })} />
+                </label>
+                <label>
+                  <span>Trim Reserve %</span>
+                  <input value={settings.trimReservePercent} onChange={(event) => setSettings({ ...settings, trimReservePercent: event.currentTarget.value })} />
+                </label>
+                <label>
+                  <span>Trim Amount Tokens</span>
+                  <input value={settings.trimAmountTokens} onChange={(event) => setSettings({ ...settings, trimAmountTokens: event.currentTarget.value })} />
+                </label>
+                <label>
+                  <span>Trim Amount %</span>
+                  <input value={settings.trimAmountPercent} onChange={(event) => setSettings({ ...settings, trimAmountPercent: event.currentTarget.value })} />
+                </label>
+              </div>
             </section>
+            <section className="chat-settings-section">
+              <h3>System Prompt</h3>
+              <textarea className="chat-settings-prompt" value={settings.systemPrompt} onChange={(event) => setSettings({ ...settings, systemPrompt: event.currentTarget.value })} />
+            </section>
+            </>
+            )}
           </div>
           <div className="chat-dialog-actions">
             <button type="button" onClick={onClose}>Cancel</button>
@@ -6225,6 +6426,9 @@ function ChatDialog({
     );
   }
   if (dialog.kind === "document-index") {
+    const editingDocumentIndex = dialog.documentIndexId
+      ? state.documentIndexes.find((index) => index.id === dialog.documentIndexId) ?? null
+      : null;
     const addDocumentPaths = (paths: string[]) => {
       setDocumentIndexPaths((current) => {
         const seen = new Set(current.map((path) => path.toLocaleLowerCase()));
@@ -6248,20 +6452,31 @@ function ChatDialog({
           className="chat-settings-dialog chat-document-index-dialog"
           role="dialog"
           aria-modal="true"
-          aria-label="Create document index"
+          aria-label="Document group"
           onPointerDown={(event) => event.stopPropagation()}
           onSubmit={(event) => {
             event.preventDefault();
-            void onRun(() => window.unitApi.chat.createDocumentIndex({
-              projectId: dialog.projectId,
-              title,
-              sourcePath: documentIndexPaths.join("\n")
-            })).then(onClose);
+            const sourcePath = documentIndexPaths.join("\n");
+            void onRun(() => editingDocumentIndex
+              ? window.unitApi.chat.updateDocumentIndex({
+                documentIndexId: editingDocumentIndex.id,
+                title,
+                sourcePath
+              })
+              : window.unitApi.chat.createDocumentIndex({
+                projectId: dialog.projectId,
+                title,
+                sourcePath
+              })).then((nextState) => {
+                if (nextState?.generation.status !== "error") {
+                  onClose();
+                }
+              });
           }}
         >
           <header className="chat-settings-header">
             <div>
-              <strong>Create Document Index</strong>
+              <strong>{editingDocumentIndex ? "Edit Document Group" : "New Document Group"}</strong>
               <span>{state.projects.find((project) => project.id === dialog.projectId)?.title ?? "Project"}</span>
             </div>
             <button type="button" aria-label="Close document index" onClick={onClose}>
@@ -6277,23 +6492,23 @@ function ChatDialog({
               </label>
             </section>
             <section className="chat-settings-section">
-              <h3>PDFs</h3>
+              <h3>Documents</h3>
               <div className="chat-document-index-toolbar">
                 <button type="button" onClick={() => {
                   void window.unitApi.fileSystem.selectFiles({
                     currentPath: state.projects.find((project) => project.id === dialog.projectId)?.directory,
                     kind: "file",
                     multiple: true
-                  }).then((result) => addDocumentPaths(result.paths.filter((path) => path.toLocaleLowerCase().endsWith(".pdf"))));
-                }}>Add PDFs</button>
+                  }).then((result) => addDocumentPaths(result.paths));
+                }}>Add Documents</button>
                 <button type="button" disabled={documentIndexPaths.length === 0} onClick={() => setDocumentIndexPaths([])}>Clear</button>
               </div>
               <div className="chat-document-index-file-list">
                 {documentIndexPaths.length === 0 ? (
-                  <div className="chat-document-index-empty">No PDFs selected.</div>
+                  <div className="chat-document-index-empty">No documents selected.</div>
                 ) : documentIndexPaths.map((path) => (
                   <div className="chat-document-index-file-row" key={path}>
-                    <input type="checkbox" aria-label={`Select ${chatFileName(path)}`} readOnly />
+                    <input type="checkbox" aria-label={`${chatFileName(path)} included`} checked readOnly />
                     <div>
                       <strong>{chatFileName(path)}</strong>
                       <span>{path}</span>
@@ -6308,7 +6523,7 @@ function ChatDialog({
           </div>
           <div className="chat-dialog-actions">
             <button type="button" onClick={onClose}>Cancel</button>
-            <button type="submit" disabled={!title.trim() || documentIndexPaths.length === 0}>Create</button>
+            <button type="submit" disabled={!title.trim() || documentIndexPaths.length === 0}>{editingDocumentIndex ? "Save" : "Create"}</button>
           </div>
         </form>
       </div>
@@ -6545,11 +6760,15 @@ function ChatDialog({
               />
               <div className="chat-settings-row">
                 <ChatSettingSelect
-                  label="Agentic framework"
-                  ariaLabel="Thread agentic framework"
+                  label="Harness"
+                  ariaLabel="Thread harness"
                   value={presetBuiltinFramework}
-                  options={[{ value: "chat", label: "Chat" }, { value: "document_analysis", label: "Document analysis" }]}
-                  onChange={(value) => setPresetBuiltinFramework(value as "chat" | "document_analysis")}
+                  options={[
+                    { value: "chat", label: "Chat" },
+                    { value: "document_analysis", label: "Document analysis" },
+                    { value: "opencode", label: "OpenCode" }
+                  ]}
+                  onChange={(value) => setPresetBuiltinFramework(value as ChatBuiltinAgenticFramework)}
                 />
                 <ChatSettingSelect
                   label="Context Window"
@@ -6670,10 +6889,8 @@ function ChatDialog({
             void onRun(() => window.unitApi.chat.renameProject({ projectId: dialog.projectId, title })).then(onClose);
           } else if (dialog.kind === "rename-thread") {
             void onRun(() => window.unitApi.chat.renameThread({ threadId: dialog.threadId, title })).then(onClose);
-          } else if (dialog.kind === "delete-project") {
-            void onRun(() => window.unitApi.chat.deleteProject({ projectId: dialog.projectId })).then(onClose);
           } else {
-            void onRun(() => window.unitApi.chat.deleteThread({ threadId: dialog.threadId })).then(onClose);
+            void onRun(() => window.unitApi.chat.deleteProject({ projectId: dialog.projectId })).then(onClose);
           }
         }}
       >
@@ -6709,7 +6926,7 @@ function initialChatDialogTitle(dialog: ChatDialogState, state: ChatState) {
   if (dialog.kind === "new-project") {
     return "New Project";
   }
-  if (dialog.kind === "rename-project" || dialog.kind === "rename-thread" || dialog.kind === "delete-project" || dialog.kind === "delete-thread") {
+  if (dialog.kind === "rename-project" || dialog.kind === "rename-thread" || dialog.kind === "delete-project") {
     return dialog.title;
   }
   if (dialog.kind === "project-settings") {
@@ -6725,6 +6942,11 @@ function initialChatDialogTitle(dialog: ChatDialogState, state: ChatState) {
     return dialog.presetId
       ? state.settingsPresets.find((preset) => preset.id === dialog.presetId)?.label ?? ""
       : "Untitled settings";
+  }
+  if (dialog.kind === "document-index") {
+    return dialog.documentIndexId
+      ? state.documentIndexes.find((index) => index.id === dialog.documentIndexId)?.title ?? ""
+      : "Untitled documents";
   }
   return "";
 }
@@ -6842,6 +7064,14 @@ function initialChatDialogDirectory(dialog: ChatDialogState, state: ChatState) {
   return state.projects.find((project) => project.id === dialog.projectId)?.directory ?? "";
 }
 
+function initialDocumentIndexPaths(dialog: ChatDialogState, state: ChatState): string[] {
+  if (dialog?.kind !== "document-index" || !dialog.documentIndexId) {
+    return [];
+  }
+  const index = state.documentIndexes.find((candidate) => candidate.id === dialog.documentIndexId);
+  return index?.sourcePath.split(/\r?\n/g).map((item) => item.trim()).filter(Boolean) ?? [];
+}
+
 function initialRuntimeSettingsForm(dialog: ChatDialogState, state: ChatState): Record<keyof ChatRuntimeSettings, string> {
   if (dialog?.kind === "thread-settings") {
     const thread = state.threads.find((candidate) => candidate.id === dialog.threadId);
@@ -6871,6 +7101,9 @@ function initialThreadProviderMode(dialog: ChatDialogState, state: ChatState): C
 function initialThreadBuiltinModelId(dialog: ChatDialogState, state: ChatState) {
   if (dialog?.kind === "thread-settings") {
     return state.threads.find((thread) => thread.id === dialog.threadId)?.builtinModelId || state.selectedModelId || state.models[0]?.id || "";
+  }
+  if (dialog?.kind === "settings-preset" && dialog.presetId) {
+    return state.settingsPresets.find((preset) => preset.id === dialog.presetId)?.builtinModelId || state.selectedModelId || state.models[0]?.id || "";
   }
   return state.selectedModelId || state.models[0]?.id || "";
 }
@@ -6915,12 +7148,15 @@ function initialThreadPlanModeEnabled(dialog: ChatDialogState, state: ChatState)
 }
 
 function initialSettingsPresetIconName(dialog: ChatDialogState, state: ChatState) {
-  return dialog?.kind === "settings-preset" && dialog.presetId
-    ? state.settingsPresets.find((preset) => preset.id === dialog.presetId)?.iconName ?? "sliders"
-    : "sliders";
+  if (dialog?.kind === "settings-preset" && dialog.presetId) {
+    const preset = state.settingsPresets.find((candidate) => candidate.id === dialog.presetId);
+    return normalizeSettingsPresetIconName(preset?.iconName ?? "", preset?.providerMode ?? "builtin");
+  }
+  const selectedThread = state.threads.find((thread) => thread.id === state.selectedThreadId);
+  return selectedThread?.providerMode === "codex" ? "openai" : "sliders";
 }
 
-function initialSettingsPresetBuiltinFramework(dialog: ChatDialogState, state: ChatState): "chat" | "document_analysis" {
+function initialSettingsPresetBuiltinFramework(dialog: ChatDialogState, state: ChatState): ChatBuiltinAgenticFramework {
   if (dialog?.kind === "thread-settings") {
     return state.threads.find((thread) => thread.id === dialog.threadId)?.builtinAgenticFramework ?? "chat";
   }
@@ -6993,8 +7229,12 @@ function preserveClosestChatScroll(origin: HTMLElement, mutate: () => void) {
     return;
   }
   const hostRect = scrollHost.getBoundingClientRect();
-  const candidates = Array.from(scrollHost.querySelectorAll<HTMLElement>(".chat-message, .reasoning-shell, .codex-event-card, .chat-message-body"));
-  const anchor = candidates.find((candidate) => {
+  const anchorSelector = ".chat-message, .reasoning-shell, .codex-event-card, .chat-message-body";
+  const pointAnchor = document
+    .elementFromPoint(hostRect.left + Math.min(32, Math.max(1, hostRect.width - 1)), hostRect.top + Math.min(32, Math.max(1, hostRect.height - 1)))
+    ?.closest<HTMLElement>(anchorSelector);
+  const candidates = Array.from(scrollHost.querySelectorAll<HTMLElement>(anchorSelector));
+  const anchor = pointAnchor && scrollHost.contains(pointAnchor) ? pointAnchor : candidates.find((candidate) => {
     const rect = candidate.getBoundingClientRect();
     return rect.top >= hostRect.top + 1 && rect.top < hostRect.bottom - 1;
   }) ?? candidates.find((candidate) => {
@@ -7030,6 +7270,7 @@ function ChatMessageBubble({
     : "";
   const codexTimelineOwnsAssistantContent = message.role === "assistant" && message.timelineBlocks?.some((block) => block.kind === "assistant_message");
   const shouldRenderMessageBody = message.role === "user" || (!codexTimelineOwnsAssistantContent && Boolean(html));
+  const hasVisibleAssistantContent = Boolean(message.timelineBlocks?.length || standaloneReasoning || shouldRenderMessageBody);
   return (
     <article
       className={[
@@ -7061,7 +7302,7 @@ function ChatMessageBubble({
           disclosureId={`${message.id}-reasoning`}
           status={message.status}
           reasoning={standaloneReasoning}
-          initiallyExpanded={reasoningInitialExpansion(message, autoExpandDisclosures)}
+          initiallyExpanded={reasoningInitialExpansion(message)}
           autoExpandDisclosures={autoExpandDisclosures}
           copiedCodeBlockIds={copiedCodeBlockIds}
         />
@@ -7075,7 +7316,7 @@ function ChatMessageBubble({
           dangerouslySetInnerHTML={{ __html: html }}
         />
       ) : null}
-      {message.status === "interrupted" ? <small>Interrupted</small> : message.status === "error" ? <small>Error</small> : null}
+      {message.status === "interrupted" ? <small>Interrupted</small> : message.status === "error" && !hasVisibleAssistantContent ? <small>Error</small> : null}
     </article>
   );
 }
@@ -7113,9 +7354,9 @@ function remainingAssistantReasoning(assistantReasoning: string, timelineReasoni
   return normalizedAssistant.slice(normalizedTimeline.length).trimStart();
 }
 
-function reasoningInitialExpansion(message: ChatMessage, autoExpandDisclosures: boolean) {
+function reasoningInitialExpansion(message: ChatMessage) {
   const metadataValue = message.metadata?.reasoningInitiallyExpanded;
-  return typeof metadataValue === "boolean" ? metadataValue : autoExpandDisclosures;
+  return typeof metadataValue === "boolean" ? metadataValue : true;
 }
 
 function ChatReasoningDisclosure({
@@ -7240,6 +7481,8 @@ function ChatDisclosure({
   status,
   initiallyExpanded,
   autoExpandDisclosures,
+  outerCard = true,
+  summaryStatus = true,
   children
 }: {
   blockKey: string;
@@ -7248,6 +7491,8 @@ function ChatDisclosure({
   status?: string;
   initiallyExpanded?: boolean;
   autoExpandDisclosures: boolean;
+  outerCard?: boolean;
+  summaryStatus?: boolean;
   children: ReactNode;
 }) {
   const shouldOpen = initiallyExpanded ?? autoExpandDisclosures;
@@ -7276,20 +7521,80 @@ function ChatDisclosure({
   return (
     <details
       ref={detailsRef}
-      className={["codex-event-card codex-event-disclosure codex-tool-shell", className].join(" ")}
+      className={[
+        outerCard ? "codex-event-card" : "reasoning-shell",
+        "codex-event-disclosure",
+        "codex-tool-shell",
+        className
+      ].join(" ")}
       data-collapsed={expanded ? "0" : "1"}
+      data-summary-status={summaryStatus ? "1" : "0"}
       open={expanded}
     >
       <summary className="reasoning-toggle codex-tool-shell-toggle" onClick={toggleExpanded}>
         <span className="reasoning-toggle-label codex-tool-shell-label">
-          <Bolt className="reasoning-toggle-icon codex-tool-shell-icon" size={16} />
+          <CodexToolShellIcon className="codex-tool-shell-icon" size={16} />
           <span className="reasoning-toggle-text-group">{title}</span>
         </span>
-        <span className="codex-event-badge" data-status={status}>{formatTimelineStatus(status ?? "")}</span>
-        <ChevronDown className="reasoning-toggle-caret" size={14} />
+        {summaryStatus ? <span className="codex-event-badge" data-status={status}>{formatTimelineStatus(status ?? "")}</span> : null}
+        <svg className="reasoning-toggle-caret codex-tool-shell-caret" width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+          <path d="M4.5 6.25L8 9.75L11.5 6.25" stroke="currentColor" strokeWidth="1.85" strokeLinecap="round" strokeLinejoin="round" />
+        </svg>
+      </summary>
+      <div className={["codex-event-disclosure-body-shell", outerCard ? "" : "codex-tool-shell-panel"].filter(Boolean).join(" ")}>
+        <div className="codex-event-disclosure-body codex-tool-shell-panel-inner">
+          {children}
+        </div>
+      </div>
+    </details>
+  );
+}
+
+function ChatNestedDisclosure({
+  blockKey,
+  title,
+  children
+}: {
+  blockKey: string;
+  title: string;
+  children: ReactNode;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const blockKeyRef = useRef(blockKey);
+  const detailsRef = useRef<HTMLDetailsElement | null>(null);
+
+  useEffect(() => {
+    if (blockKeyRef.current !== blockKey) {
+      blockKeyRef.current = blockKey;
+      setExpanded(false);
+    }
+  }, [blockKey]);
+
+  const toggleExpanded = useCallback((event: ReactMouseEvent<HTMLElement>) => {
+    event.preventDefault();
+    const details = detailsRef.current;
+    if (!details) {
+      setExpanded((current) => !current);
+      return;
+    }
+    preserveClosestChatScroll(details, () => setExpanded((current) => !current));
+  }, []);
+
+  return (
+    <details
+      ref={detailsRef}
+      className="codex-event-disclosure"
+      data-collapsed={expanded ? "0" : "1"}
+      open={expanded}
+    >
+      <summary className="codex-event-disclosure-toggle" onClick={toggleExpanded}>
+        <span className="codex-event-disclosure-label">{title}</span>
+        <svg className="codex-event-disclosure-caret" width="14" height="14" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+          <path d="M4.5 6.25L8 9.75L11.5 6.25" stroke="currentColor" strokeWidth="1.85" strokeLinecap="round" strokeLinejoin="round" />
+        </svg>
       </summary>
       <div className="codex-event-disclosure-body-shell">
-        <div className="codex-event-disclosure-body codex-tool-shell-panel-inner">
+        <div className="codex-event-disclosure-body">
           {children}
         </div>
       </div>
@@ -7325,7 +7630,7 @@ function ChatTimelineBlockView({
           disclosureId={block.id}
           status={block.status}
           reasoning={block.text}
-          initiallyExpanded={block.initiallyExpanded}
+          initiallyExpanded={block.initiallyExpanded ?? true}
           autoExpandDisclosures={autoExpandDisclosures}
           copiedCodeBlockIds={copiedCodeBlockIds}
         />
@@ -7333,18 +7638,56 @@ function ChatTimelineBlockView({
     ) : null;
   }
   if (block.kind === "tool") {
-    const title = block.command || block.summary || formatTimelineTitle(block.toolName || "Tool Call");
+    const normalizedToolName = block.toolName.trim().toLowerCase();
+    const formattedToolName = formatTimelineTitle(block.toolName || "Tool Call");
+    const isFailedTool = block.status.trim().toLowerCase() === "failed";
+    const isSearchTool = normalizedToolName === "search" || normalizedToolName === "web_search";
+    const isCommandTool = normalizedToolName === "command" || normalizedToolName === "command_execution";
+    const titlePrefix = isSearchTool
+      ? "Search"
+      : isCommandTool
+        ? "Command"
+        : "";
+    const rawBodyTitle = block.command || block.summary || formattedToolName;
+    const bodyTitle = isCommandTool ? extractShellWrappedCommand(rawBodyTitle) : rawBodyTitle;
+    const bodySubtitle = !isSearchTool && !isCommandTool ? formattedToolName : "";
+    const showCommandMeta = Boolean(block.command && block.command !== bodyTitle && !isSearchTool && !isCommandTool);
     return (
       <ChatDisclosure
         blockKey={block.id}
         className="codex-tool-card"
-        title={<span className="codex-event-title">{title}</span>}
+        title={<span className="reasoning-toggle-text">{isFailedTool ? "Failed Tool Call" : "Tool Call"}</span>}
         status={block.status}
         initiallyExpanded={block.initiallyExpanded}
         autoExpandDisclosures={autoExpandDisclosures}
+        outerCard={false}
+        summaryStatus={false}
       >
-        {block.directory ? <div className="codex-event-meta">Directory: {block.directory}</div> : null}
-        {block.output ? <pre className="codex-event-pre">{block.output}</pre> : null}
+        <section className="codex-event-card" data-kind="tool">
+          <div className="codex-event-header">
+            <div className="codex-event-title-group">
+              <div className="codex-event-title">
+                {titlePrefix ? <span className="codex-event-title-prefix">{titlePrefix}: </span> : null}
+                <span className="codex-event-title-text">{bodyTitle}</span>
+              </div>
+              {bodySubtitle ? <div className="codex-event-subtitle">{bodySubtitle}</div> : null}
+            </div>
+            <div className="codex-event-badges">
+              <span className="codex-event-badge" data-status={block.status}>{formatTimelineStatus(block.status)}</span>
+            </div>
+          </div>
+          {showCommandMeta || block.directory ? (
+            <div className="codex-event-meta">
+              {showCommandMeta ? <span className="codex-event-meta-line">Command: {block.command}</span> : null}
+              {block.directory ? <span className="codex-event-meta-line">Directory: {block.directory}</span> : null}
+            </div>
+          ) : null}
+          {block.output ? (
+            <ChatNestedDisclosure blockKey={`${block.id}:output`} title="Output">
+              <pre className="codex-event-pre">{block.output}</pre>
+            </ChatNestedDisclosure>
+          ) : null}
+        </section>
       </ChatDisclosure>
     );
   }
@@ -7445,7 +7788,12 @@ function ChatTimelineBlockView({
       </div>
       <div className="codex-event-text">{message}</div>
       {"code" in block && block.code ? <pre className="codex-event-pre">{block.code}</pre> : null}
-      {block.kind === "status" && block.level === "error" ? (
+      {"details" in block && block.details ? (
+        <ChatNestedDisclosure blockKey={`${block.id}:details`} title="Details">
+          <pre className="codex-event-pre">{block.details}</pre>
+        </ChatNestedDisclosure>
+      ) : null}
+      {block.kind === "status" && block.level === "error" && block.code === "codex_turn_failed" ? (
         <div className="codex-event-actions">
           <button type="button" className="codex-event-action" onClick={() => void onTimelineAction(block.id, "retry")}>Retry</button>
           <button type="button" className="codex-event-action" onClick={() => void onTimelineAction(block.id, "retry_new_thread")}>Retry in new thread</button>
@@ -7472,6 +7820,37 @@ function formatTimelineStatus(value: string) {
     return "Running";
   }
   return normalized.replace(/\b\w/g, (char) => char.toUpperCase());
+}
+
+function documentIndexProgressPercent(index: ChatDocumentIndex) {
+  return Math.round(Math.min(1, Math.max(0, index.progress)) * 100);
+}
+
+function documentIndexStatusLabel(index: ChatDocumentIndex) {
+  if (index.state === "ready") {
+    return "Ready";
+  }
+  if (index.state === "building") {
+    return `${index.message || "Indexing"} ${documentIndexProgressPercent(index)}%`;
+  }
+  return index.message || formatTimelineStatus(index.state);
+}
+
+function DocumentIndexStatusMark({ index }: { index: ChatDocumentIndex | null }) {
+  if (!index) {
+    return null;
+  }
+  if (index.state === "ready") {
+    return (
+      <span className="chat-document-status-mark ready" aria-hidden="true">
+        <Check size={12} />
+      </span>
+    );
+  }
+  if (index.state === "building") {
+    return <span className="chat-document-status-mark building" aria-hidden="true" />;
+  }
+  return <span className="chat-document-status-mark error" aria-hidden="true">!</span>;
 }
 
 function formatChatTimestamp(value: string) {
@@ -7502,17 +7881,34 @@ function codexAccessModeForApprovalMode(value: ChatCodexApprovalMode): ChatPermi
   return value === "never" ? "full_access" : "default_permissions";
 }
 
-function settingsPresetIcon(iconName: string, providerMode: ChatSettingsPreset["providerMode"]) {
-  if (providerMode === "codex" || iconName === "code") {
-    return Code2;
+function SettingsPresetIcon({
+  iconName,
+  providerMode,
+  size = 14,
+  className
+}: {
+  iconName: string;
+  providerMode: ChatSettingsPreset["providerMode"];
+  size?: number;
+  className?: string;
+}) {
+  const Icon = settingsPresetIcon(iconName, providerMode);
+  return <Icon className={className} size={size} />;
+}
+
+function normalizeSettingsPresetIconName(iconName: string, providerMode: ChatSettingsPreset["providerMode"]): SettingsPresetIconName {
+  const normalized = iconName.trim();
+  if (normalized === "code") {
+    return "openai";
   }
-  if (iconName === "bolt") {
-    return Bolt;
+  if (SETTINGS_PRESET_ICON_OPTIONS.some((option) => option.value === normalized)) {
+    return normalized as SettingsPresetIconName;
   }
-  if (iconName === "brain") {
-    return Brain;
-  }
-  return SlidersHorizontal;
+  return providerMode === "codex" ? "openai" : "sliders";
+}
+
+function settingsPresetIcon(iconName: string, providerMode: ChatSettingsPreset["providerMode"]): LucideIcon {
+  return SETTINGS_PRESET_ICONS[normalizeSettingsPresetIconName(iconName, providerMode)];
 }
 
 function runtimeReasoningLabel(settings: ChatRuntimeSettings) {

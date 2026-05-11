@@ -242,6 +242,43 @@ test("builds and searches document index chunks", () => {
   store.close();
 });
 
+test("updates and deletes document index groups", () => {
+  const { store, dir } = makeStore();
+  const sourcePath = path.join(dir, "notes.txt");
+  const nextSourcePath = path.join(dir, "brief.txt");
+  fs.writeFileSync(sourcePath, "alpha project facts");
+  fs.writeFileSync(nextSourcePath, "beta project facts");
+  const state = store.loadState();
+  const index = store.createDocumentIndex(state.selectedProjectId, "Notes", sourcePath);
+  store.selectDocumentIndex(state.selectedThreadId, index.id);
+  store.replaceDocumentIndexChunks(index.id, [
+    {
+      chunkId: "chunk-1",
+      sourceTitle: "notes.txt",
+      sourcePath,
+      pageStart: 1,
+      pageEnd: 1,
+      text: "alpha project facts",
+      tokenCount: 5,
+      ordinalStart: 0,
+      ordinalEnd: 0
+    }
+  ]);
+  store.updateDocumentIndexStatus(index.id, { state: "ready", progress: 1, message: "Ready" });
+
+  const updated = store.updateDocumentIndex(index.id, "Brief", nextSourcePath);
+  let next = store.loadState();
+  expect(updated).toMatchObject({ id: index.id, title: "Brief", sourcePath: nextSourcePath, state: "building", progress: 0 });
+  expect(next.documentIndexes.find((item) => item.id === index.id)).toMatchObject({ title: "Brief", sourcePath: nextSourcePath, state: "building" });
+  expect(() => store.searchDocumentIndex(index.id, "alpha")).toThrow(/not ready/);
+
+  store.deleteDocumentIndex(index.id);
+  next = store.loadState();
+  expect(next.documentIndexes.some((item) => item.id === index.id)).toBe(false);
+  expect(next.threads.find((thread) => thread.id === state.selectedThreadId)?.documentIndexId).toBe("");
+  store.close();
+});
+
 test("manages projects, threads, deletion selection, and runtime settings", () => {
   const { store } = makeStore();
   const project = store.createProject();
@@ -311,6 +348,19 @@ test("persists settings presets and applies provider/framework state", () => {
     builtinAgenticFramework: "document_analysis",
     documentAnalysisEmbeddingModelPath: "C:\\Models\\embed.gguf"
   });
+  const openCodePreset = store.saveSettingsPreset({
+    label: "OpenCode preset",
+    runtimeSettings: { temperature: 0.2 },
+    providerMode: "builtin",
+    builtinAgenticFramework: "opencode"
+  });
+  const codexPreset = store.saveSettingsPreset({
+    label: "Codex preset",
+    runtimeSettings: {},
+    providerMode: "codex",
+    iconName: "code"
+  });
+  expect(codexPreset.iconName).toBe("openai");
   store.applySettingsPreset(threadId, preset.id);
   state = store.loadState();
   expect(state.runtimeSettings.nCtx).toBe(8192);
@@ -318,6 +368,12 @@ test("persists settings presets and applies provider/framework state", () => {
     selectedSettingsPresetId: preset.id,
     builtinAgenticFramework: "document_analysis",
     documentAnalysisEmbeddingModelPath: "C:\\Models\\embed.gguf"
+  });
+  store.applySettingsPreset(threadId, openCodePreset.id);
+  state = store.loadState();
+  expect(state.threads.find((thread) => thread.id === threadId)).toMatchObject({
+    selectedSettingsPresetId: openCodePreset.id,
+    builtinAgenticFramework: "opencode"
   });
 
   store.deleteSettingsPreset("builtin::fast");

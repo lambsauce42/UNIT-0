@@ -247,6 +247,60 @@ test("chat sidebar and dropup controls align to rendered trigger bounds", async 
   expect(sidebarMetrics.threadsLabel.top - sidebarMetrics.newThreadButton.bottom).toBeGreaterThanOrEqual(12);
   expect(sidebarMetrics.firstProject.top - sidebarMetrics.threadsLabel.bottom).toBeLessThanOrEqual(10);
 
+  const hiddenProjectAction = page.locator(".chat-project-card .chat-project-actions .chat-project-action").first();
+  await page.mouse.move(2, 2);
+  await page.evaluate(() => {
+    if (document.activeElement instanceof HTMLElement) {
+      document.activeElement.blur();
+    }
+  });
+  const hiddenActionHit = await hiddenProjectAction.evaluate((button) => {
+    const bounds = button.getBoundingClientRect();
+    const hit = document.elementFromPoint(bounds.left + bounds.width / 2, bounds.top + bounds.height / 2);
+    return {
+      pointerEvents: getComputedStyle(button.parentElement!).pointerEvents,
+      hitAction: hit === button || button.contains(hit)
+    };
+  });
+  expect(hiddenActionHit.pointerEvents).toBe("none");
+  expect(hiddenActionHit.hitAction).toBe(false);
+
+  const hiddenProjectActionBox = await hiddenProjectAction.boundingBox();
+  expect(hiddenProjectActionBox).not.toBeNull();
+  await page.mouse.move(
+    hiddenProjectActionBox!.x + hiddenProjectActionBox!.width / 2,
+    hiddenProjectActionBox!.y + hiddenProjectActionBox!.height / 2
+  );
+  const revealedActionHit = await hiddenProjectAction.evaluate((button) => {
+    const bounds = button.getBoundingClientRect();
+    const hit = document.elementFromPoint(bounds.left + bounds.width / 2, bounds.top + bounds.height / 2);
+    return {
+      pointerEvents: getComputedStyle(button.parentElement!).pointerEvents,
+      hitAction: hit === button || button.contains(hit)
+    };
+  });
+  expect(revealedActionHit.pointerEvents).toBe("auto");
+  expect(revealedActionHit.hitAction).toBe(true);
+
+  const threadAction = page.locator(".chat-thread-list .chat-thread-actions .chat-project-action").first();
+  const threadActionBox = await threadAction.boundingBox();
+  expect(threadActionBox).not.toBeNull();
+  await page.mouse.move(
+    threadActionBox!.x + threadActionBox!.width / 2,
+    threadActionBox!.y + threadActionBox!.height / 2
+  );
+  const threadActionHit = await threadAction.evaluate((button) => {
+    const bounds = button.getBoundingClientRect();
+    const hit = document.elementFromPoint(bounds.left + bounds.width / 2, bounds.top + bounds.height / 2);
+    const time = button.closest(".chat-thread-action-slot")?.querySelector<HTMLElement>(".chat-thread-time");
+    return {
+      hitAction: hit === button || button.contains(hit),
+      timePointerEvents: time ? getComputedStyle(time).pointerEvents : ""
+    };
+  });
+  expect(threadActionHit.timePointerEvents).toBe("none");
+  expect(threadActionHit.hitAction).toBe(true);
+
   const trigger = page.locator(".chat-composer-control-row .chat-ghost-button").first();
   const triggerBox = await trigger.boundingBox();
   expect(triggerBox).not.toBeNull();
@@ -339,9 +393,14 @@ test("chat project actions and composer menus are backed by persistent state", a
   const presetDialog = page.getByRole("dialog", { name: "Settings preset" });
   await expect(presetDialog).toBeVisible();
   await presetDialog.getByLabel("Name").fill("Parity Preset");
+  await presetDialog.getByLabel("Icon").click();
+  const iconMenu = page.getByRole("listbox", { name: "Icon" });
+  await expect(iconMenu.locator("button")).toHaveCount(9);
+  await expect(iconMenu.getByRole("option", { name: "OpenAI" }).locator("svg")).toBeVisible();
+  await iconMenu.getByRole("option", { name: "Branch" }).click({ force: true });
   await presetDialog.getByRole("button", { name: "Save" }).click();
   state = await page.evaluate(() => window.unitApi.chat.bootstrap());
-  expect(state.settingsPresets.some((preset) => preset.label === "Parity Preset")).toBe(true);
+  expect(state.settingsPresets.some((preset) => preset.label === "Parity Preset" && preset.iconName === "git_branch")).toBe(true);
 
   await page.getByLabel("Model settings").click();
   const editPresetButton = page.getByLabel("Edit Parity Preset");
@@ -382,6 +441,120 @@ test("chat dropups close when clicking outside consumed child surfaces", async (
   expect(threadBox).not.toBeNull();
   await page.mouse.click(threadBox!.x + 24, threadBox!.y + 24);
   await expect(settingsDropup).toHaveCount(0);
+
+  await app.close();
+});
+
+test("chat document groups dropup manages local document indexes", async () => {
+  const dataDir = makeDataDir();
+  const chatModelPath = path.join(dataDir, "chat-model.gguf");
+  const embeddingModelPath = path.join(dataDir, "embedding-model.gguf");
+  const documentPath = path.join(dataDir, "knowledge.txt");
+  fs.writeFileSync(chatModelPath, "not a real chat model");
+  fs.writeFileSync(embeddingModelPath, "not a real embedding model");
+  fs.writeFileSync(documentPath, "alpha document facts");
+  const app = await launchApp(dataDir);
+  const page = await firstWindow(app);
+  await expect(page.getByTestId("chat-surface")).toBeVisible();
+
+  await page.evaluate(async ({ chatModelPath, embeddingModelPath, documentPath }) => {
+    let state = await window.unitApi.chat.addLocalModel({ path: chatModelPath });
+    const threadId = state.selectedThreadId;
+    state = await window.unitApi.chat.updateThreadSettings({
+      threadId,
+      builtinAgenticFramework: "document_analysis",
+      builtinModelId: state.models[0]?.id ?? ""
+    });
+    state = await window.unitApi.chat.createDocumentIndex({
+      projectId: state.selectedProjectId,
+      title: "Missing Embedding",
+      sourcePath: documentPath
+    });
+    if (state.generation.status !== "error" || state.documentIndexes.some((index) => index.title === "Missing Embedding")) {
+      throw new Error("Document index creation should require an explicit embedding path.");
+    }
+    state = await window.unitApi.chat.saveSettingsPreset({
+      label: "Document Preset",
+      runtimeSettings: state.runtimeSettings,
+      providerMode: "builtin",
+      iconName: "sliders",
+      builtinModelId: state.models[0]?.id ?? "",
+      builtinAgenticFramework: "document_analysis",
+      documentAnalysisEmbeddingModelPath: embeddingModelPath
+    });
+    const documentPreset = state.settingsPresets.find((preset) => preset.label === "Document Preset");
+    if (!documentPreset) {
+      throw new Error("Document preset was not created.");
+    }
+    state = await window.unitApi.chat.updateThreadSettings({
+      threadId,
+      selectedSettingsPresetId: documentPreset.id,
+      builtinAgenticFramework: "document_analysis",
+      builtinModelId: state.models[0]?.id ?? ""
+    });
+    await window.unitApi.chat.createDocumentIndex({
+      projectId: state.selectedProjectId,
+      title: "Knowledge",
+      sourcePath: documentPath
+    });
+  }, { chatModelPath, embeddingModelPath, documentPath });
+
+  const controlLabels = await page.locator(".chat-composer-control-row button").evaluateAll((buttons) =>
+    buttons.map((button) => button.getAttribute("aria-label") ?? button.textContent?.trim() ?? "")
+  );
+  expect(controlLabels.indexOf("Model settings")).toBeLessThan(controlLabels.indexOf("Document groups"));
+  expect(controlLabels.indexOf("Document groups")).toBeLessThan(controlLabels.indexOf("Open model menu"));
+  await expect(page.getByLabel("Document groups")).toContainText("Knowledge");
+  await expect(page.getByLabel("Document groups").locator(".chat-document-status-mark")).toBeVisible();
+  await expect(page.locator(".chat-document-progress")).toHaveCount(0);
+
+  await page.getByLabel("Document groups").click();
+  const documentDropup = page.locator(".chat-dropup");
+  await expect(documentDropup).toBeVisible();
+  await expect(page.getByRole("menuitemradio", { name: /Knowledge/ })).toBeVisible();
+  await expect(documentDropup.locator(".chat-document-index-menu-title .chat-document-status-mark").first()).toBeVisible();
+  await expect(page.getByRole("menuitem", { name: "New group..." })).toBeEnabled();
+  await expect(await page.evaluate(() => typeof window.unitApi.chat.updateDocumentIndex)).toBe("function");
+  await page.getByLabel("Edit Knowledge").click();
+  const dialog = page.getByRole("dialog", { name: "Document group" });
+  await expect(dialog).toBeVisible();
+  await expect(dialog.locator("input[name='document-index-title']")).toHaveValue("Knowledge");
+  await expect(dialog.getByText("knowledge.txt", { exact: true })).toBeVisible();
+  await expect(dialog.getByLabel("knowledge.txt included")).toBeChecked();
+  const fileListLayout = await dialog.evaluate((root) => {
+    const list = root.querySelector<HTMLElement>(".chat-document-index-file-list");
+    const row = root.querySelector<HTMLElement>(".chat-document-index-file-row");
+    if (!list || !row) {
+      throw new Error("Document file list row was not rendered.");
+    }
+    return {
+      listTop: Math.round(list.getBoundingClientRect().top),
+      rowTop: Math.round(row.getBoundingClientRect().top)
+    };
+  });
+  expect(fileListLayout.rowTop - fileListLayout.listTop).toBeLessThanOrEqual(2);
+  await dialog.locator("input[name='document-index-title']").fill("analysistest");
+  await dialog.getByRole("button", { name: "Save" }).click();
+  const documentButton = page.getByLabel("Document groups");
+  await expect(documentButton).toContainText("analysistest");
+  const documentButtonMetrics = await documentButton.locator(".chat-document-menu-label").evaluate((element) => ({
+    clientWidth: element.clientWidth,
+    scrollWidth: element.scrollWidth,
+    buttonWidth: element.closest("button")?.getBoundingClientRect().width ?? 0
+  }));
+  expect(documentButtonMetrics.scrollWidth).toBeLessThanOrEqual(documentButtonMetrics.clientWidth + 1);
+  expect(documentButtonMetrics.buttonWidth).toBeLessThan(150);
+
+  await page.getByLabel("Document groups").click();
+  await page.getByLabel("Edit analysistest").click();
+  await expect(dialog).toBeVisible();
+  await expect(dialog.getByLabel("knowledge.txt included")).toBeChecked();
+  await dialog.getByLabel("Close document index").click();
+
+  await page.getByLabel("Document groups").click();
+  await page.getByLabel("Delete analysistest").click();
+  await expect(documentDropup).toBeVisible();
+  await expect(page.getByLabel("Delete analysistest")).toHaveCount(0);
 
   await app.close();
 });
@@ -482,10 +655,21 @@ test("chat Codex mode uses mocked events and provider-aware menus", async () => 
     const duplicateStandaloneBody = assistantMessage?.querySelector<HTMLElement>(":scope > .assistant-content-block");
     const reasoningDetails = assistantMessage?.querySelector<HTMLDetailsElement>(".codex-reasoning-block details.reasoning-shell");
     const toolDetails = assistantMessage?.querySelector<HTMLDetailsElement>("details.codex-tool-card");
+    const toolSummaryTitle = toolDetails?.querySelector<HTMLElement>(".codex-tool-shell-toggle .reasoning-toggle-text");
+    const toolSummary = toolDetails?.querySelector<HTMLElement>(":scope > .codex-tool-shell-toggle");
+    const toolIconPath = toolSummary?.querySelector<SVGPathElement>(".codex-tool-shell-icon path");
+    const toolCaret = toolSummary?.querySelector<SVGElement>(".codex-tool-shell-caret");
+    const toolBodyTitle = toolDetails?.querySelector<HTMLElement>(".codex-tool-shell-panel-inner .codex-event-title");
+    const toolOutputDetails = toolDetails?.querySelector<HTMLDetailsElement>(".codex-tool-shell-panel-inner > .codex-event-card[data-kind='tool'] > details.codex-event-disclosure");
+    const outputCaretPath = toolOutputDetails?.querySelector<SVGPathElement>(".codex-event-disclosure-caret path");
+    const outerSummaryBadge = toolDetails?.querySelector<HTMLElement>(":scope > summary .codex-event-badge");
+    const bodyBadge = toolDetails?.querySelector<HTMLElement>(".codex-tool-shell-panel-inner .codex-event-badge[data-status='completed']");
     const badge = assistantMessage?.querySelector<HTMLElement>(".codex-event-badge[data-status='completed']");
-    if (!assistantMessage || !plan || !reasoning || !tool || !body || !reasoningDetails || !toolDetails || !badge) {
+    if (!assistantMessage || !plan || !reasoning || !tool || !body || !reasoningDetails || !toolDetails || !toolSummaryTitle || !toolSummary || !toolIconPath || !toolCaret || !toolBodyTitle || !toolOutputDetails || !outputCaretPath || !bodyBadge || !badge) {
       throw new Error("Missing Codex assistant render elements");
     }
+    const toolSummaryRect = toolSummary.getBoundingClientRect();
+    const toolRect = tool.getBoundingClientRect();
     return {
       planTop: Math.round(plan.getBoundingClientRect().top),
       reasoningTop: Math.round(reasoning.getBoundingClientRect().top),
@@ -494,6 +678,17 @@ test("chat Codex mode uses mocked events and provider-aware menus", async () => 
       hasDuplicateStandaloneBody: Boolean(duplicateStandaloneBody),
       reasoningOpen: reasoningDetails.open,
       toolOpen: toolDetails.open,
+      toolSummaryTitle: toolSummaryTitle.textContent?.trim(),
+      toolSummaryWidth: Math.round(toolSummaryRect.width),
+      toolWidth: Math.round(toolRect.width),
+      toolIconPath: toolIconPath.getAttribute("d"),
+      toolCaretOpacity: getComputedStyle(toolCaret).opacity,
+      toolBodyTitle: toolBodyTitle.textContent?.trim(),
+      toolOutputOpen: toolOutputDetails.open,
+      outputCaretPath: outputCaretPath.getAttribute("d"),
+      outputDirectChildOfToolCard: toolOutputDetails.parentElement?.matches(".codex-event-card[data-kind='tool']") ?? false,
+      hasOuterSummaryBadge: Boolean(outerSummaryBadge),
+      bodyBadgeText: bodyBadge.textContent?.trim(),
       badgeColor: getComputedStyle(badge).color
     };
   });
@@ -503,7 +698,36 @@ test("chat Codex mode uses mocked events and provider-aware menus", async () => 
   expect(assistantRenderOrder.hasDuplicateStandaloneBody).toBe(false);
   expect(assistantRenderOrder.reasoningOpen).toBe(false);
   expect(assistantRenderOrder.toolOpen).toBe(false);
+  expect(assistantRenderOrder.toolSummaryTitle).toBe("Tool Call");
+  expect(assistantRenderOrder.toolSummaryWidth).toBeLessThan(180);
+  expect(assistantRenderOrder.toolIconPath).toContain("M11.4194 15.1694");
+  expect(assistantRenderOrder.toolCaretOpacity).toBe("0");
+  expect(assistantRenderOrder.toolBodyTitle).toContain("Command: npm test");
+  expect(assistantRenderOrder.toolOutputOpen).toBe(false);
+  expect(assistantRenderOrder.outputCaretPath).toBe("M4.5 6.25L8 9.75L11.5 6.25");
+  expect(assistantRenderOrder.outputDirectChildOfToolCard).toBe(true);
+  expect(assistantRenderOrder.hasOuterSummaryBadge).toBe(false);
+  expect(assistantRenderOrder.bodyBadgeText).toBe("Completed");
   expect(assistantRenderOrder.badgeColor).toBe("rgb(168, 213, 182)");
+
+  await page.locator("details.codex-tool-card > summary").click();
+  const outputDisclosureMetrics = await page.evaluate(() => {
+    const outputSummary = document.querySelector<HTMLElement>("details.codex-tool-card .codex-event-card[data-kind='tool'] > details.codex-event-disclosure > summary.codex-event-disclosure-toggle");
+    const outputLabel = outputSummary?.querySelector<HTMLElement>(".codex-event-disclosure-label");
+    const outputCaret = outputSummary?.querySelector<SVGElement>(".codex-event-disclosure-caret");
+    if (!outputSummary || !outputLabel || !outputCaret) {
+      throw new Error("Missing output disclosure summary.");
+    }
+    const summaryRect = outputSummary.getBoundingClientRect();
+    const labelRect = outputLabel.getBoundingClientRect();
+    const caretRect = outputCaret.getBoundingClientRect();
+    return {
+      summaryWidth: Math.round(summaryRect.width),
+      labelCaretGap: Math.round(caretRect.left - labelRect.right)
+    };
+  });
+  expect(outputDisclosureMetrics.summaryWidth).toBeLessThan(90);
+  expect(outputDisclosureMetrics.labelCaretGap).toBeLessThanOrEqual(12);
 
   await app.close();
 });

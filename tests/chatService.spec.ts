@@ -6,8 +6,8 @@ import { ChatService } from "../src/main/chatService";
 import { ChatStore } from "../src/main/chatStore";
 import { MockCodexRuntime, type CodexRunOptions, type CodexThreadEvent } from "../src/main/codexRuntime";
 import { LocalLlamaRuntime } from "../src/main/localLlamaRuntime";
-import { RemoteHostRuntime } from "../src/main/remoteHostRuntime";
-import type { ChatMessage, ChatModel, ChatRuntimeSettings } from "../src/shared/types";
+import { RemoteHostRuntime, type RemoteStreamMetrics } from "../src/main/remoteHostRuntime";
+import type { ChatAppSettings, ChatBuiltinAgenticFramework, ChatMessage, ChatModel, ChatRuntimeSettings } from "../src/shared/types";
 
 function makeService() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-service-test-"));
@@ -17,6 +17,11 @@ function makeService() {
 }
 
 class ScriptedLlamaRuntime extends LocalLlamaRuntime {
+  readonly calls: ChatMessage[][] = [];
+  readonly settingsCalls: ChatRuntimeSettings[] = [];
+  readonly frameworkCalls: string[] = [];
+  readonly documentTitleCalls: string[] = [];
+
   constructor(private readonly replies: string[]) {
     super({ startupTimeoutMs: 10 });
   }
@@ -27,9 +32,110 @@ class ScriptedLlamaRuntime extends LocalLlamaRuntime {
     messages: ChatMessage[];
     onToken: (token: string) => void;
     onReasoning?: (token: string) => void;
+    builtinAgenticFramework?: ChatBuiltinAgenticFramework;
+    documentTitle?: string;
   }): Promise<void> {
+    this.calls.push(options.messages.map((message) => ({ ...message })));
+    this.settingsCalls.push({ ...options.settings });
+    this.frameworkCalls.push(options.builtinAgenticFramework ?? "chat");
+    this.documentTitleCalls.push(options.documentTitle ?? "");
     const reply = this.replies.shift() ?? "";
     options.onToken(reply);
+  }
+}
+
+class StreamingDocumentLlamaRuntime extends LocalLlamaRuntime {
+  private readonly replies = [
+    { tokens: ['<tool_call>{"tool":"search","query":"alpha","top_k":4}</tool_call>'], reasoning: ["Need ", "search."] },
+    { tokens: ["Alpha ", "appears in the indexed document [r1]."], reasoning: ["Reading ", "evidence."] }
+  ];
+
+  override async streamChat(options: {
+    model: ChatModel;
+    settings: ChatRuntimeSettings;
+    messages: ChatMessage[];
+    onToken: (token: string) => void;
+    onReasoning?: (token: string) => void;
+  }): Promise<void> {
+    const reply = this.replies.shift() ?? { tokens: [], reasoning: [] };
+    for (const token of reply.reasoning) {
+      options.onReasoning?.(token);
+      await Promise.resolve();
+    }
+    for (const token of reply.tokens) {
+      options.onToken(token);
+      await Promise.resolve();
+    }
+  }
+}
+
+class ReasoningOnlyThenToolRuntime extends LocalLlamaRuntime {
+  private attempt = 0;
+
+  override async streamChat(options: {
+    model: ChatModel;
+    settings: ChatRuntimeSettings;
+    messages: ChatMessage[];
+    onToken: (token: string) => void;
+    onReasoning?: (token: string) => void;
+  }): Promise<void> {
+    this.attempt += 1;
+    if (this.attempt === 1) {
+      options.onReasoning?.("Need search but forgot final tool call.");
+      return;
+    }
+    if (this.attempt === 2) {
+      options.onReasoning?.("Need search.");
+      options.onToken('<tool_call>{"tool":"search","query":"alpha","top_k":4}</tool_call>');
+      return;
+    }
+    options.onReasoning?.("Reading evidence.");
+    options.onToken("Alpha appears in the indexed document [r1].");
+  }
+}
+
+class StreamingRemoteDocumentRuntime extends RemoteHostRuntime {
+  override async streamDocumentAnalysis(options: {
+    settings: ChatAppSettings;
+    model: ChatModel;
+    runtimeSettings: ChatRuntimeSettings;
+    messages: ChatMessage[];
+    documentIndexId: string;
+    remoteSessionId?: string;
+    runtimeSlotId?: number;
+    runtimeSettingsSignature?: string;
+    onToken: (token: string) => void;
+    onReasoning?: (token: string) => void;
+    onAgentEvents?: (events: unknown[], sessionState: unknown) => void;
+  }): Promise<RemoteStreamMetrics> {
+    options.onReasoning?.("Need remote search.");
+    options.onAgentEvents?.([
+      {
+        type: "tool_call",
+        tool_call_id: "remote-search-1",
+        tool_name: "search",
+        status: "completed",
+        summary: "pdf links",
+        command: "pdf links"
+      },
+      {
+        type: "tool_output",
+        tool_call_id: "remote-search-1",
+        stage: "final",
+        stream: "combined",
+        content: "Tool result:\n[r1] Adobe PDF32000_2008.pdf page 366: Link annotations connect document regions to destinations or actions."
+      }
+    ], {});
+    options.onReasoning?.("Reading remote evidence.");
+    options.onToken("PDF links are represented by link annotations in the PDF evidence.");
+    return {
+      remoteSessionId: "session-1",
+      remoteSlotId: 1,
+      remoteHostId: "host-1",
+      remoteHostIdentity: "identity-1",
+      remoteSessionStatus: "ready",
+      metrics: {}
+    };
   }
 }
 
@@ -291,6 +397,41 @@ test("handles local /reset without starting generation", async () => {
   }
 });
 
+test("runs OpenCode shell tool calls through local harness timeline blocks", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-opencode-test-"));
+  const modelPath = path.join(dir, "model.gguf");
+  fs.writeFileSync(modelPath, "");
+  const store = new ChatStore(path.join(dir, "chat.sqlite"));
+  const runtime = new ScriptedLlamaRuntime([
+    '<tool_call>{"tool":"shell","command":"echo open-code-ok"}</tool_call>',
+    "Done."
+  ]);
+  const service = new ChatService(store, runtime, new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined);
+  try {
+    let state = store.loadState();
+    store.updateProjectSettings(state.selectedProjectId, "OpenCode Project", dir);
+    store.addLocalModel(modelPath);
+    state = store.loadState();
+    store.updateThreadSettings(state.selectedThreadId, {
+      builtinAgenticFramework: "opencode",
+      builtinModelId: state.selectedModelId
+    });
+
+    await service.submit({ text: "check the workspace" });
+    await expect.poll(() => service.state().generation.status).toBe("idle");
+
+    state = store.loadState();
+    const assistant = state.messages.find((message) => message.role === "assistant");
+    expect(assistant?.content).toBe("Done.");
+    expect(assistant?.timelineBlocks?.some((block) => block.kind === "tool" && block.toolName === "shell" && block.status === "completed" && block.output?.includes("open-code-ok"))).toBe(true);
+    expect(runtime.frameworkCalls).toEqual(["opencode", "opencode"]);
+    expect(runtime.calls[1].at(-1)?.content).toContain("Tool result:");
+  } finally {
+    service.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("runs iterative document-analysis tool calls against a ready local index", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-doc-service-test-"));
   const store = new ChatStore(path.join(dir, "chat.sqlite"));
@@ -334,6 +475,448 @@ test("runs iterative document-analysis tool calls against a ready local index", 
 
     expect(assistant?.content).toContain("Alpha appears");
     expect(assistant?.timelineBlocks?.map((block) => block.kind)).toEqual(["tool", "tool"]);
+    expect(assistant?.timelineBlocks?.filter((block) => block.kind === "tool")).toEqual([
+      expect.objectContaining({ kind: "tool", command: "alpha", initiallyExpanded: true }),
+      expect.objectContaining({ kind: "tool", command: "modify_results", initiallyExpanded: true })
+    ]);
+  } finally {
+    service.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("keeps document-analysis retry on the search protocol after malformed local tool calls", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-doc-malformed-test-"));
+  const store = new ChatStore(path.join(dir, "chat.sqlite"));
+  const runtime = new ScriptedLlamaRuntime([
+    '<tool_call>{"tool":"search","query":"alpha",</tool_call>',
+    '<tool_call>{"tool":"search","query":"alpha","top_k":4}</tool_call>',
+    "",
+    "Alpha appears in the indexed document [r1]."
+  ]);
+  const service = new ChatService(store, runtime, new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined);
+  try {
+    const sourcePath = path.join(dir, "notes.txt");
+    fs.writeFileSync(sourcePath, "alpha first paragraph");
+    let state = store.loadState();
+    fs.writeFileSync(path.join(dir, "model.gguf"), "");
+    store.addLocalModel(path.join(dir, "model.gguf"));
+    state = store.loadState();
+    store.updateThreadSettings(state.selectedThreadId, {
+      builtinModelId: state.models[0].id,
+      builtinAgenticFramework: "document_analysis",
+      documentAnalysisEmbeddingModelPath: path.join(dir, "embed.gguf")
+    });
+    const index = store.createDocumentIndex(state.selectedProjectId, "Notes", sourcePath);
+    store.replaceDocumentIndexChunks(index.id, [
+      { chunkId: "c1", sourceTitle: "notes.txt", sourcePath, pageStart: 1, pageEnd: 1, text: "alpha first paragraph", tokenCount: 4, ordinalStart: 0, ordinalEnd: 0 }
+    ]);
+    store.updateDocumentIndexStatus(index.id, { state: "ready", progress: 1, message: "Ready" });
+    store.selectDocumentIndex(state.selectedThreadId, index.id);
+
+    await service.submit({ text: "Where is alpha?" });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const next = service.state();
+    const assistant = next.messages.filter((message) => message.role === "assistant").at(-1);
+    expect(assistant?.status).toBe("complete");
+    expect(assistant?.timelineBlocks?.map((block) => block.kind)).toEqual(["tool", "tool", "tool"]);
+    expect(assistant?.timelineBlocks?.[0]).toMatchObject({ kind: "tool", status: "failed", initiallyExpanded: false });
+    expect(assistant?.timelineBlocks?.[1]).toMatchObject({ kind: "tool", initiallyExpanded: true });
+    expect(assistant?.timelineBlocks?.[2]).toMatchObject({ kind: "tool", status: "failed", initiallyExpanded: false });
+    expect(runtime.frameworkCalls[0]).toBe("document_analysis");
+    expect(runtime.documentTitleCalls[0]).toBe("Notes");
+    expect(runtime.settingsCalls[0].systemPrompt).toContain("This framework is for analyzing one selected indexed document index");
+    expect(runtime.calls[1].at(-1)?.content).toContain("Do not answer normally until document search results are provided.");
+  } finally {
+    service.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("rolls back streamed document final candidates that later fail tool-call parsing", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-doc-candidate-rollback-test-"));
+  const store = new ChatStore(path.join(dir, "chat.sqlite"));
+  const runtime = new ScriptedLlamaRuntime([
+    '<tool_call>{"tool":"search","query":"alpha","top_k":4}</tool_call>',
+    'Bad partial <tool_call>{"tool":"search","query":"alpha","top_k":4}</tool_call>',
+    "Alpha appears in the indexed document [r1]."
+  ]);
+  const service = new ChatService(store, runtime, new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined);
+  try {
+    const sourcePath = path.join(dir, "notes.txt");
+    fs.writeFileSync(sourcePath, "alpha first paragraph");
+    let state = store.loadState();
+    fs.writeFileSync(path.join(dir, "model.gguf"), "");
+    store.addLocalModel(path.join(dir, "model.gguf"));
+    state = store.loadState();
+    store.updateThreadSettings(state.selectedThreadId, {
+      builtinModelId: state.models[0].id,
+      builtinAgenticFramework: "document_analysis",
+      documentAnalysisEmbeddingModelPath: path.join(dir, "embed.gguf")
+    });
+    const index = store.createDocumentIndex(state.selectedProjectId, "Notes", sourcePath);
+    store.replaceDocumentIndexChunks(index.id, [
+      { chunkId: "c1", sourceTitle: "notes.txt", sourcePath, pageStart: 1, pageEnd: 1, text: "alpha first paragraph", tokenCount: 4, ordinalStart: 0, ordinalEnd: 0 }
+    ]);
+    store.updateDocumentIndexStatus(index.id, { state: "ready", progress: 1, message: "Ready" });
+    store.selectDocumentIndex(state.selectedThreadId, index.id);
+
+    await service.submit({ text: "Where is alpha?" });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const next = service.state();
+    const assistant = next.messages.filter((message) => message.role === "assistant").at(-1);
+
+    expect(assistant?.status).toBe("complete");
+    expect(assistant?.content).toBe("Alpha appears in the indexed document [r1].");
+    expect(assistant?.content).not.toContain("Bad partial");
+    expect(assistant?.timelineBlocks?.map((block) => block.kind)).toEqual(["tool", "tool"]);
+    expect(assistant?.timelineBlocks?.[1]).toMatchObject({ kind: "tool", status: "failed" });
+  } finally {
+    service.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("surfaces document-analysis setup failures on the assistant turn", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-doc-visible-error-test-"));
+  const store = new ChatStore(path.join(dir, "chat.sqlite"));
+  const service = new ChatService(store, new ScriptedLlamaRuntime([]), new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined);
+  try {
+    const modelPath = path.join(dir, "model.gguf");
+    fs.writeFileSync(modelPath, "");
+    let state = store.loadState();
+    store.addLocalModel(modelPath);
+    state = store.loadState();
+    store.updateThreadSettings(state.selectedThreadId, {
+      builtinModelId: state.models[0].id,
+      builtinAgenticFramework: "document_analysis",
+      documentAnalysisEmbeddingModelPath: path.join(dir, "embed.gguf")
+    });
+
+    await service.submit({ text: "Tell me about links in the PDF using the tool" });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const next = service.state();
+    const assistant = next.messages.filter((message) => message.role === "assistant").at(-1);
+
+    expect(next.generation).toMatchObject({
+      status: "error",
+      error: "No document index is selected for this thread."
+    });
+    expect(assistant?.status).toBe("error");
+    expect(assistant?.timelineBlocks).toEqual([
+      expect.objectContaining({
+        kind: "status",
+        level: "error",
+        message: "No document index is selected for this thread.",
+        code: "document_analysis_failed"
+      })
+    ]);
+  } finally {
+    service.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("streams document-analysis reasoning and final answer after tool evidence", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-doc-stream-test-"));
+  const store = new ChatStore(path.join(dir, "chat.sqlite"));
+  const snapshots: ReturnType<ChatService["state"]>[] = [];
+  let service!: ChatService;
+  service = new ChatService(
+    store,
+    new StreamingDocumentLlamaRuntime(),
+    new RemoteHostRuntime(),
+    new MockCodexRuntime(),
+    () => snapshots.push(service.state())
+  );
+  try {
+    const sourcePath = path.join(dir, "notes.txt");
+    const modelPath = path.join(dir, "model.gguf");
+    fs.writeFileSync(sourcePath, "alpha first paragraph");
+    fs.writeFileSync(modelPath, "");
+    let state = store.loadState();
+    store.addLocalModel(modelPath);
+    state = store.loadState();
+    store.updateThreadSettings(state.selectedThreadId, {
+      builtinModelId: state.models[0].id,
+      builtinAgenticFramework: "document_analysis",
+      documentAnalysisEmbeddingModelPath: path.join(dir, "embed.gguf")
+    });
+    const index = store.createDocumentIndex(state.selectedProjectId, "Notes", sourcePath);
+    store.replaceDocumentIndexChunks(index.id, [
+      { chunkId: "c1", sourceTitle: "notes.txt", sourcePath, pageStart: 1, pageEnd: 1, text: "alpha first paragraph", tokenCount: 4, ordinalStart: 0, ordinalEnd: 0 }
+    ]);
+    store.updateDocumentIndexStatus(index.id, { state: "ready", progress: 1, message: "Ready" });
+    store.selectDocumentIndex(state.selectedThreadId, index.id);
+
+    await service.submit({ text: "Where is alpha?" });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const next = service.state();
+    const assistant = next.messages.filter((message) => message.role === "assistant").at(-1);
+    const runningSnapshots = snapshots.filter((snapshot) => snapshot.generation.status === "running");
+    const runningAssistantMessages = runningSnapshots
+      .map((snapshot) => snapshot.messages.filter((message) => message.role === "assistant").at(-1))
+      .filter(Boolean);
+
+    expect(assistant?.status).toBe("complete");
+    expect(assistant?.content).toBe("Alpha appears in the indexed document [r1].");
+    expect(assistant?.reasoning ?? "").toBe("");
+    expect(assistant?.timelineBlocks?.map((block) => block.kind)).toEqual(["reasoning", "tool", "reasoning"]);
+    expect(assistant?.timelineBlocks?.[0]).toMatchObject({ kind: "reasoning", text: "Need search.", initiallyExpanded: true });
+    expect(assistant?.timelineBlocks?.[1]).toMatchObject({ kind: "tool", initiallyExpanded: true });
+    expect(assistant?.timelineBlocks?.[2]).toMatchObject({ kind: "reasoning", text: "Reading evidence.", initiallyExpanded: true });
+    expect(runningAssistantMessages.some((message) => message?.content === "Alpha ")).toBe(true);
+    expect(runningSnapshots.some((snapshot) => {
+      const runningAssistant = snapshot.messages.filter((message) => message.role === "assistant").at(-1);
+      return runningAssistant?.timelineBlocks?.some((block) => block.kind === "reasoning" && block.text === "Reading ");
+    })).toBe(true);
+  } finally {
+    service.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("keeps transient document-analysis reasoning with a failed tool marker when retry succeeds", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-doc-transient-reasoning-test-"));
+  const store = new ChatStore(path.join(dir, "chat.sqlite"));
+  const service = new ChatService(store, new ReasoningOnlyThenToolRuntime(), new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined);
+  try {
+    const sourcePath = path.join(dir, "notes.txt");
+    const modelPath = path.join(dir, "model.gguf");
+    fs.writeFileSync(sourcePath, "alpha first paragraph");
+    fs.writeFileSync(modelPath, "");
+    let state = store.loadState();
+    store.addLocalModel(modelPath);
+    state = store.loadState();
+    store.updateThreadSettings(state.selectedThreadId, {
+      builtinModelId: state.models[0].id,
+      builtinAgenticFramework: "document_analysis",
+      documentAnalysisEmbeddingModelPath: path.join(dir, "embed.gguf")
+    });
+    const index = store.createDocumentIndex(state.selectedProjectId, "Notes", sourcePath);
+    store.replaceDocumentIndexChunks(index.id, [
+      { chunkId: "c1", sourceTitle: "notes.txt", sourcePath, pageStart: 1, pageEnd: 1, text: "alpha first paragraph", tokenCount: 4, ordinalStart: 0, ordinalEnd: 0 }
+    ]);
+    store.updateDocumentIndexStatus(index.id, { state: "ready", progress: 1, message: "Ready" });
+    store.selectDocumentIndex(state.selectedThreadId, index.id);
+
+    await service.submit({ text: "Where is alpha?" });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const next = service.state();
+    const assistant = next.messages.filter((message) => message.role === "assistant").at(-1);
+
+    expect(assistant?.status).toBe("complete");
+    expect(assistant?.content).toBe("Alpha appears in the indexed document [r1].");
+    expect(assistant?.timelineBlocks?.map((block) => block.kind)).toEqual(["reasoning", "tool", "reasoning", "tool", "reasoning"]);
+    expect(assistant?.timelineBlocks?.[0]).toMatchObject({ kind: "reasoning", text: "Need search but forgot final tool call.", initiallyExpanded: true });
+    expect(assistant?.timelineBlocks?.[1]).toMatchObject({ kind: "tool", status: "failed", initiallyExpanded: false });
+    expect(assistant?.timelineBlocks?.[2]).toMatchObject({ kind: "reasoning", text: "Need search.", initiallyExpanded: true });
+    expect(assistant?.timelineBlocks?.[3]).toMatchObject({ kind: "tool", status: "completed", initiallyExpanded: true });
+    expect(assistant?.timelineBlocks?.[4]).toMatchObject({ kind: "reasoning", text: "Reading evidence.", initiallyExpanded: true });
+  } finally {
+    service.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("does not treat unwrapped document-analysis JSON as a local tool call", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-doc-unwrapped-json-test-"));
+  const store = new ChatStore(path.join(dir, "chat.sqlite"));
+  const runtime = new ScriptedLlamaRuntime([
+    '{"tool":"document_analysis","query":"alpha"}',
+    '<tool_call>{"tool":"search","query":"alpha","top_k":4}</tool_call>',
+    "Alpha appears in the indexed document [r1]."
+  ]);
+  const service = new ChatService(store, runtime, new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined);
+  try {
+    const sourcePath = path.join(dir, "notes.txt");
+    fs.writeFileSync(sourcePath, "alpha first paragraph");
+    let state = store.loadState();
+    fs.writeFileSync(path.join(dir, "model.gguf"), "");
+    store.addLocalModel(path.join(dir, "model.gguf"));
+    state = store.loadState();
+    store.updateThreadSettings(state.selectedThreadId, {
+      builtinModelId: state.models[0].id,
+      builtinAgenticFramework: "document_analysis",
+      documentAnalysisEmbeddingModelPath: path.join(dir, "embed.gguf")
+    });
+    const index = store.createDocumentIndex(state.selectedProjectId, "Notes", sourcePath);
+    store.replaceDocumentIndexChunks(index.id, [
+      { chunkId: "c1", sourceTitle: "notes.txt", sourcePath, pageStart: 1, pageEnd: 1, text: "alpha first paragraph", tokenCount: 4, ordinalStart: 0, ordinalEnd: 0 }
+    ]);
+    store.updateDocumentIndexStatus(index.id, { state: "ready", progress: 1, message: "Ready" });
+    store.selectDocumentIndex(state.selectedThreadId, index.id);
+
+    await service.submit({ text: "Where is alpha?" });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const next = service.state();
+    const assistant = next.messages.filter((message) => message.role === "assistant").at(-1);
+
+    expect(assistant?.status).toBe("complete");
+    expect(assistant?.timelineBlocks?.map((block) => block.kind)).toEqual(["tool"]);
+    expect(assistant?.timelineBlocks?.[0]).toMatchObject({ kind: "tool", initiallyExpanded: true });
+    expect(runtime.calls[1].at(-1)?.content).toContain("Grounding required:");
+  } finally {
+    service.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("rejects document-analysis tool calls mixed with surrounding text", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-doc-mixed-tool-test-"));
+  const store = new ChatStore(path.join(dir, "chat.sqlite"));
+  const runtime = new ScriptedLlamaRuntime([
+    'Sure: <tool_call>{"tool":"search","query":"alpha","top_k":4}</tool_call>',
+    '<tool_call>{"tool":"search","query":"alpha","top_k":4}</tool_call>',
+    "Alpha appears in the indexed document [r1]."
+  ]);
+  const service = new ChatService(store, runtime, new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined);
+  try {
+    const sourcePath = path.join(dir, "notes.txt");
+    fs.writeFileSync(sourcePath, "alpha first paragraph");
+    let state = store.loadState();
+    fs.writeFileSync(path.join(dir, "model.gguf"), "");
+    store.addLocalModel(path.join(dir, "model.gguf"));
+    state = store.loadState();
+    store.updateThreadSettings(state.selectedThreadId, {
+      builtinModelId: state.models[0].id,
+      builtinAgenticFramework: "document_analysis",
+      documentAnalysisEmbeddingModelPath: path.join(dir, "embed.gguf")
+    });
+    const index = store.createDocumentIndex(state.selectedProjectId, "Notes", sourcePath);
+    store.replaceDocumentIndexChunks(index.id, [
+      { chunkId: "c1", sourceTitle: "notes.txt", sourcePath, pageStart: 1, pageEnd: 1, text: "alpha first paragraph", tokenCount: 4, ordinalStart: 0, ordinalEnd: 0 }
+    ]);
+    store.updateDocumentIndexStatus(index.id, { state: "ready", progress: 1, message: "Ready" });
+    store.selectDocumentIndex(state.selectedThreadId, index.id);
+
+    await service.submit({ text: "Where is alpha?" });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const next = service.state();
+    const assistant = next.messages.filter((message) => message.role === "assistant").at(-1);
+
+    expect(assistant?.status).toBe("complete");
+    expect(assistant?.timelineBlocks?.map((block) => block.kind)).toEqual(["tool", "tool"]);
+    expect(assistant?.timelineBlocks?.[0]).toMatchObject({ kind: "tool", status: "failed" });
+    expect(assistant?.timelineBlocks?.[1]).toMatchObject({ kind: "tool", command: "alpha" });
+  } finally {
+    service.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("rejects document-analysis tool calls emitted only in reasoning", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-doc-reasoning-tool-test-"));
+  const store = new ChatStore(path.join(dir, "chat.sqlite"));
+  class ReasoningOnlyToolRuntime extends LocalLlamaRuntime {
+    readonly calls: ChatMessage[][] = [];
+
+    override async streamChat(options: {
+      model: ChatModel;
+      settings: ChatRuntimeSettings;
+      messages: ChatMessage[];
+      onToken: (token: string) => void;
+      onReasoning?: (token: string) => void;
+    }): Promise<void> {
+      this.calls.push(options.messages);
+      options.onReasoning?.('<tool_call>{"tool":"search","query":"alpha","top_k":4}</tool_call>');
+    }
+  }
+  const runtime = new ReasoningOnlyToolRuntime({ startupTimeoutMs: 10 });
+  const service = new ChatService(store, runtime, new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined);
+  try {
+    const sourcePath = path.join(dir, "notes.txt");
+    fs.writeFileSync(sourcePath, "alpha first paragraph");
+    let state = store.loadState();
+    fs.writeFileSync(path.join(dir, "model.gguf"), "");
+    store.addLocalModel(path.join(dir, "model.gguf"));
+    state = store.loadState();
+    store.updateThreadSettings(state.selectedThreadId, {
+      builtinModelId: state.models[0].id,
+      builtinAgenticFramework: "document_analysis",
+      documentAnalysisEmbeddingModelPath: path.join(dir, "embed.gguf")
+    });
+    const index = store.createDocumentIndex(state.selectedProjectId, "Notes", sourcePath);
+    store.replaceDocumentIndexChunks(index.id, [
+      { chunkId: "c1", sourceTitle: "notes.txt", sourcePath, pageStart: 1, pageEnd: 1, text: "alpha first paragraph", tokenCount: 4, ordinalStart: 0, ordinalEnd: 0 }
+    ]);
+    store.updateDocumentIndexStatus(index.id, { state: "ready", progress: 1, message: "Ready" });
+    store.selectDocumentIndex(state.selectedThreadId, index.id);
+
+    await service.submit({ text: "Where is alpha?" });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const next = service.state();
+    const assistant = next.messages.filter((message) => message.role === "assistant").at(-1);
+
+    expect(assistant?.status).toBe("error");
+    expect(assistant?.timelineBlocks?.map((block) => block.kind)).toEqual(["reasoning", "tool", "reasoning", "tool", "status"]);
+    expect(assistant?.timelineBlocks?.filter((block) => block.kind === "tool")).toHaveLength(2);
+    expect(assistant?.timelineBlocks?.[1]).toMatchObject({ kind: "tool", status: "failed" });
+    expect(runtime.calls[1].at(-1)?.content).toContain("only final assistant message content can contain `<tool_call>` blocks");
+  } finally {
+    service.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("keeps remote-hosted document reasoning and tool output in event order", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-doc-remote-stream-test-"));
+  const store = new ChatStore(path.join(dir, "chat.sqlite"));
+  const service = new ChatService(store, new ScriptedLlamaRuntime([]), new StreamingRemoteDocumentRuntime(), new MockCodexRuntime(), () => undefined);
+  try {
+    const sourcePath = path.join(dir, "remote-notes.txt");
+    fs.writeFileSync(sourcePath, "pdf links are annotations");
+    store.replaceRemoteModels([
+      {
+        id: "remote-model",
+        label: "Remote Model",
+        path: "",
+        providerId: "remote",
+        reference: "remote-model",
+        hostId: "host-1",
+        createdAt: new Date().toISOString()
+      }
+    ], { hostId: "host-1", hostIdentity: "identity-1", protocolVersion: "1" });
+    store.updateAppSettings({
+      documentIndexLocation: "remote",
+      documentToolExecutionLocation: "remote",
+      remoteHostAddress: "127.0.0.1",
+      remotePairingCode: "123456"
+    });
+    let state = store.loadState();
+    store.updateThreadSettings(state.selectedThreadId, {
+      builtinModelId: "remote-model",
+      builtinAgenticFramework: "document_analysis"
+    });
+    const index = store.createDocumentIndex(state.selectedProjectId, "Adobe PDF", sourcePath);
+    const remoteIndexId = "remote-doc::identity-1::doc-1";
+    (store as unknown as { db: { prepare: (sql: string) => { run: (...values: unknown[]) => void } } })
+      .db
+      .prepare("UPDATE chat_document_indexes SET id = ? WHERE id = ?")
+      .run(remoteIndexId, index.id);
+    store.updateDocumentIndexStatus(remoteIndexId, { state: "ready", progress: 1, message: "Ready" });
+    state = store.loadState();
+    store.selectDocumentIndex(state.selectedThreadId, remoteIndexId);
+
+    await service.submit({ text: "Tell me sth about pdf links" });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const next = service.state();
+    const assistant = next.messages.filter((message) => message.role === "assistant").at(-1);
+
+    expect(assistant?.status).toBe("complete");
+    expect(assistant?.reasoning ?? "").toBe("");
+    expect(assistant?.content).toContain("PDF links are represented by link annotations");
+    expect(assistant?.timelineBlocks?.map((block) => block.kind)).toEqual(["reasoning", "tool", "reasoning"]);
+    expect(assistant?.timelineBlocks?.[0]).toMatchObject({ kind: "reasoning", text: "Need remote search.", status: "completed", initiallyExpanded: true });
+    expect(assistant?.timelineBlocks?.[1]).toMatchObject({
+      kind: "tool",
+      id: "remote-search-1",
+      toolName: "search",
+      command: "pdf links",
+      output: expect.stringContaining("Adobe PDF32000_2008.pdf"),
+      initiallyExpanded: true
+    });
+    expect(assistant?.timelineBlocks?.[2]).toMatchObject({ kind: "reasoning", text: "Reading remote evidence.", status: "completed", initiallyExpanded: true });
   } finally {
     service.close();
     fs.rmSync(dir, { recursive: true, force: true });

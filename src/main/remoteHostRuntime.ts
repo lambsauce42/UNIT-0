@@ -210,8 +210,6 @@ export class RemoteHostRuntime {
           if (isRecord(event.metrics)) {
             metrics.metrics = { ...metrics.metrics, ...event.metrics };
           }
-          options.onToken(stringField(event.content));
-          options.onReasoning?.(stringField(event.reasoning));
         }
         if (type === "error") {
           throw new Error(stringField(event.message) || "Remote host request failed.");

@@ -30,7 +30,7 @@ export type ChatProviderMode = "builtin" | "codex";
 export type ChatReasoningEffort = "low" | "medium" | "high" | "xhigh";
 export type ChatPermissionMode = "default_permissions" | "full_access";
 export type ChatCodexApprovalMode = "default" | "on-request" | "on-failure" | "untrusted" | "never";
-export type ChatBuiltinAgenticFramework = "chat" | "document_analysis";
+export type ChatBuiltinAgenticFramework = "chat" | "document_analysis" | "opencode";
 
 export interface ChatActionButton {
   id: string;
@@ -68,7 +68,7 @@ export type ChatTimelineBlock =
   | { kind: "tool"; id: string; toolName: string; status: string; summary?: string; command?: string; directory?: string; output?: string; initiallyExpanded?: boolean }
   | { kind: "approval"; id: string; status: string; title: string; decision?: string; details?: string; requestMethod?: string; toolCallId?: string }
   | { kind: "diff"; id: string; status?: string; summary: string; branchName?: string; preview?: string; addedLines?: number; deletedLines?: number; filesChanged?: number; changes?: ChatTimelineFileChange[]; initiallyExpanded?: boolean }
-  | { kind: "status"; id: string; level: string; message: string; code?: string; initiallyExpanded?: boolean }
+  | { kind: "status"; id: string; level: string; message: string; code?: string; details?: string; initiallyExpanded?: boolean }
   | { kind: "plan"; id: string; status: string; explanation?: string; markdown?: string; steps?: Array<{ status: string; text: string }> }
   | { kind: "question"; id: string; status: string; title: string; question?: string; questions?: Array<{ id: string; label: string; options?: string[]; allowsCustomAnswer?: boolean }>; answers?: Record<string, string> }
   | { kind: "delegated"; id: string; status: string; summary: string }

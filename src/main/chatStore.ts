@@ -162,6 +162,18 @@ const DEFAULT_APP_SETTINGS: ChatAppSettings = {
 };
 
 const DEFAULT_SETTINGS_PRESET_ID = "custom::default";
+const DEFAULT_CODEX_PRESET_ICON_NAME = "openai";
+const SETTINGS_PRESET_ICON_NAMES = new Set([
+  "sliders",
+  "openai",
+  "bolt",
+  "brain",
+  "brand",
+  "settings",
+  "list",
+  "folder",
+  "git_branch"
+]);
 
 export const DEFAULT_CODEX_MODELS: ChatCodexModel[] = [
   {
@@ -1357,6 +1369,27 @@ export class ChatStore {
     }
   }
 
+  replaceMessageContent(messageId: string, content: string): void {
+    const row = this.db.prepare("SELECT thread_id FROM chat_messages WHERE id = ?").get(messageId) as
+      | { thread_id: string }
+      | undefined;
+    if (!row) {
+      throw new Error(`Chat message does not exist: ${messageId}`);
+    }
+    const now = timestamp();
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db
+        .prepare("UPDATE chat_messages SET content = ?, updated_at = ? WHERE id = ?")
+        .run(content, now, messageId);
+      this.touchThreadInTransaction(row.thread_id, now);
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
   appendToMessageReasoning(messageId: string, reasoningDelta: string): void {
     if (!reasoningDelta) {
       return;
@@ -2394,7 +2427,7 @@ function normalizeSettingsPreset(value: Omit<Partial<ChatSettingsPreset>, "runti
     label: typeof value.label === "string" && value.label.trim() ? normalizeTitle(value.label, 80) : "Untitled settings",
     runtimeSettings: normalizeRuntimeSettings(value.runtimeSettings ?? {}),
     providerMode,
-    iconName: typeof value.iconName === "string" && value.iconName.trim() ? value.iconName.trim() : (providerMode === "codex" ? "code" : "sliders"),
+    iconName: normalizeSettingsPresetIconName(value.iconName, providerMode),
     builtinModelId: typeof value.builtinModelId === "string" ? value.builtinModelId.trim() : "",
     builtinAgenticFramework: normalizeBuiltinAgenticFramework(value.builtinAgenticFramework),
     documentAnalysisEmbeddingModelPath: typeof value.documentAnalysisEmbeddingModelPath === "string" ? value.documentAnalysisEmbeddingModelPath.trim() : "",
@@ -2404,6 +2437,17 @@ function normalizeSettingsPreset(value: Omit<Partial<ChatSettingsPreset>, "runti
     editable: typeof value.editable === "boolean" ? value.editable : true,
     deletable: typeof value.deletable === "boolean" ? value.deletable : id !== DEFAULT_SETTINGS_PRESET_ID
   };
+}
+
+function normalizeSettingsPresetIconName(value: unknown, providerMode: ChatSettingsPreset["providerMode"]): string {
+  const normalized = typeof value === "string" ? value.trim() : "";
+  if (normalized === "code") {
+    return DEFAULT_CODEX_PRESET_ICON_NAME;
+  }
+  if (SETTINGS_PRESET_ICON_NAMES.has(normalized)) {
+    return normalized;
+  }
+  return providerMode === "codex" ? DEFAULT_CODEX_PRESET_ICON_NAME : "sliders";
 }
 
 function normalizeSettingsPresetId(value: string, presets: ChatSettingsPreset[]): string {
@@ -2432,7 +2476,7 @@ function normalizePermissionMode(value: unknown, fallback: ChatPermissionMode): 
 }
 
 function normalizeBuiltinAgenticFramework(value: unknown): ChatBuiltinAgenticFramework {
-  return value === "document_analysis" ? "document_analysis" : "chat";
+  return value === "document_analysis" || value === "opencode" ? value : "chat";
 }
 
 function documentIndexFromRow(row: ChatDocumentIndexRow): ChatDocumentIndex {

@@ -224,6 +224,21 @@ export class ChatService {
     };
   }
 
+  private appendAssistantErrorBlock(assistantMessageId: string, message: string, code: string): void {
+    const existingMessage = this.store.loadState().messages.find((item) => item.id === assistantMessageId);
+    const timelineBlocks = existingMessage?.timelineBlocks ?? [];
+    this.store.updateMessageTimelineBlocks(assistantMessageId, [
+      ...timelineBlocks,
+      {
+        kind: "status",
+        id: `${code}-${randomUUID()}`,
+        level: "error",
+        message,
+        code
+      }
+    ]);
+  }
+
   createProject(): ChatState {
     this.store.createProject();
     this.clearError();
@@ -608,6 +623,15 @@ export class ChatService {
       });
       return;
     }
+    if (thread?.builtinAgenticFramework === "opencode") {
+      await this.runOpenCodeGeneration({
+        thread,
+        messages,
+        assistantMessageId: options.assistantMessageId,
+        model: options.model
+      });
+      return;
+    }
     if (options.model.providerId === "remote") {
       await this.runRemoteGeneration({
         thread,
@@ -640,6 +664,9 @@ export class ChatService {
     } catch (error) {
       const message = errorMessage(error);
       this.store.updateMessageStatus(options.assistantMessageId, this.cancelRequested ? "interrupted" : "error");
+      if (!this.cancelRequested) {
+        this.appendAssistantErrorBlock(options.assistantMessageId, message, "chat_generation_failed");
+      }
       this.generation = this.cancelRequested ? { status: "idle" } : { status: "error", error: message };
     } finally {
       this.cancelRequested = false;
@@ -684,6 +711,9 @@ export class ChatService {
     } catch (error) {
       const message = errorMessage(error);
       this.store.updateMessageStatus(options.assistantMessageId, this.cancelRequested ? "interrupted" : "error");
+      if (!this.cancelRequested) {
+        this.appendAssistantErrorBlock(options.assistantMessageId, message, "chat_generation_failed");
+      }
       this.generation = this.cancelRequested ? { status: "idle" } : { status: "error", error: message };
     } finally {
       this.cancelRequested = false;
@@ -717,6 +747,7 @@ export class ChatService {
         this.generation = { status: "idle" };
         return;
       }
+      const documentRuntimeSettings = documentAnalysisRuntimeSettings(options.thread.runtimeSettings, documentIndex.title);
       const workingMessages = [...options.messages];
       const timelineBlocks: ChatTimelineBlock[] = [];
       const useRemoteDocumentTools = documentIndex.id.startsWith("remote-doc::") || appSettings.documentToolExecutionLocation === "remote";
@@ -728,12 +759,43 @@ export class ChatService {
       let forcedGroundingRetries = 0;
       let malformedAttempts = 0;
       for (let toolCallCount = 0; toolCallCount <= 8; toolCallCount += 1) {
+        const shouldStreamFinalCandidate = !documentAnalysisRequiresSearchFirst(workingMessages)
+          && (latestResults.length > 0 || Boolean(latestRemoteResult));
+        const reasoningBlockId = `document-reasoning-${randomUUID()}`;
+        const updateReasoningTimeline = (text: string, status: string) => {
+          if (!text.trim()) {
+            return;
+          }
+          const block: ChatTimelineBlock = {
+            kind: "reasoning",
+            id: reasoningBlockId,
+            status,
+            text,
+            initiallyExpanded: true
+          };
+          const existingIndex = timelineBlocks.findIndex((item) => item.id === reasoningBlockId);
+          if (existingIndex >= 0) {
+            timelineBlocks[existingIndex] = block;
+          } else {
+            timelineBlocks.push(block);
+          }
+          this.store.updateMessageTimelineBlocks(options.assistantMessageId, timelineBlocks);
+          this.broadcast();
+        };
+        const assistantContentBeforePass = this.assistantMessageContent(options.assistantMessageId);
         const pass = await this.runDocumentModelPass({
           model: options.model,
-          settings: options.thread.runtimeSettings,
+          settings: documentAnalysisModelSettings(options.model, options.thread.runtimeSettings, documentRuntimeSettings),
           messages: workingMessages,
-          streamToAssistant: false
+          builtinAgenticFramework: "document_analysis",
+          documentTitle: documentIndex.title,
+          streamToAssistant: {
+            assistantMessageId: options.assistantMessageId,
+            content: shouldStreamFinalCandidate ? "final_candidate" : "off",
+            onReasoning: (text) => updateReasoningTimeline(text, "updated")
+          }
         });
+        updateReasoningTimeline(pass.reasoning, "completed");
         const parsed = parseDocumentToolCallResponse(pass.content, pass.reasoning);
         if (parsed.status === "final") {
           if (documentAnalysisRequiresSearchFirst(workingMessages)) {
@@ -745,28 +807,40 @@ export class ChatService {
             workingMessages.push(syntheticChatMessage("user", "Grounding required: this request is about the selected document. Call `search` first with exactly one <tool_call> JSON block. Do not answer from general knowledge."));
             continue;
           }
-          if (pass.reasoning) {
-            this.store.appendToMessageReasoning(options.assistantMessageId, pass.reasoning);
+          const contentRemainder = pass.content.slice(pass.streamedContentLength);
+          if (contentRemainder) {
+            this.store.appendToMessage(options.assistantMessageId, contentRemainder);
           }
-          this.store.appendToMessage(options.assistantMessageId, pass.content);
           break;
         }
         if (parsed.status !== "tool_call") {
+          if (pass.streamedContentLength > 0) {
+            this.store.replaceMessageContent(options.assistantMessageId, assistantContentBeforePass);
+          }
           const errorText = parsed.status === "malformed" ? parsed.error : "Malformed tool call.";
           malformedAttempts += 1;
-          timelineBlocks.push({ kind: "status", id: `document-warning-${randomUUID()}`, level: "warning", message: errorText, code: "document_analysis_tool_call_invalid" });
+          timelineBlocks.push({
+            kind: "tool",
+            id: `document-tool-failed-${randomUUID()}`,
+            toolName: "Failed Tool Call",
+            status: "failed",
+            summary: errorText,
+            output: documentToolCallDiagnosticDetails(pass.content, pass.reasoning),
+            initiallyExpanded: false
+          });
           this.store.updateMessageTimelineBlocks(options.assistantMessageId, timelineBlocks);
           this.broadcast();
           if (malformedAttempts >= 2) {
             throw new Error(errorText);
           }
           workingMessages.push(syntheticChatMessage("assistant", pass.content));
-          workingMessages.push(syntheticChatMessage("user", `Tool call error: ${errorText}\nRetry with exactly one <tool_call> JSON block or answer normally.`));
+          workingMessages.push(syntheticChatMessage("user", documentAnalysisToolRetryMessage(errorText, latestResults.length > 0 || Boolean(latestRemoteResult))));
           continue;
         }
         if (toolCallCount >= 8) {
           throw new Error("Document analysis exceeded the safe tool-call limit for one response. Narrow the request and try again.");
         }
+        malformedAttempts = 0;
         const toolBlockId = `document-tool-${randomUUID()}`;
         if (parsed.tool === "search") {
           if (useRemoteDocumentTools) {
@@ -783,7 +857,7 @@ export class ChatService {
             });
             latestResults = remoteSearchEntriesToChat(latestRemoteResult);
           } else {
-            const budgetTokens = documentEvidenceBudget(options.thread.runtimeSettings, workingMessages, documentIndex.title);
+            const budgetTokens = documentEvidenceBudget(documentRuntimeSettings, workingMessages, documentIndex.title);
             if (budgetTokens <= 0) {
               throw new Error("Document analysis ran out of safe evidence budget. Start a new thread, reset local context, or use a larger context window.");
             }
@@ -808,7 +882,7 @@ export class ChatService {
             });
             latestResults = remoteSearchEntriesToChat(latestRemoteResult);
           } else {
-            const budgetTokens = documentEvidenceBudget(options.thread.runtimeSettings, workingMessages, documentIndex.title);
+            const budgetTokens = documentEvidenceBudget(documentRuntimeSettings, workingMessages, documentIndex.title);
             if (budgetTokens <= 0) {
               throw new Error("Document analysis ran out of safe evidence budget. Start a new thread, reset local context, or use a larger context window.");
             }
@@ -825,18 +899,22 @@ export class ChatService {
           status: "completed",
           summary: parsed.tool === "search" ? parsed.query : "Refine latest search results",
           command: parsed.tool === "search" ? parsed.query : "modify_results",
-          output: resultText
+          output: resultText,
+          initiallyExpanded: true
         });
         this.store.updateMessageTimelineBlocks(options.assistantMessageId, timelineBlocks);
         this.broadcast();
         workingMessages.push(syntheticChatMessage("assistant", pass.content));
-        workingMessages.push(syntheticChatMessage("user", `Tool result:\n${resultText}\n${parsed.tool === "search" ? "Use this evidence to answer, or issue one narrower search if needed." : "Use this refined evidence to answer, or refine it again if needed."}`));
+        workingMessages.push(syntheticChatMessage("user", `Tool result:\n${resultText}\n${documentToolResultGuidance(parsed.tool)}`));
       }
       this.store.updateMessageStatus(options.assistantMessageId, this.cancelRequested ? "interrupted" : "complete");
       this.generation = { status: "idle" };
     } catch (error) {
       const message = errorMessage(error);
       this.store.updateMessageStatus(options.assistantMessageId, this.cancelRequested ? "interrupted" : "error");
+      if (!this.cancelRequested) {
+        this.appendAssistantErrorBlock(options.assistantMessageId, message, "document_analysis_failed");
+      }
       this.generation = this.cancelRequested ? { status: "idle" } : { status: "error", error: message };
     } finally {
       this.cancelRequested = false;
@@ -849,33 +927,196 @@ export class ChatService {
     model: ChatModel;
     settings: ChatState["runtimeSettings"];
     messages: ChatState["messages"];
-    streamToAssistant: false;
-  }): Promise<{ content: string; reasoning: string }> {
+    builtinAgenticFramework?: ChatState["threads"][number]["builtinAgenticFramework"];
+    documentTitle?: string;
+    streamToAssistant: {
+      assistantMessageId: string;
+      content: "off" | "final_candidate";
+      onReasoning?: (text: string) => void;
+    };
+  }): Promise<{ content: string; reasoning: string; streamedContentLength: number; streamedReasoningLength: number }> {
     const contentParts: string[] = [];
     const reasoningParts: string[] = [];
+    let streamedContentLength = 0;
+    let streamedReasoningLength = 0;
+    let contentStreamingStarted = false;
+    const appendContentToken = (token: string) => {
+      contentParts.push(token);
+      if (options.streamToAssistant.content !== "final_candidate") {
+        return;
+      }
+      const content = contentParts.join("");
+      const trimmedStart = content.trimStart();
+      if (!contentStreamingStarted) {
+        if (!trimmedStart) {
+          return;
+        }
+        if ("<tool_call>".startsWith(trimmedStart) || trimmedStart.startsWith("<tool_call")) {
+          return;
+        }
+        contentStreamingStarted = true;
+      }
+      const delta = content.slice(streamedContentLength);
+      if (delta) {
+        this.store.appendToMessage(options.streamToAssistant.assistantMessageId, delta);
+        streamedContentLength = content.length;
+        this.broadcast();
+      }
+    };
+    const appendReasoningToken = (token: string) => {
+      reasoningParts.push(token);
+      if (!options.streamToAssistant.onReasoning || !token) {
+        return;
+      }
+      streamedReasoningLength += token.length;
+      options.streamToAssistant.onReasoning(reasoningParts.join(""));
+    };
     if (options.model.providerId === "remote") {
       await this.remoteRuntime.streamChat({
         settings: this.store.loadState().appSettings,
         model: options.model,
         runtimeSettings: options.settings,
         messages: options.messages,
-        onToken: (token) => contentParts.push(token),
-        onReasoning: (token) => reasoningParts.push(token)
+        onToken: appendContentToken,
+        onReasoning: appendReasoningToken
       });
-      return { content: contentParts.join(""), reasoning: reasoningParts.join("") };
+      return { content: contentParts.join(""), reasoning: reasoningParts.join(""), streamedContentLength, streamedReasoningLength };
     }
     await this.runtime.streamChat({
       model: options.model,
       settings: options.settings,
       messages: options.messages,
-      onToken: (token) => {
-        contentParts.push(token);
-      },
-      onReasoning: (token) => {
-        reasoningParts.push(token);
-      }
+      builtinAgenticFramework: options.builtinAgenticFramework,
+      documentTitle: options.documentTitle,
+      onToken: appendContentToken,
+      onReasoning: appendReasoningToken
     });
-    return { content: contentParts.join(""), reasoning: reasoningParts.join("") };
+    return { content: contentParts.join(""), reasoning: reasoningParts.join(""), streamedContentLength, streamedReasoningLength };
+  }
+
+  private async runOpenCodeGeneration(options: {
+    thread: ChatState["threads"][number];
+    messages: ChatState["messages"];
+    assistantMessageId: string;
+    model: ChatModel;
+  }): Promise<void> {
+    try {
+      if (options.model.providerId === "remote") {
+        throw new Error("OpenCode requires a local built-in model.");
+      }
+      const project = this.store.loadState().projects.find((item) => item.id === options.thread.projectId);
+      if (!project?.directory) {
+        throw new Error("Select a project directory before using OpenCode.");
+      }
+      const workingMessages = [...options.messages];
+      const timelineBlocks: ChatTimelineBlock[] = [];
+      for (let toolCallCount = 0; toolCallCount <= 12; toolCallCount += 1) {
+        const reasoningBlockId = `opencode-reasoning-${randomUUID()}`;
+        const updateReasoningTimeline = (text: string, status: string) => {
+          if (!text.trim()) {
+            return;
+          }
+          const block: ChatTimelineBlock = {
+            kind: "reasoning",
+            id: reasoningBlockId,
+            status,
+            text,
+            initiallyExpanded: true
+          };
+          const existingIndex = timelineBlocks.findIndex((item) => item.id === reasoningBlockId);
+          if (existingIndex >= 0) {
+            timelineBlocks[existingIndex] = block;
+          } else {
+            timelineBlocks.push(block);
+          }
+          this.store.updateMessageTimelineBlocks(options.assistantMessageId, timelineBlocks);
+          this.broadcast();
+        };
+        const pass = await this.runDocumentModelPass({
+          model: options.model,
+          settings: options.thread.runtimeSettings,
+          messages: workingMessages,
+          builtinAgenticFramework: "opencode",
+          streamToAssistant: {
+            assistantMessageId: options.assistantMessageId,
+            content: "off",
+            onReasoning: (text) => updateReasoningTimeline(text, "updated")
+          }
+        });
+        updateReasoningTimeline(pass.reasoning, "completed");
+        const parsed = parseOpenCodeToolCallResponse(pass.content, pass.reasoning);
+        if (parsed.status === "final") {
+          this.store.appendToMessage(options.assistantMessageId, pass.content);
+          break;
+        }
+        if (parsed.status !== "tool_call") {
+          const errorText = parsed.status === "malformed" ? parsed.error : "Empty OpenCode response.";
+          timelineBlocks.push({
+            kind: "tool",
+            id: `opencode-tool-failed-${randomUUID()}`,
+            toolName: "Failed Tool Call",
+            status: "failed",
+            summary: errorText,
+            output: openCodeToolCallDiagnosticDetails(pass.content, pass.reasoning),
+            initiallyExpanded: false
+          });
+          this.store.updateMessageTimelineBlocks(options.assistantMessageId, timelineBlocks);
+          throw new Error(errorText);
+        }
+        if (toolCallCount >= 12) {
+          throw new Error("OpenCode exceeded the tool-call limit for one response. Narrow the request and try again.");
+        }
+        const toolBlockId = `opencode-tool-${randomUUID()}`;
+        timelineBlocks.push({
+          kind: "tool",
+          id: toolBlockId,
+          toolName: "shell",
+          status: "started",
+          summary: parsed.command,
+          command: parsed.command,
+          directory: project.directory,
+          initiallyExpanded: true
+        });
+        this.store.updateMessageTimelineBlocks(options.assistantMessageId, timelineBlocks);
+        this.broadcast();
+        const toolResult = await runOpenCodeShellCommand(parsed.command, project.directory);
+        const toolIndex = timelineBlocks.findIndex((item) => item.id === toolBlockId);
+        if (toolIndex >= 0) {
+          timelineBlocks[toolIndex] = {
+            kind: "tool",
+            id: toolBlockId,
+            toolName: "shell",
+            status: toolResult.exitCode === 0 ? "completed" : "failed",
+            summary: parsed.command,
+            command: parsed.command,
+            directory: project.directory,
+            output: formatOpenCodeShellOutput(toolResult),
+            initiallyExpanded: true
+          };
+        }
+        this.store.updateMessageTimelineBlocks(options.assistantMessageId, timelineBlocks);
+        this.broadcast();
+        workingMessages.push(syntheticChatMessage("assistant", pass.content, pass.reasoning));
+        workingMessages.push(syntheticChatMessage("user", `Tool result:\n${formatOpenCodeShellOutput(toolResult)}\n${openCodeToolResultGuidance(toolResult.exitCode)}`));
+      }
+      this.store.updateMessageStatus(options.assistantMessageId, this.cancelRequested ? "interrupted" : "complete");
+      this.generation = { status: "idle" };
+    } catch (error) {
+      const message = errorMessage(error);
+      this.store.updateMessageStatus(options.assistantMessageId, this.cancelRequested ? "interrupted" : "error");
+      if (!this.cancelRequested) {
+        this.appendAssistantErrorBlock(options.assistantMessageId, message, "opencode_failed");
+      }
+      this.generation = this.cancelRequested ? { status: "idle" } : { status: "error", error: message };
+    } finally {
+      this.cancelRequested = false;
+      this.broadcast();
+      void this.drainNextQueuedSubmission();
+    }
+  }
+
+  private assistantMessageContent(messageId: string): string {
+    return this.store.loadState().messages.find((message) => message.id === messageId)?.content ?? "";
   }
 
   private async runRemoteHostedDocumentAnalysisGeneration(options: {
@@ -886,8 +1127,35 @@ export class ChatService {
     documentIndex: NonNullable<ReturnType<ChatStore["documentIndex"]>>;
   }): Promise<void> {
     const timelineBlocks: ChatTimelineBlock[] = [];
+    let currentReasoningBlockId = "";
+    let currentReasoningText = "";
     const state = this.store.loadState();
     const resume = remoteResumeState(options.thread, options.model, state.appSettings, options.documentIndex.id);
+    const updateReasoningTimeline = (text: string, status: string) => {
+      if (!text.trim()) {
+        return;
+      }
+      if (!currentReasoningBlockId) {
+        currentReasoningBlockId = `remote-document-reasoning-${randomUUID()}`;
+        currentReasoningText = "";
+      }
+      currentReasoningText += text;
+      const block: ChatTimelineBlock = {
+        kind: "reasoning",
+        id: currentReasoningBlockId,
+        status,
+        text: currentReasoningText,
+        initiallyExpanded: true
+      };
+      const existingIndex = timelineBlocks.findIndex((item) => item.id === currentReasoningBlockId);
+      if (existingIndex >= 0) {
+        timelineBlocks[existingIndex] = block;
+      } else {
+        timelineBlocks.push(block);
+      }
+      this.store.updateMessageTimelineBlocks(options.assistantMessageId, timelineBlocks);
+      this.broadcast();
+    };
     const metrics = await this.remoteRuntime.streamDocumentAnalysis({
       settings: state.appSettings,
       model: options.model,
@@ -902,26 +1170,31 @@ export class ChatService {
         this.broadcast();
       },
       onReasoning: (token) => {
-        this.store.appendToMessageReasoning(options.assistantMessageId, token);
-        this.broadcast();
+        updateReasoningTimeline(token, "updated");
       },
       onAgentEvents: (events) => {
+        if (currentReasoningBlockId) {
+          const reasoningBlock = timelineBlocks.find((item) => item.id === currentReasoningBlockId);
+          if (reasoningBlock?.kind === "reasoning") {
+            reasoningBlock.status = "completed";
+          }
+          currentReasoningBlockId = "";
+          currentReasoningText = "";
+        }
         for (const event of events) {
-          const block = remoteAgentEventToTimelineBlock(event);
-          if (!block) {
-            continue;
-          }
-          const existing = timelineBlocks.findIndex((item) => item.id === block.id);
-          if (existing >= 0) {
-            timelineBlocks[existing] = block;
-          } else {
-            timelineBlocks.push(block);
-          }
+          applyRemoteAgentEventToTimelineBlocks(timelineBlocks, event);
         }
         this.store.updateMessageTimelineBlocks(options.assistantMessageId, timelineBlocks);
         this.broadcast();
       }
     });
+    if (currentReasoningBlockId) {
+      const reasoningBlock = timelineBlocks.find((item) => item.id === currentReasoningBlockId);
+      if (reasoningBlock?.kind === "reasoning") {
+        reasoningBlock.status = "completed";
+        this.store.updateMessageTimelineBlocks(options.assistantMessageId, timelineBlocks);
+      }
+    }
     this.store.updateThreadSettings(options.thread.id, remoteMetricsToThreadSettings(options.thread, options.model, state.appSettings, metrics, options.documentIndex.id));
     this.store.mergeMessageMetadata(options.assistantMessageId, { remoteMetrics: metrics.metrics });
   }
@@ -949,6 +1222,7 @@ export class ChatService {
     const lastUserMessage = [...state.messages].reverse().find((message) => message.threadId === options.threadId && message.role === "user");
     if (!thread || !lastUserMessage) {
       this.store.updateMessageStatus(options.assistantMessageId, "error");
+      this.appendAssistantErrorBlock(options.assistantMessageId, "Codex thread state could not be loaded.", "codex_turn_failed");
       this.generation = { status: "error", error: "Codex thread state could not be loaded." };
       this.broadcast();
       return;
@@ -1055,6 +1329,9 @@ export class ChatService {
     } catch (error) {
       const message = errorMessage(error);
       this.store.updateMessageStatus(options.assistantMessageId, this.cancelRequested ? "interrupted" : "error");
+      if (!this.cancelRequested) {
+        this.appendAssistantErrorBlock(options.assistantMessageId, message, "codex_turn_failed");
+      }
       this.generation = this.cancelRequested ? { status: "idle" } : { status: "error", error: message };
     } finally {
       if (completedTurn) {
@@ -1258,10 +1535,14 @@ export class ChatService {
       this.broadcast();
       return this.state();
     }
-    if (!selectedThread.documentAnalysisEmbeddingModelPath.trim()) {
+    const embeddingModelPath = effectiveDocumentAnalysisEmbeddingModelPath(state, selectedThread);
+    if (!embeddingModelPath) {
       this.setError("Document analysis requires an embedding GGUF path before creating an index.");
       this.broadcast();
       return this.state();
+    }
+    if (embeddingModelPath !== selectedThread.documentAnalysisEmbeddingModelPath.trim()) {
+      this.store.updateThreadSettings(selectedThread.id, { documentAnalysisEmbeddingModelPath: embeddingModelPath });
     }
     const tokenizerPath = state.appSettings.tokenizerModelPath.trim() || selectedThread.builtinModelId.trim();
     if (!tokenizerPath) {
@@ -1299,10 +1580,14 @@ export class ChatService {
       this.broadcast();
       return this.state();
     }
-    if (!selectedThread.documentAnalysisEmbeddingModelPath.trim()) {
+    const embeddingModelPath = effectiveDocumentAnalysisEmbeddingModelPath(state, selectedThread);
+    if (!embeddingModelPath) {
       this.setError("Document analysis requires an embedding GGUF path before updating an index.");
       this.broadcast();
       return this.state();
+    }
+    if (embeddingModelPath !== selectedThread.documentAnalysisEmbeddingModelPath.trim()) {
+      this.store.updateThreadSettings(selectedThread.id, { documentAnalysisEmbeddingModelPath: embeddingModelPath });
     }
     const tokenizerPath = state.appSettings.tokenizerModelPath.trim() || selectedThread.builtinModelId.trim();
     if (!tokenizerPath) {
@@ -1403,6 +1688,9 @@ export class ChatService {
         };
       }
       if (block.kind === "status" && (payload.action === "retry" || payload.action === "retry_new_thread")) {
+        if (block.code !== "codex_turn_failed") {
+          return block;
+        }
         this.retryCodexTurnForMessage(payload.messageId, payload.action === "retry_new_thread");
         return {
           ...block,
@@ -1607,6 +1895,23 @@ function withDocumentEvidence(messages: ChatState["messages"], documentTitle: st
     : message);
 }
 
+function effectiveDocumentAnalysisEmbeddingModelPath(
+  state: Pick<ChatState, "settingsPresets">,
+  thread: ChatState["threads"][number]
+): string {
+  const threadPath = thread.documentAnalysisEmbeddingModelPath.trim();
+  if (threadPath) {
+    return threadPath;
+  }
+  const presetPath = state.settingsPresets
+    .find((preset) => preset.id === thread.selectedSettingsPresetId)
+    ?.documentAnalysisEmbeddingModelPath.trim();
+  if (presetPath) {
+    return presetPath;
+  }
+  return "";
+}
+
 function formatDocumentSearchResults(evidence: ChatDocumentSearchEntry[]): string {
   if (evidence.length === 0) {
     return "No matching document evidence was found.";
@@ -1702,30 +2007,79 @@ function builtinRuntimeSettingsSignature(thread: ChatState["threads"][number], m
   });
 }
 
-function remoteAgentEventToTimelineBlock(value: unknown): ChatTimelineBlock | null {
+function applyRemoteAgentEventToTimelineBlocks(timelineBlocks: ChatTimelineBlock[], value: unknown): void {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
-    return null;
+    return;
   }
   const event = value as Record<string, unknown>;
   const type = String(event.type ?? event.kind ?? "").trim();
-  const id = String(event.id ?? event.event_id ?? `remote-event-${randomUUID()}`);
-  if (type.includes("tool") || type.includes("search")) {
-    return {
+  const eventId = String(event.id ?? event.event_id ?? "").trim();
+  if (type === "tool_output") {
+    const toolCallId = String(event.tool_call_id ?? "").trim();
+    const id = toolCallId || eventId || `remote-tool-output-${randomUUID()}`;
+    const output = String(event.content ?? event.output ?? event.result ?? "");
+    const existing = timelineBlocks.findIndex((item) => item.kind === "tool" && item.id === id);
+    const existingTool = existing >= 0 && timelineBlocks[existing].kind === "tool" ? timelineBlocks[existing] : null;
+    const outputText = event.stage === "delta" && existingTool?.output ? `${existingTool.output}${output}` : output;
+    const block: ChatTimelineBlock = {
       kind: "tool",
       id,
-      toolName: String(event.tool_name ?? event.tool ?? "remote_document_analysis"),
-      status: String(event.status ?? "completed"),
-      summary: String(event.summary ?? event.command ?? ""),
-      output: typeof event.output === "string" ? event.output : typeof event.result === "string" ? event.result : undefined
+      toolName: existingTool?.toolName ?? String(event.tool_name ?? event.tool ?? "tool_output"),
+      status: existingTool?.status === "failed" ? "failed" : "completed",
+      summary: existingTool?.summary,
+      command: existingTool?.command,
+      directory: existingTool?.directory,
+      output: outputText,
+      initiallyExpanded: true
     };
+    if (existing >= 0) {
+      timelineBlocks[existing] = block;
+    } else {
+      timelineBlocks.push(block);
+    }
+    return;
+  }
+  if (type === "tool_call" || type.includes("search")) {
+    const toolCallId = String(event.tool_call_id ?? "").trim();
+    const id = toolCallId || eventId || `remote-tool-${randomUUID()}`;
+    const existing = timelineBlocks.findIndex((item) => item.kind === "tool" && item.id === id);
+    const existingTool = existing >= 0 && timelineBlocks[existing].kind === "tool" ? timelineBlocks[existing] : null;
+    const block: ChatTimelineBlock = {
+      kind: "tool",
+      id,
+      toolName: String(event.tool_name ?? event.tool ?? existingTool?.toolName ?? "remote_document_analysis"),
+      status: String(event.status ?? existingTool?.status ?? "completed"),
+      summary: String(event.summary ?? event.command ?? event.query ?? existingTool?.summary ?? ""),
+      command: typeof event.command === "string" ? event.command : typeof event.query === "string" ? event.query : existingTool?.command,
+      directory: typeof event.directory === "string" ? event.directory : existingTool?.directory,
+      output: existingTool?.output,
+      initiallyExpanded: true
+    };
+    if (existing >= 0) {
+      timelineBlocks[existing] = block;
+    } else {
+      timelineBlocks.push(block);
+    }
+    return;
   }
   if (type.includes("plan")) {
-    return { kind: "plan", id, status: String(event.status ?? "updated"), markdown: String(event.markdown ?? event.summary ?? "") };
+    const id = eventId || `remote-plan-${randomUUID()}`;
+    upsertTimelineBlock(timelineBlocks, { kind: "plan", id, status: String(event.status ?? "updated"), markdown: String(event.markdown ?? event.summary ?? "") });
+    return;
   }
   if (type.includes("status")) {
-    return { kind: "status", id, level: String(event.level ?? "info"), message: String(event.message ?? event.summary ?? "") };
+    const id = eventId || `remote-status-${randomUUID()}`;
+    upsertTimelineBlock(timelineBlocks, { kind: "status", id, level: String(event.level ?? "info"), message: String(event.message ?? event.summary ?? "") });
   }
-  return null;
+}
+
+function upsertTimelineBlock(timelineBlocks: ChatTimelineBlock[], block: ChatTimelineBlock): void {
+  const existing = timelineBlocks.findIndex((item) => item.id === block.id);
+  if (existing >= 0) {
+    timelineBlocks[existing] = block;
+  } else {
+    timelineBlocks.push(block);
+  }
 }
 
 type ParsedDocumentToolCall =
@@ -1734,14 +2088,103 @@ type ParsedDocumentToolCall =
   | { status: "tool_call"; tool: "search"; query: string; topK: number }
   | { status: "tool_call"; tool: "modify_results"; query: ""; topK: number; dropResultIds: string[]; expand: Array<{ resultId: string; before: number; after: number }> };
 
+type ParsedOpenCodeToolCall =
+  | { status: "final" | "empty" }
+  | { status: "malformed"; error: string }
+  | { status: "tool_call"; command: string };
+
+type OpenCodeShellResult = {
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+};
+
+function parseOpenCodeToolCallResponse(content: string, reasoning: string): ParsedOpenCodeToolCall {
+  const parsedContent = parseOpenCodeToolCall(content);
+  if (parsedContent.status === "empty" && reasoning.trim()) {
+    return { status: "malformed", error: "Missing final OpenCode tool call." };
+  }
+  return parsedContent;
+}
+
+function parseOpenCodeToolCall(text: string): ParsedOpenCodeToolCall {
+  const normalized = text.trim();
+  if (!normalized) {
+    return { status: "empty" };
+  }
+  const match = /^<tool_call>\s*([\s\S]*?)\s*<\/tool_call>$/u.exec(normalized);
+  if (!match) {
+    if (normalized.includes("<tool_call") || normalized.includes("</tool_call>")) {
+      return { status: "malformed", error: "Malformed OpenCode tool call." };
+    }
+    return { status: "final" };
+  }
+  return parseOpenCodePayloadText(match[1]);
+}
+
+function parseOpenCodePayloadText(text: string): ParsedOpenCodeToolCall {
+  try {
+    const payload = JSON.parse(text.trim()) as Record<string, unknown>;
+    const tool = String(payload.tool ?? "").trim();
+    if (tool !== "shell") {
+      return { status: "malformed", error: "OpenCode only supports the `shell` tool." };
+    }
+    const command = String(payload.command ?? "").trim();
+    if (!command) {
+      return { status: "malformed", error: "OpenCode shell command must be non-empty." };
+    }
+    return { status: "tool_call", command };
+  } catch {
+    return { status: "malformed", error: "OpenCode tool-call JSON could not be parsed." };
+  }
+}
+
+async function runOpenCodeShellCommand(command: string, cwd: string): Promise<OpenCodeShellResult> {
+  try {
+    const result = await execFileAsync(command, [], {
+      cwd,
+      shell: true,
+      windowsHide: true,
+      timeout: 120_000,
+      maxBuffer: 1024 * 1024
+    });
+    return { exitCode: 0, stdout: result.stdout, stderr: result.stderr };
+  } catch (error) {
+    const shellError = error as { code?: unknown; stdout?: unknown; stderr?: unknown };
+    return {
+      exitCode: typeof shellError.code === "number" ? shellError.code : 1,
+      stdout: typeof shellError.stdout === "string" ? shellError.stdout : "",
+      stderr: typeof shellError.stderr === "string" ? shellError.stderr : errorMessage(error)
+    };
+  }
+}
+
+function formatOpenCodeShellOutput(result: OpenCodeShellResult): string {
+  return [
+    `exit code: ${result.exitCode}`,
+    result.stdout.trim() ? `stdout:\n${truncateDiagnosticText(result.stdout, 12000)}` : "stdout: (empty)",
+    result.stderr.trim() ? `stderr:\n${truncateDiagnosticText(result.stderr, 12000)}` : "stderr: (empty)"
+  ].join("\n\n");
+}
+
+function openCodeToolCallDiagnosticDetails(content: string, reasoning: string): string {
+  return [
+    `content:\n${truncateDiagnosticText(content) || "(empty)"}`,
+    `reasoning:\n${truncateDiagnosticText(reasoning) || "(empty)"}`
+  ].join("\n\n");
+}
+
+function openCodeToolResultGuidance(exitCode: number): string {
+  if (exitCode === 0) {
+    return "Use this tool output to decide whether to call another tool or answer the user.";
+  }
+  return "The shell command failed. Inspect the error, then either call another shell command to fix the root cause or explain the failure.";
+}
+
 function parseDocumentToolCallResponse(content: string, reasoning: string): ParsedDocumentToolCall {
   const parsedContent = parseDocumentToolCall(content);
-  if (parsedContent.status === "tool_call" || content.trim()) {
-    return parsedContent;
-  }
-  const parsedReasoning = parseDocumentToolCall(reasoning);
-  if (parsedReasoning.status === "tool_call" || parsedReasoning.status === "malformed") {
-    return parsedReasoning;
+  if (parsedContent.status === "empty" && reasoning.trim()) {
+    return { status: "malformed", error: "Missing final tool call." };
   }
   return parsedContent;
 }
@@ -1751,54 +2194,58 @@ function parseDocumentToolCall(text: string): ParsedDocumentToolCall {
   if (!normalized) {
     return { status: "empty" };
   }
-  const match = /<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/u.exec(normalized);
-  const jsonText = match ? match[1] : extractJsonObjectText(normalized);
-  if (!jsonText) {
+  const match = /^<tool_call>\s*([\s\S]*?)\s*<\/tool_call>$/u.exec(normalized);
+  if (!match) {
+    if (normalized.includes("<tool_call") || normalized.includes("</tool_call>")) {
+      return { status: "malformed", error: "Malformed tool call." };
+    }
     return { status: "final" };
+  }
+  return parseDocumentPayloadText(match[1]);
+}
+
+function parseDocumentPayloadText(text: string): ParsedDocumentToolCall {
+  const jsonText = text.trim();
+  if (!jsonText) {
+    return { status: "malformed", error: "Tool call JSON could not be parsed." };
   }
   try {
     const payload = JSON.parse(jsonText) as Record<string, unknown>;
-    const tool = String(payload.tool ?? "").trim();
-    if (tool === "search") {
-      const query = String(payload.query ?? "").trim().split(/\s+/).join(" ");
-      if (!query) {
-        return { status: "malformed", error: "Tool call query must be non-empty." };
-      }
-      return { status: "tool_call", tool: "search", query, topK: boundedInteger(payload.top_k, 8, 1, 12) };
-    }
-    if (tool === "modify_results") {
-      const dropResultIds = Array.isArray(payload.drop_result_ids)
-        ? payload.drop_result_ids.map((item) => String(item).trim()).filter(Boolean)
-        : [];
-      const expand = Array.isArray(payload.expand)
-        ? payload.expand
-          .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object" && !Array.isArray(item))
-          .map((item) => ({
-            resultId: String(item.result_id ?? "").trim(),
-            before: boundedInteger(item.before, 0, 0, 4),
-            after: boundedInteger(item.after, 0, 0, 4)
-          }))
-          .filter((item) => item.resultId)
-        : [];
-      if (dropResultIds.length === 0 && expand.length === 0) {
-        return { status: "malformed", error: "`modify_results` requires at least one drop or expand instruction." };
-      }
-      return { status: "tool_call", tool: "modify_results", query: "", topK: 8, dropResultIds, expand };
-    }
-    return { status: "malformed", error: "Only the `search` and `modify_results` tools are available." };
+    return parseDocumentPayload(payload);
   } catch {
     return { status: "malformed", error: "Tool call JSON could not be parsed." };
   }
 }
 
-function extractJsonObjectText(text: string): string {
-  const trimmed = text.trim();
-  if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
-    return trimmed;
+function parseDocumentPayload(payload: Record<string, unknown>): ParsedDocumentToolCall {
+  const tool = String(payload.tool ?? "").trim();
+  if (tool === "search") {
+    const query = String(payload.query ?? "").trim().split(/\s+/).join(" ");
+    if (!query) {
+      return { status: "malformed", error: "Tool call query must be non-empty." };
+    }
+    return { status: "tool_call", tool: "search", query, topK: boundedInteger(payload.top_k, 8, 1, 12) };
   }
-  const start = trimmed.indexOf("{");
-  const end = trimmed.lastIndexOf("}");
-  return start >= 0 && end > start ? trimmed.slice(start, end + 1) : "";
+  if (tool === "modify_results") {
+    const dropResultIds = Array.isArray(payload.drop_result_ids)
+      ? payload.drop_result_ids.map((item) => String(item).trim()).filter(Boolean)
+      : [];
+    const expand = Array.isArray(payload.expand)
+      ? payload.expand
+        .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object" && !Array.isArray(item))
+        .map((item) => ({
+          resultId: String(item.result_id ?? "").trim(),
+          before: boundedInteger(item.before, 0, 0, 4),
+          after: boundedInteger(item.after, 0, 0, 4)
+        }))
+        .filter((item) => item.resultId)
+      : [];
+    if (dropResultIds.length === 0 && expand.length === 0) {
+      return { status: "malformed", error: "`modify_results` requires at least one drop or expand instruction." };
+    }
+    return { status: "tool_call", tool: "modify_results", query: "", topK: 8, dropResultIds, expand };
+  }
+  return { status: "malformed", error: "Only the `search` and `modify_results` tools are available." };
 }
 
 function documentAnalysisRequiresSearchFirst(messages: ChatState["messages"]): boolean {
@@ -1808,6 +2255,9 @@ function documentAnalysisRequiresSearchFirst(messages: ChatState["messages"]): b
       continue;
     }
     const content = message.content.trim();
+    if (content.startsWith("Document analysis mode is active for")) {
+      continue;
+    }
     if (content.startsWith("Tool result:")) {
       return false;
     }
@@ -1821,6 +2271,128 @@ function documentAnalysisRequiresSearchFirst(messages: ChatState["messages"]): b
     return Boolean(normalized && !["hi", "hello", "hey", "thanks", "thank you", "ok", "okay", "cool"].includes(normalized));
   }
   return false;
+}
+
+function documentAnalysisToolRetryMessage(errorText: string, hasDocumentEvidence: boolean): string {
+  if (hasDocumentEvidence) {
+    return [
+      `Tool call error: ${errorText}`,
+      "Your previous response did not put a valid tool call in final assistant message content.",
+      "Reasoning/analysis may describe the plan, but only final assistant message content can contain `<tool_call>` blocks.",
+      "Do not stop after analysis. If you decide to search, switch to final and emit the `<tool_call>` before ending the turn.",
+      "Retry with exactly one strict <tool_call> JSON block and no surrounding text, or answer normally using the document evidence already provided."
+    ].join("\n");
+  }
+  return [
+    `Tool call error: ${errorText}`,
+    "Your previous response did not put a valid tool call in final assistant message content.",
+    "Reasoning/analysis may describe the plan, but only final assistant message content can contain `<tool_call>` blocks.",
+    "Do not stop after analysis. If you decide to search, switch to final and emit the `<tool_call>` before ending the turn.",
+    "Retry with exactly one strict search call and no surrounding text:",
+    '<tool_call>{"tool":"search","query":"short query from the user request","top_k":8}</tool_call>',
+    "Do not answer normally until document search results are provided."
+  ].join("\n");
+}
+
+function documentToolCallDiagnosticDetails(content: string, reasoning: string): string {
+  const parts = [
+    `content:\n${truncateDiagnosticText(content) || "(empty)"}`,
+    `reasoning:\n${truncateDiagnosticText(reasoning) || "(empty)"}`
+  ];
+  return parts.join("\n\n");
+}
+
+function documentToolResultGuidance(tool: "search" | "modify_results"): string {
+  if (tool === "modify_results") {
+    return [
+      "Use this refined evidence to answer now.",
+      "Refine again only when the evidence is empty, unrelated, contradictory, still missing a specifically requested detail, or the user asked for exhaustive or comparative coverage."
+    ].join(" ");
+  }
+  return [
+    "Use this evidence to answer now.",
+    "Issue one narrower search only when the result is empty, unrelated, contradictory, missing a specifically requested detail, or the user asked for exhaustive or comparative coverage.",
+    "Do not search again merely to find a better citation, exact section title, narrower wording, or additional supporting excerpt.",
+    "For a simple explanatory prompt, one non-empty relevant result is sufficient."
+  ].join(" ");
+}
+
+function truncateDiagnosticText(value: string, maxLength = 3000): string {
+  const normalized = value.trim();
+  if (normalized.length <= maxLength) {
+    return normalized;
+  }
+  return `${normalized.slice(0, maxLength)}\n...[truncated ${normalized.length - maxLength} chars]`;
+}
+
+function documentAnalysisRuntimeSettings(settings: ChatState["runtimeSettings"], documentTitle: string): ChatState["runtimeSettings"] {
+  return {
+    ...settings,
+    systemPrompt: documentAnalysisSystemPrompt(settings, documentTitle)
+  };
+}
+
+function documentAnalysisModelSettings(
+  model: ChatModel,
+  threadSettings: ChatState["runtimeSettings"],
+  documentSettings: ChatState["runtimeSettings"]
+): ChatState["runtimeSettings"] {
+  if (model.providerId === "remote") {
+    return documentSettings;
+  }
+  return isNativeGptOssModel(model) ? threadSettings : documentSettings;
+}
+
+function isNativeGptOssModel(model: ChatModel): boolean {
+  return [model.label, model.path, model.reference].filter(Boolean).join(" ").toLowerCase().includes("gpt-oss");
+}
+
+function documentAnalysisSystemPrompt(settings: ChatState["runtimeSettings"], documentTitle: string): string {
+  const currentDate = new Date().toISOString().slice(0, 10);
+  const normalizedTitle = documentTitle.trim();
+  const customPrompt = settings.systemPrompt.trim();
+  return [
+    "You are ChatGPT, a large language model trained by OpenAI.",
+    "Knowledge cutoff: 2024-06",
+    `Current date: ${currentDate}`,
+    "",
+    `Reasoning: ${settings.reasoningEffort}`,
+    "",
+    "# Valid channels: analysis, commentary, final. Channel must be included for every message.",
+    "In document analysis mode, commentary may target only the host-managed tool recipients `search` and `modify_results`.",
+    "This framework is for analyzing one selected indexed document index or corpus, which may contain multiple PDFs.",
+    normalizedTitle ? `The selected indexed document index is \"${normalizedTitle}\".` : "",
+    "You have exactly two host-managed tools available for that selected corpus: `search` and `modify_results`.",
+    "The host calls tools. The user never calls tools directly.",
+    "Any later `Tool result:` message is host-injected search output, not user-authored input.",
+    "Do not ask the user to wrap queries in `<tool_call>`, and do not suggest that they need to use the tool themselves.",
+    "For questions about the selected document's contents, retrieve evidence with `search` before answering. This includes PDFs inside the selected document index.",
+    "Use `modify_results` only to refine the latest tool result by dropping weak hits or expanding a promising hit with adjacent same-source chunks.",
+    "For meta questions about this framework, the system prompt, or tool behavior, answer directly without calling `search` unless document evidence is actually needed.",
+    "Do not mention the tool unless the user is explicitly asking about capabilities or tool behavior.",
+    "Preferred native GPT-OSS tool calls:",
+    "Use commentary to=search with constrained JSON arguments, for example {\"query\":\"pdf links\",\"top_k\":8}.",
+    "Use commentary to=modify_results with constrained JSON arguments only after a search result exists.",
+    "If retrieval is needed, output exactly one of these syntaxes and nothing else in that message:",
+    "<tool_call>",
+    '{\"tool\":\"search\",\"query\":\"...\", \"top_k\":8}',
+    "</tool_call>",
+    "<tool_call>",
+    '{\"tool\":\"modify_results\",\"drop_result_ids\":[\"r2\"],\"expand\":[{\"result_id\":\"r1\",\"before\":1,\"after\":1}]}',
+    "</tool_call>",
+    "Emit that `<tool_call>` block in the final channel, not in analysis or reasoning.",
+    "Do not put raw tool-call JSON in reasoning.",
+    "Never mix tool calls and the final answer in the same message.",
+    "If you do not have enough evidence, call `search` first. Narrow later searches instead of repeating broad ones.",
+    "After a non-empty relevant search result, answer from that evidence instead of searching again.",
+    "Search again only when the result is empty, unrelated, contradictory, missing a specifically requested detail, or the user asked for exhaustive or comparative coverage.",
+    "Do not search again merely to find a better citation, exact section title, narrower wording, or additional supporting excerpt.",
+    "For simple explanatory prompts like 'tell me about X', one relevant search result is sufficient.",
+    "Search results are excerpts, not the full corpus. Use them to ground the answer.",
+    "Cite the source PDF filename plus the returned page and section metadata in the final answer.",
+    "Do not emit commentary to files, browsers, functions, repo_browser, or any recipient other than final, search, or modify_results.",
+    customPrompt ? `\nAdditional user system instructions:\n${customPrompt}` : ""
+  ].filter(Boolean).join("\n");
 }
 
 function isDocumentAnalysisMetaQuestion(text: string): boolean {
@@ -1855,7 +2427,7 @@ function boundedInteger(value: unknown, fallback: number, min: number, max: numb
   return Number.isFinite(parsed) ? Math.max(min, Math.min(max, parsed)) : fallback;
 }
 
-function syntheticChatMessage(role: "user" | "assistant", content: string): ChatState["messages"][number] {
+function syntheticChatMessage(role: "user" | "assistant", content: string, reasoning = ""): ChatState["messages"][number] {
   const now = new Date().toISOString();
   return {
     id: `synthetic-${randomUUID()}`,
@@ -1863,6 +2435,7 @@ function syntheticChatMessage(role: "user" | "assistant", content: string): Chat
     role,
     content,
     attachments: [],
+    reasoning,
     status: "complete",
     createdAt: now,
     updatedAt: now

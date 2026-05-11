@@ -2,7 +2,89 @@ import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
 import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
-import type { ChatMessage, ChatModel, ChatRuntimeSettings } from "../shared/types.js";
+import type { ChatBuiltinAgenticFramework, ChatMessage, ChatModel, ChatRuntimeSettings } from "../shared/types.js";
+
+const GPTOSS_END_MARKER = "<|end|>";
+const GPTOSS_CALL_MARKER = "<|call|>";
+const GPTOSS_RETURN_MARKER = "<|return|>";
+const GPTOSS_CHANNEL_TERMINATORS = [GPTOSS_END_MARKER, GPTOSS_CALL_MARKER, GPTOSS_RETURN_MARKER];
+const DOCUMENT_ANALYSIS_TOOL_RESULT_PREFIX = "Tool result:\n";
+const GPTOSS_SYSTEM_PROMPT = [
+  "You are ChatGPT, a large language model trained by OpenAI.",
+  "Knowledge cutoff: 2024-06",
+  "Current date: {current_date}",
+  "",
+  "Reasoning: {reasoning_effort}",
+  "",
+  "# Valid channels: analysis, commentary, final. Channel must be included for every message.",
+  "No tools or external recipients are available in this chat.",
+  "Do not emit commentary to tools, files, browsers, functions, repo_browser, or any recipient other than final.",
+  "After reasoning, respond to the user in final, or use commentary to=final only when a constrained final format is required."
+].join("\n");
+const GPTOSS_DOCUMENT_ANALYSIS_SYSTEM_PROMPT = [
+  "You are ChatGPT, a large language model trained by OpenAI.",
+  "Knowledge cutoff: 2024-06",
+  "Current date: {current_date}",
+  "",
+  "Reasoning: {reasoning_effort}",
+  "",
+  "# Valid channels: analysis, commentary, final. Channel must be included for every message.",
+  "In document analysis mode, commentary may target only the host-managed tool recipients `search` and `modify_results`.",
+  "This framework is for analyzing one selected indexed document index or corpus, which may contain multiple PDFs.",
+  "{document_title_line}You have exactly two host-managed tools available for that selected corpus: `search` and `modify_results`.",
+  "The host calls tools. The user never calls tools directly.",
+  "Any later `Tool result:` message is host-injected search output, not user-authored input.",
+  "Do not ask the user to wrap queries in `<tool_call>`, and do not suggest that they need to use the tool themselves.",
+  "For questions about the selected document's contents, retrieve evidence with `search` before answering. This includes PDFs inside the selected document index.",
+  "Use `modify_results` only to refine the latest tool result by dropping weak hits or expanding a promising hit with adjacent same-source chunks.",
+  "For meta questions about this framework, the system prompt, or tool behavior, answer directly without calling `search` unless document evidence is actually needed.",
+  "Do not mention the tool unless the user is explicitly asking about capabilities or tool behavior.",
+  "Preferred native GPT-OSS tool calls:",
+  "Use commentary to=search with constrained JSON arguments, for example {\"query\":\"pdf links\",\"top_k\":8}.",
+  "Use commentary to=modify_results with constrained JSON arguments only after a search result exists.",
+  "If retrieval is needed, output exactly one of these syntaxes and nothing else in that message:",
+  "<tool_call>",
+  "{\"tool\":\"search\",\"query\":\"...\", \"top_k\":8}",
+  "</tool_call>",
+  "<tool_call>",
+  "{\"tool\":\"modify_results\",\"drop_result_ids\":[\"r2\"],\"expand\":[{\"result_id\":\"r1\",\"before\":1,\"after\":1}]}",
+  "</tool_call>",
+  "Emit that `<tool_call>` block in the final channel, not in analysis or reasoning.",
+  "Do not put raw tool-call JSON in reasoning.",
+  "Never mix tool calls and the final answer in the same message.",
+  "If you do not have enough evidence, call `search` first. Narrow later searches instead of repeating broad ones.",
+  "After a non-empty relevant search result, answer from that evidence instead of searching again.",
+  "Search again only when the result is empty, unrelated, contradictory, missing a specifically requested detail, or the user asked for exhaustive or comparative coverage.",
+  "Do not search again merely to find a better citation, exact section title, narrower wording, or additional supporting excerpt.",
+  "For simple explanatory prompts like 'tell me about X', one relevant search result is sufficient.",
+  "Search results are excerpts, not the full corpus. Use them to ground the answer.",
+  "Cite the source PDF filename plus the returned page and section metadata in the final answer.",
+  "Do not emit commentary to files, browsers, functions, repo_browser, or any recipient other than final, search, or modify_results."
+].join("\n");
+const GPTOSS_OPENCODE_SYSTEM_PROMPT = [
+  "You are ChatGPT, a large language model trained by OpenAI.",
+  "Knowledge cutoff: 2024-06",
+  "Current date: {current_date}",
+  "",
+  "Reasoning: {reasoning_effort}",
+  "",
+  "# Valid channels: analysis, commentary, final. Channel must be included for every message.",
+  "OpenCode mode is for coding work inside the selected project directory.",
+  "You may use exactly one host-managed tool recipient: `shell`.",
+  "Use shell commands to inspect files, run tests, and make focused edits.",
+  "Never claim that you changed or verified something unless the tool output supports it.",
+  "Preferred native GPT-OSS tool calls:",
+  "Use commentary to=shell with constrained JSON arguments, for example {\"command\":\"rg -n \\\"TODO\\\" src\"}.",
+  "If a tool is needed, output exactly one of these syntaxes and nothing else in that message:",
+  "<tool_call>",
+  "{\"tool\":\"shell\",\"command\":\"rg -n \\\"TODO\\\" src\"}",
+  "</tool_call>",
+  "Emit that `<tool_call>` block in the final channel, not in analysis or reasoning.",
+  "Do not put raw tool-call JSON in reasoning.",
+  "Never mix tool calls and the final answer in the same message.",
+  "After the host returns a `Tool result:` message, use it to decide the next step.",
+  "Do not emit commentary to files, browsers, functions, repo_browser, search, modify_results, or any recipient other than final or shell."
+].join("\n");
 
 export class LocalLlamaRuntimeError extends Error {
   constructor(message: string) {
@@ -29,6 +111,7 @@ type ServerKey = {
   modelPath: string;
   nCtx: number;
   nGpuLayers: number;
+  nativeGptOss: boolean;
 };
 
 type ActiveServer = {
@@ -58,31 +141,58 @@ export class LocalLlamaRuntime {
       messages: ChatMessage[];
       onToken: (token: string) => void;
       onReasoning?: (token: string) => void;
+      builtinAgenticFramework?: ChatBuiltinAgenticFramework;
+      documentTitle?: string;
     }
   ): Promise<void> {
     const server = await this.ensureServer(options.model, options.settings);
     const abortController = new AbortController();
     this.activeAbortController = abortController;
     try {
-      const response = await this.fetchImpl(`${server.baseUrl}/v1/chat/completions`, {
-        method: "POST",
-        headers: {
-          "Accept": "text/event-stream",
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          model: server.modelId,
-          messages: localRuntimeMessages(options.settings, options.messages),
-          stream: true,
-          stream_options: { include_usage: true },
-          temperature: options.settings.temperature,
-          repeat_penalty: options.settings.repeatPenalty,
-          max_tokens: options.settings.maxTokens,
-          cache_prompt: true,
-          id_slot: 0
-        }),
-        signal: abortController.signal
-      });
+      const nativeGptOss = isNativeGptOssModel(options.model);
+      const response = nativeGptOss
+        ? await this.fetchImpl(`${server.baseUrl}/completion`, {
+          method: "POST",
+          headers: {
+            "Accept": "text/event-stream",
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            prompt: renderGptOssPrompt(options.messages, options.settings, {
+              builtinAgenticFramework: options.builtinAgenticFramework ?? "chat",
+              documentTitle: options.documentTitle ?? ""
+            }),
+            stream: true,
+            n_predict: gptOssRequestMaxTokens(options.messages, options.settings, {
+              builtinAgenticFramework: options.builtinAgenticFramework ?? "chat",
+              documentTitle: options.documentTitle ?? ""
+            }),
+            temperature: options.settings.temperature,
+            repeat_penalty: options.settings.repeatPenalty,
+            cache_prompt: true,
+            id_slot: 0
+          }),
+          signal: abortController.signal
+        })
+        : await this.fetchImpl(`${server.baseUrl}/v1/chat/completions`, {
+          method: "POST",
+          headers: {
+            "Accept": "text/event-stream",
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            model: server.modelId,
+            messages: localRuntimeMessages(options.settings, options.messages),
+            stream: true,
+            stream_options: { include_usage: true },
+            temperature: options.settings.temperature,
+            repeat_penalty: options.settings.repeatPenalty,
+            max_tokens: options.settings.maxTokens,
+            cache_prompt: true,
+            id_slot: 0
+          }),
+          signal: abortController.signal
+        });
       if (!response.ok) {
         const body = await response.text().catch(() => "");
         throw new LocalLlamaRuntimeError(`Bundled llama-server request failed (${response.status}): ${body || response.statusText}`);
@@ -90,8 +200,26 @@ export class LocalLlamaRuntime {
       if (!response.body) {
         throw new LocalLlamaRuntimeError("Bundled llama-server did not return a streaming response body.");
       }
+      const channelParser = nativeGptOss ? new GptOssChannelParser({
+        toolRecipients: gptOssToolRecipients(options.builtinAgenticFramework ?? "chat")
+      }) : null;
       await readServerSentEvents(response.body, (payload) => {
         if (payload === "[DONE]") {
+          return;
+        }
+        if (channelParser) {
+          const parsed = JSON.parse(payload) as { content?: unknown };
+          const rawText = extractText(parsed.content);
+          if (!rawText) {
+            return;
+          }
+          const { content, reasoning } = channelParser.push(rawText);
+          if (content) {
+            options.onToken(content);
+          }
+          if (reasoning) {
+            options.onReasoning?.(reasoning);
+          }
           return;
         }
         const parsed = JSON.parse(payload) as {
@@ -107,6 +235,15 @@ export class LocalLlamaRuntime {
           options.onReasoning?.(reasoning);
         }
       });
+      if (channelParser) {
+        const { content, reasoning } = channelParser.finish();
+        if (content) {
+          options.onToken(content);
+        }
+        if (reasoning) {
+          options.onReasoning?.(reasoning);
+        }
+      }
     } catch (error) {
       if (abortController.signal.aborted) {
         throw new LocalLlamaRuntimeError("Bundled llama-server request was cancelled.");
@@ -133,13 +270,15 @@ export class LocalLlamaRuntime {
 
   private async ensureServer(model: ChatModel, settings: ChatRuntimeSettings): Promise<ActiveServer> {
     const modelPath = path.resolve(model.path);
+    const nativeGptOss = isNativeGptOssModel(model);
     if (!fs.existsSync(modelPath) || !fs.statSync(modelPath).isFile()) {
       throw new LocalLlamaRuntimeError(`Model file not found: ${modelPath}`);
     }
     const key: ServerKey = {
       modelPath,
       nCtx: settings.nCtx,
-      nGpuLayers: settings.nGpuLayers
+      nGpuLayers: settings.nGpuLayers,
+      nativeGptOss
     };
     if (this.activeServer && serverKeyMatches(this.activeServer.key, key) && this.activeServer.process.exitCode === null) {
       return this.activeServer;
@@ -158,6 +297,7 @@ export class LocalLlamaRuntime {
       port,
       modelPath,
       settings,
+      nativeGptOss,
       slotSavePath: this.slotSavePath(binaryPath)
     });
     const process = this.spawnImpl(command.command, command.args, {
@@ -227,28 +367,33 @@ export function buildLlamaServerCommand(options: {
   port: number;
   modelPath: string;
   settings: ChatRuntimeSettings;
+  nativeGptOss?: boolean;
   slotSavePath?: string;
 }): LlamaServerCommand {
+  const args = [
+    "--host",
+    "127.0.0.1",
+    "--port",
+    String(options.port),
+    "--model",
+    options.modelPath,
+    "--ctx-size",
+    String(options.settings.nCtx),
+    "--n-gpu-layers",
+    options.settings.nGpuLayers < 0 ? "auto" : String(options.settings.nGpuLayers),
+    "-np",
+    "1",
+    "--slots",
+    "--slot-save-path",
+    options.slotSavePath ?? path.join(path.dirname(options.binaryPath), "slots")
+  ];
+  if (options.nativeGptOss ?? isNativeGptOssReference(options.modelPath)) {
+    args.push("--special");
+  }
   return {
     command: options.binaryPath,
     cwd: path.dirname(options.binaryPath),
-    args: [
-      "--host",
-      "127.0.0.1",
-      "--port",
-      String(options.port),
-      "--model",
-      options.modelPath,
-      "--ctx-size",
-      String(options.settings.nCtx),
-      "--n-gpu-layers",
-      options.settings.nGpuLayers < 0 ? "auto" : String(options.settings.nGpuLayers),
-      "-np",
-      "1",
-      "--slots",
-      "--slot-save-path",
-      options.slotSavePath ?? path.join(path.dirname(options.binaryPath), "slots")
-    ]
+    args
   };
 }
 
@@ -318,6 +463,91 @@ function extractText(value: unknown): string {
   return typeof value === "string" ? value : "";
 }
 
+function isNativeGptOssModel(model: ChatModel): boolean {
+  return isNativeGptOssReference([model.label, model.path, model.reference].filter(Boolean).join(" "));
+}
+
+function isNativeGptOssReference(value: string): boolean {
+  return value.toLowerCase().includes("gpt-oss");
+}
+
+function renderGptOssPrompt(
+  messages: ChatMessage[],
+  settings: ChatRuntimeSettings,
+  options: { builtinAgenticFramework: ChatBuiltinAgenticFramework; documentTitle: string }
+): string {
+  const framework = options.builtinAgenticFramework;
+  const documentTitle = options.documentTitle.trim();
+  const systemTemplate = framework === "document_analysis"
+    ? GPTOSS_DOCUMENT_ANALYSIS_SYSTEM_PROMPT
+    : framework === "opencode"
+      ? GPTOSS_OPENCODE_SYSTEM_PROMPT
+      : GPTOSS_SYSTEM_PROMPT;
+  const systemPrompt = systemTemplate
+    .replace("{current_date}", new Date().toISOString().slice(0, 10))
+    .replace("{reasoning_effort}", settings.reasoningEffort.trim().toLowerCase() || "medium")
+    .replace(
+      "{document_title_line}",
+      framework === "document_analysis" && documentTitle
+        ? `The selected indexed document index is "${documentTitle.replace(/[{}]/g, "")}".\n`
+        : ""
+    );
+  const parts = [`<|start|>system<|message|>${systemPrompt}${GPTOSS_END_MARKER}`];
+  const developerPrompt = settings.systemPrompt.trim();
+  if (developerPrompt) {
+    parts.push(`<|start|>developer<|message|># Instructions\n\n${developerPrompt}${GPTOSS_END_MARKER}`);
+  }
+  const lastUserIndex = messages.reduce((latest, message, index) => message.role === "user" ? index : latest, -1);
+  for (const [index, message] of messages.entries()) {
+    if (message.role === "user" && message.content.trim()) {
+      if ((framework === "document_analysis" || framework === "opencode") && message.content.startsWith(DOCUMENT_ANALYSIS_TOOL_RESULT_PREFIX)) {
+        parts.push([
+          `<|start|>developer<|message|># Host ${framework === "opencode" ? "Shell" : "Search"} Result`,
+          "This tool output was injected by the host, not authored by the user.",
+          "<tool_result>",
+          message.content,
+          "</tool_result>"
+        ].join("\n") + GPTOSS_END_MARKER);
+      } else {
+        parts.push(`<|start|>user<|message|>${message.content}${GPTOSS_END_MARKER}`);
+      }
+      continue;
+    }
+    if (message.role === "assistant") {
+      if (message.reasoning?.trim() && index > lastUserIndex) {
+        parts.push(`<|start|>assistant<|channel|>analysis<|message|>${message.reasoning}${GPTOSS_END_MARKER}`);
+      }
+      if (message.content.trim()) {
+        parts.push(`<|start|>assistant<|channel|>final<|message|>${message.content}${GPTOSS_END_MARKER}`);
+      }
+    }
+  }
+  parts.push("<|start|>assistant");
+  return parts.join("");
+}
+
+function gptOssRequestMaxTokens(
+  messages: ChatMessage[],
+  settings: ChatRuntimeSettings,
+  options: { builtinAgenticFramework: ChatBuiltinAgenticFramework; documentTitle: string }
+): number {
+  const promptChars = renderGptOssPrompt(messages, settings, options).length;
+  const estimatedPromptTokens = Math.ceil(promptChars / 3);
+  const remainingContextTokens = Math.max(0, settings.nCtx - estimatedPromptTokens);
+  const configuredMaxTokens = settings.maxTokens > 0 ? settings.maxTokens : remainingContextTokens;
+  return Math.min(configuredMaxTokens, remainingContextTokens);
+}
+
+function gptOssToolRecipients(framework: ChatBuiltinAgenticFramework): string[] {
+  if (framework === "document_analysis") {
+    return ["search", "modify_results"];
+  }
+  if (framework === "opencode") {
+    return ["shell"];
+  }
+  return [];
+}
+
 function localRuntimeMessages(settings: ChatRuntimeSettings, messages: ChatMessage[]): Array<{ role: "system" | "user" | "assistant"; content: string }> {
   const payload = messages.map((message) => ({
     role: message.role,
@@ -325,6 +555,242 @@ function localRuntimeMessages(settings: ChatRuntimeSettings, messages: ChatMessa
   }));
   const systemPrompt = settings.systemPrompt.trim();
   return systemPrompt ? [{ role: "system", content: systemPrompt }, ...payload] : payload;
+}
+
+class GptOssChannelParser {
+  private buffer = "";
+  private activeChannel: "analysis" | "final" | "final_json" | "tool_json" | null = null;
+  private activeToolRecipient = "";
+  private done = false;
+
+  constructor(private readonly options: { defaultChannel?: "analysis" | "final"; toolRecipients?: string[] } = {}) {}
+
+  push(text: string): { content: string; reasoning: string } {
+    if (this.done || !text) {
+      return { content: "", reasoning: "" };
+    }
+    this.buffer += text;
+    const content: string[] = [];
+    const reasoning: string[] = [];
+    while (true) {
+      if (!this.activeChannel) {
+        const nextChannel = this.consumeChannelPrefix();
+        if (!nextChannel) {
+          return { content: content.join(""), reasoning: reasoning.join("") };
+        }
+        this.activeChannel = nextChannel;
+        continue;
+      }
+      const terminator = firstSpecialTerminator(this.buffer);
+      if (terminator) {
+        const endIndex = terminator.index;
+        if (this.activeChannel === "final_json") {
+          appendCommentaryFinalJson(this.buffer.slice(0, endIndex), content);
+        } else if (this.activeChannel === "tool_json") {
+          appendCommentaryToolCallJson(this.activeToolRecipient, this.buffer.slice(0, endIndex), content);
+        } else {
+          this.appendChannelText(this.buffer.slice(0, endIndex), content, reasoning);
+        }
+        this.buffer = this.buffer.slice(endIndex + terminator.marker.length);
+        this.activeChannel = null;
+        this.activeToolRecipient = "";
+        if (!this.buffer) {
+          return { content: content.join(""), reasoning: reasoning.join("") };
+        }
+        continue;
+      }
+      if (this.activeChannel === "final_json" || this.activeChannel === "tool_json") {
+        return { content: content.join(""), reasoning: reasoning.join("") };
+      }
+      const partialEndLength = trailingPartialSpecialTerminatorLength(this.buffer);
+      const emitText = partialEndLength > 0 ? this.buffer.slice(0, -partialEndLength) : this.buffer;
+      this.appendChannelText(emitText, content, reasoning);
+      this.buffer = partialEndLength > 0 ? this.buffer.slice(-partialEndLength) : "";
+      return { content: content.join(""), reasoning: reasoning.join("") };
+    }
+  }
+
+  finish(): { content: string; reasoning: string } {
+    if (this.done || !this.buffer) {
+      return { content: "", reasoning: "" };
+    }
+    const content: string[] = [];
+    const reasoning: string[] = [];
+    if (this.activeChannel === "final_json") {
+      appendCommentaryFinalJson(this.buffer, content);
+      this.buffer = "";
+      this.activeChannel = null;
+      return { content: content.join(""), reasoning: reasoning.join("") };
+    }
+    if (this.activeChannel === "tool_json") {
+      appendCommentaryToolCallJson(this.activeToolRecipient, this.buffer, content);
+      this.buffer = "";
+      this.activeChannel = null;
+      this.activeToolRecipient = "";
+      return { content: content.join(""), reasoning: reasoning.join("") };
+    }
+    if ((this.activeChannel === "analysis" || this.activeChannel === "final") && !this.buffer.startsWith("<|")) {
+      this.appendChannelText(this.buffer, content, reasoning);
+    }
+    this.buffer = "";
+    this.activeChannel = null;
+    return { content: content.join(""), reasoning: reasoning.join("") };
+  }
+
+  private consumeChannelPrefix(): "analysis" | "final" | "final_json" | "tool_json" | null {
+    while (this.buffer.startsWith("<|start|>assistant")) {
+      this.buffer = this.buffer.slice("<|start|>assistant".length);
+      if (!this.buffer) {
+        return null;
+      }
+    }
+    const analysisPrefix = "<|channel|>analysis<|message|>";
+    const finalPrefix = "<|channel|>final<|message|>";
+    if (this.buffer.startsWith(analysisPrefix)) {
+      this.buffer = this.buffer.slice(analysisPrefix.length);
+      return "analysis";
+    }
+    if (this.buffer.startsWith(finalPrefix)) {
+      this.buffer = this.buffer.slice(finalPrefix.length);
+      return "final";
+    }
+    const commentaryChannel = this.consumeCommentaryPrefix();
+    if (commentaryChannel === "await_commentary") {
+      return null;
+    }
+    if (commentaryChannel) {
+      return commentaryChannel;
+    }
+    if (this.buffer && !this.buffer.startsWith("<|")) {
+      return this.options.defaultChannel ?? "analysis";
+    }
+    if (this.buffer && awaitingKnownPrefix(this.buffer, ["<|start|>assistant", analysisPrefix, finalPrefix, "<|channel|>commentary"])) {
+      return null;
+    }
+    this.done = true;
+    return null;
+  }
+
+  private consumeCommentaryPrefix(): "analysis" | "final" | "final_json" | "tool_json" | "await_commentary" | null {
+    const commentaryPrefix = "<|channel|>commentary";
+    if (!this.buffer.startsWith(commentaryPrefix)) {
+      return null;
+    }
+    const messageMarker = "<|message|>";
+    const messageIndex = this.buffer.indexOf(messageMarker);
+    if (messageIndex < 0) {
+      return "await_commentary";
+    }
+    const prefix = this.buffer.slice(0, messageIndex + messageMarker.length);
+    this.buffer = this.buffer.slice(messageIndex + messageMarker.length);
+    const toolRecipient = this.commentaryToolRecipient(prefix);
+    if (toolRecipient) {
+      this.activeToolRecipient = toolRecipient;
+      return "tool_json";
+    }
+    if (prefix.includes("to=final") && prefix.includes("<|constrain|>json")) {
+      return "final_json";
+    }
+    if (prefix.includes("to=final")) {
+      return "final";
+    }
+    return "analysis";
+  }
+
+  private commentaryToolRecipient(prefix: string): string {
+    const recipients = this.options.toolRecipients ?? [];
+    if (recipients.length === 0) {
+      return "";
+    }
+    const normalized = prefix.replace(/\s+/g, " ");
+    for (const recipient of recipients) {
+      const escaped = recipient.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      if (new RegExp(`(?:^|\\s)to=${escaped}(?:\\s|<|$)`, "u").test(normalized)) {
+        return recipient;
+      }
+    }
+    return "";
+  }
+
+  private appendChannelText(text: string, content: string[], reasoning: string[]): void {
+    if (!text) {
+      return;
+    }
+    if (this.activeChannel === "analysis") {
+      reasoning.push(text);
+      return;
+    }
+    content.push(text);
+  }
+}
+
+function awaitingKnownPrefix(text: string, markers: string[]): boolean {
+  return Boolean(text) && markers.some((marker) => marker.startsWith(text));
+}
+
+function firstSpecialTerminator(text: string): { index: number; marker: string } | null {
+  let first: { index: number; marker: string } | null = null;
+  for (const marker of GPTOSS_CHANNEL_TERMINATORS) {
+    const index = text.indexOf(marker);
+    if (index >= 0 && (!first || index < first.index)) {
+      first = { index, marker };
+    }
+  }
+  return first;
+}
+
+function trailingPartialSpecialTerminatorLength(text: string): number {
+  return Math.max(...GPTOSS_CHANNEL_TERMINATORS.map((marker) => trailingPartialMarkerLength(text, marker)));
+}
+
+function trailingPartialMarkerLength(text: string, marker: string): number {
+  const maxSuffix = Math.min(text.length, marker.length - 1);
+  for (let suffixLength = maxSuffix; suffixLength > 0; suffixLength -= 1) {
+    if (marker.startsWith(text.slice(-suffixLength))) {
+      return suffixLength;
+    }
+  }
+  return 0;
+}
+
+function appendCommentaryFinalJson(text: string, content: string[]): void {
+  const normalized = text.trim();
+  if (!normalized) {
+    return;
+  }
+  try {
+    const decoded = JSON.parse(normalized) as unknown;
+    if (decoded && typeof decoded === "object" && !Array.isArray(decoded)) {
+      const record = decoded as Record<string, unknown>;
+      for (const key of ["final", "response", "content"]) {
+        if (typeof record[key] === "string") {
+          content.push(record[key]);
+          return;
+        }
+      }
+    }
+  } catch {
+    // Fall through to preserving the raw constrained payload.
+  }
+  content.push(normalized);
+}
+
+function appendCommentaryToolCallJson(toolRecipient: string, text: string, content: string[]): void {
+  const normalized = text.trim();
+  if (!normalized) {
+    return;
+  }
+  try {
+    const decoded = JSON.parse(normalized) as unknown;
+    if (decoded && typeof decoded === "object" && !Array.isArray(decoded)) {
+      const payload = { ...(decoded as Record<string, unknown>), tool: toolRecipient };
+      content.push(`<tool_call>${JSON.stringify(payload)}</tool_call>`);
+      return;
+    }
+  } catch {
+    // Keep malformed tool JSON visible to the strict document tool-call parser.
+  }
+  content.push(`<tool_call>${normalized}</tool_call>`);
 }
 
 function sleep(ms: number): Promise<void> {

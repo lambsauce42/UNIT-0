@@ -1,5 +1,4 @@
 import os from "node:os";
-import { execFile } from "node:child_process";
 import * as pty from "node-pty";
 import type {
   TerminalAppletKind,
@@ -116,15 +115,7 @@ export class TerminalManager {
 }
 
 function killTerminalProcess(process: pty.IPty): void {
-  if (os.platform() !== "win32") {
-    process.kill();
-    return;
-  }
-  execFile("taskkill.exe", ["/pid", String(process.pid), "/t", "/f"], (error) => {
-    if (error) {
-      console.warn(`[unit0:terminal] taskkill failed for terminal pid ${process.pid}: ${error.message}`);
-    }
-  });
+  process.kill();
 }
 
 function terminalEnv(): Record<string, string> {
