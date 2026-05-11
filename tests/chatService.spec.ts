@@ -5,6 +5,7 @@ import path from "node:path";
 import { ChatService } from "../src/main/chatService";
 import { ChatStore } from "../src/main/chatStore";
 import { MockCodexRuntime, type CodexRunOptions, type CodexThreadEvent } from "../src/main/codexRuntime";
+import type { DocumentEmbeddingRuntime } from "../src/main/embeddingRuntime";
 import { LocalLlamaRuntime } from "../src/main/localLlamaRuntime";
 import { RemoteHostRuntime, type RemoteStreamMetrics } from "../src/main/remoteHostRuntime";
 import type { ChatAppSettings, ChatBuiltinAgenticFramework, ChatMessage, ChatModel, ChatRuntimeSettings } from "../src/shared/types";
@@ -12,8 +13,32 @@ import type { ChatAppSettings, ChatBuiltinAgenticFramework, ChatMessage, ChatMod
 function makeService() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-service-test-"));
   const store = new ChatStore(path.join(dir, "chat.sqlite"));
-  const service = new ChatService(store, new LocalLlamaRuntime(), new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined);
+  const service = new ChatService(store, new LocalLlamaRuntime(), new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined, new TestEmbeddingRuntime());
   return { service, store, cleanup: () => fs.rmSync(dir, { recursive: true, force: true }) };
+}
+
+class TestEmbeddingRuntime implements DocumentEmbeddingRuntime {
+  async embedDocuments(options: { texts: string[]; onProgress?: (completed: number, total: number) => void }): Promise<number[][]> {
+    options.onProgress?.(options.texts.length, options.texts.length);
+    return options.texts.map((text) => testEmbeddingForText(text));
+  }
+
+  async embedQuery(options: { text: string }): Promise<number[]> {
+    return testEmbeddingForText(options.text);
+  }
+
+  close(): void {}
+}
+
+function testEmbeddingForText(text: string): number[] {
+  const lower = text.toLowerCase();
+  if (lower.includes("alpha")) {
+    return [1, 0, 0];
+  }
+  if (lower.includes("beta")) {
+    return [0, 1, 0];
+  }
+  return [0, 0, 1];
 }
 
 class ScriptedLlamaRuntime extends LocalLlamaRuntime {
@@ -249,7 +274,7 @@ class CapturingCodexRuntime extends MockCodexRuntime {
 test("keeps Codex assistant and reasoning timeline blocks in stream order", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-codex-order-test-"));
   const store = new ChatStore(path.join(dir, "chat.sqlite"));
-  const service = new ChatService(store, new LocalLlamaRuntime(), new RemoteHostRuntime(), new OrderedCodexRuntime(), () => undefined);
+  const service = new ChatService(store, new LocalLlamaRuntime(), new RemoteHostRuntime(), new OrderedCodexRuntime(), () => undefined, new TestEmbeddingRuntime());
   try {
     let state = store.loadState();
     store.updateProjectSettings(state.selectedProjectId, "Codex Project", dir);
@@ -273,7 +298,7 @@ test("keeps Codex assistant and reasoning timeline blocks in stream order", asyn
 test("accumulates streamed Codex details without duplicating completed snapshots", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-codex-stream-details-test-"));
   const store = new ChatStore(path.join(dir, "chat.sqlite"));
-  const service = new ChatService(store, new LocalLlamaRuntime(), new RemoteHostRuntime(), new StreamingDetailsCodexRuntime(), () => undefined);
+  const service = new ChatService(store, new LocalLlamaRuntime(), new RemoteHostRuntime(), new StreamingDetailsCodexRuntime(), () => undefined, new TestEmbeddingRuntime());
   try {
     let state = store.loadState();
     store.updateProjectSettings(state.selectedProjectId, "Codex Project", dir);
@@ -298,7 +323,7 @@ test("accumulates streamed Codex details without duplicating completed snapshots
 test("completed Codex reasoning content and structured file snapshots replace matching streams", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-codex-content-reasoning-test-"));
   const store = new ChatStore(path.join(dir, "chat.sqlite"));
-  const service = new ChatService(store, new LocalLlamaRuntime(), new RemoteHostRuntime(), new CompletedContentReasoningCodexRuntime(), () => undefined);
+  const service = new ChatService(store, new LocalLlamaRuntime(), new RemoteHostRuntime(), new CompletedContentReasoningCodexRuntime(), () => undefined, new TestEmbeddingRuntime());
   try {
     let state = store.loadState();
     store.updateProjectSettings(state.selectedProjectId, "Codex Project", dir);
@@ -321,7 +346,7 @@ test("completed Codex reasoning content and structured file snapshots replace ma
 test("empty Codex reasoning summary parts preserve stream section order", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-codex-summary-order-test-"));
   const store = new ChatStore(path.join(dir, "chat.sqlite"));
-  const service = new ChatService(store, new LocalLlamaRuntime(), new RemoteHostRuntime(), new EmptySummaryPartCodexRuntime(), () => undefined);
+  const service = new ChatService(store, new LocalLlamaRuntime(), new RemoteHostRuntime(), new EmptySummaryPartCodexRuntime(), () => undefined, new TestEmbeddingRuntime());
   try {
     let state = store.loadState();
     store.updateProjectSettings(state.selectedProjectId, "Codex Project", dir);
@@ -350,7 +375,7 @@ test("empty Codex reasoning summary parts preserve stream section order", async 
 test("Codex account refresh recovers without surfacing a chat generation error", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-codex-account-test-"));
   const store = new ChatStore(path.join(dir, "chat.sqlite"));
-  const service = new ChatService(store, new LocalLlamaRuntime(), new RemoteHostRuntime(), new FlakyAccountCodexRuntime(), () => undefined);
+  const service = new ChatService(store, new LocalLlamaRuntime(), new RemoteHostRuntime(), new FlakyAccountCodexRuntime(), () => undefined, new TestEmbeddingRuntime());
   try {
     const failed = await service.refreshCodexAccount();
     expect(failed.codexAccount.status).toBe("error");
@@ -373,7 +398,7 @@ test("does not pass local system prompt as Codex base instructions", async () =>
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-codex-system-prompt-test-"));
   const store = new ChatStore(path.join(dir, "chat.sqlite"));
   const codexRuntime = new CapturingCodexRuntime();
-  const service = new ChatService(store, new LocalLlamaRuntime(), new RemoteHostRuntime(), codexRuntime, () => undefined);
+  const service = new ChatService(store, new LocalLlamaRuntime(), new RemoteHostRuntime(), codexRuntime, () => undefined, new TestEmbeddingRuntime());
   try {
     let state = store.loadState();
     store.updateProjectSettings(state.selectedProjectId, "Codex Project", dir);
@@ -396,7 +421,7 @@ test("blocks Codex submit when the project directory is empty", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-codex-empty-dir-test-"));
   const store = new ChatStore(path.join(dir, "chat.sqlite"));
   const codexRuntime = new CapturingCodexRuntime();
-  const service = new ChatService(store, new LocalLlamaRuntime(), new RemoteHostRuntime(), codexRuntime, () => undefined);
+  const service = new ChatService(store, new LocalLlamaRuntime(), new RemoteHostRuntime(), codexRuntime, () => undefined, new TestEmbeddingRuntime());
   try {
     const state = store.loadState();
     store.updateProjectSettings(state.selectedProjectId, "No Directory Project", "");
@@ -494,7 +519,7 @@ test("runs OpenCode shell tool calls through local harness timeline blocks", asy
     '<tool_call>{"tool":"shell","command":"echo open-code-ok"}</tool_call>',
     "Done."
   ]);
-  const service = new ChatService(store, runtime, new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined);
+  const service = new ChatService(store, runtime, new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined, new TestEmbeddingRuntime());
   try {
     let state = store.loadState();
     store.updateProjectSettings(state.selectedProjectId, "OpenCode Project", dir);
@@ -534,7 +559,7 @@ test("streams OpenCode final answer content after tool-call prefix is ruled out"
       await secondTokenGate;
     }
   }, ["Thinking ", "first."]);
-  const service = new ChatService(store, runtime, new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined);
+  const service = new ChatService(store, runtime, new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined, new TestEmbeddingRuntime());
   try {
     let state = store.loadState();
     store.updateProjectSettings(state.selectedProjectId, "OpenCode Stream Project", dir);
@@ -682,7 +707,7 @@ test("cancels active OpenCode shell tool execution", async () => {
     `<tool_call>${JSON.stringify({ tool: "shell", command })}</tool_call>`,
     "Should not continue."
   ]);
-  const service = new ChatService(store, runtime, new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined);
+  const service = new ChatService(store, runtime, new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined, new TestEmbeddingRuntime());
   try {
     let state = store.loadState();
     store.updateProjectSettings(state.selectedProjectId, "OpenCode Cancel Project", dir);
@@ -732,7 +757,7 @@ test("cancelled OpenCode run does not clear a newer generation", async () => {
       await secondReplyGate;
     }
   });
-  const service = new ChatService(store, runtime, new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined);
+  const service = new ChatService(store, runtime, new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined, new TestEmbeddingRuntime());
   try {
     let state = store.loadState();
     store.updateProjectSettings(state.selectedProjectId, "OpenCode Race Project", dir);
@@ -777,7 +802,8 @@ test("runs iterative document-analysis tool calls against a ready local index", 
     ]),
     new RemoteHostRuntime(),
     new MockCodexRuntime(),
-    () => undefined
+    () => undefined,
+    new TestEmbeddingRuntime()
   );
   try {
     const sourcePath = path.join(dir, "notes.txt");
@@ -795,8 +821,8 @@ test("runs iterative document-analysis tool calls against a ready local index", 
     store.updateAppSettings({ tokenizerModelPath: path.join(dir, "tokenizer.gguf") });
     const index = store.createDocumentIndex(state.selectedProjectId, "Notes", sourcePath);
     store.replaceDocumentIndexChunks(index.id, [
-      { chunkId: "c1", sourceTitle: "notes.txt", sourcePath, pageStart: 1, pageEnd: 1, text: "alpha first paragraph", tokenCount: 4, ordinalStart: 0, ordinalEnd: 0 },
-      { chunkId: "c2", sourceTitle: "notes.txt", sourcePath, pageStart: 1, pageEnd: 1, text: "beta neighbor paragraph", tokenCount: 4, ordinalStart: 1, ordinalEnd: 1 }
+      { chunkId: "c1", sourceTitle: "notes.txt", sourcePath, pageStart: 1, pageEnd: 1, text: "alpha first paragraph", tokenCount: 4, ordinalStart: 0, ordinalEnd: 0, embedding: [1, 0, 0] },
+      { chunkId: "c2", sourceTitle: "notes.txt", sourcePath, pageStart: 1, pageEnd: 1, text: "beta neighbor paragraph", tokenCount: 4, ordinalStart: 1, ordinalEnd: 1, embedding: [0, 1, 0] }
     ]);
     store.updateDocumentIndexStatus(index.id, { state: "ready", progress: 1, message: "Ready" });
     store.selectDocumentIndex(state.selectedThreadId, index.id);
@@ -827,7 +853,7 @@ test("keeps document-analysis retry on the search protocol after malformed local
     "",
     "Alpha appears in the indexed document [r1]."
   ]);
-  const service = new ChatService(store, runtime, new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined);
+  const service = new ChatService(store, runtime, new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined, new TestEmbeddingRuntime());
   try {
     const sourcePath = path.join(dir, "notes.txt");
     fs.writeFileSync(sourcePath, "alpha first paragraph");
@@ -842,7 +868,7 @@ test("keeps document-analysis retry on the search protocol after malformed local
     });
     const index = store.createDocumentIndex(state.selectedProjectId, "Notes", sourcePath);
     store.replaceDocumentIndexChunks(index.id, [
-      { chunkId: "c1", sourceTitle: "notes.txt", sourcePath, pageStart: 1, pageEnd: 1, text: "alpha first paragraph", tokenCount: 4, ordinalStart: 0, ordinalEnd: 0 }
+      { chunkId: "c1", sourceTitle: "notes.txt", sourcePath, pageStart: 1, pageEnd: 1, text: "alpha first paragraph", tokenCount: 4, ordinalStart: 0, ordinalEnd: 0, embedding: [1, 0, 0] }
     ]);
     store.updateDocumentIndexStatus(index.id, { state: "ready", progress: 1, message: "Ready" });
     store.selectDocumentIndex(state.selectedThreadId, index.id);
@@ -874,7 +900,7 @@ test("rolls back streamed document final candidates that later fail tool-call pa
     'Bad partial <tool_call>{"tool":"search","query":"alpha","top_k":4}</tool_call>',
     "Alpha appears in the indexed document [r1]."
   ]);
-  const service = new ChatService(store, runtime, new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined);
+  const service = new ChatService(store, runtime, new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined, new TestEmbeddingRuntime());
   try {
     const sourcePath = path.join(dir, "notes.txt");
     fs.writeFileSync(sourcePath, "alpha first paragraph");
@@ -889,7 +915,7 @@ test("rolls back streamed document final candidates that later fail tool-call pa
     });
     const index = store.createDocumentIndex(state.selectedProjectId, "Notes", sourcePath);
     store.replaceDocumentIndexChunks(index.id, [
-      { chunkId: "c1", sourceTitle: "notes.txt", sourcePath, pageStart: 1, pageEnd: 1, text: "alpha first paragraph", tokenCount: 4, ordinalStart: 0, ordinalEnd: 0 }
+      { chunkId: "c1", sourceTitle: "notes.txt", sourcePath, pageStart: 1, pageEnd: 1, text: "alpha first paragraph", tokenCount: 4, ordinalStart: 0, ordinalEnd: 0, embedding: [1, 0, 0] }
     ]);
     store.updateDocumentIndexStatus(index.id, { state: "ready", progress: 1, message: "Ready" });
     store.selectDocumentIndex(state.selectedThreadId, index.id);
@@ -913,7 +939,7 @@ test("rolls back streamed document final candidates that later fail tool-call pa
 test("surfaces document-analysis setup failures on the assistant turn", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-doc-visible-error-test-"));
   const store = new ChatStore(path.join(dir, "chat.sqlite"));
-  const service = new ChatService(store, new ScriptedLlamaRuntime([]), new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined);
+  const service = new ChatService(store, new ScriptedLlamaRuntime([]), new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined, new TestEmbeddingRuntime());
   try {
     const modelPath = path.join(dir, "model.gguf");
     fs.writeFileSync(modelPath, "");
@@ -950,6 +976,61 @@ test("surfaces document-analysis setup failures on the assistant turn", async ()
   }
 });
 
+test("surfaces legacy document indexes without vector embeddings on the assistant turn", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-doc-legacy-vector-test-"));
+  const store = new ChatStore(path.join(dir, "chat.sqlite"));
+  const service = new ChatService(
+    store,
+    new ScriptedLlamaRuntime(['<tool_call>{"tool":"search","query":"alpha","top_k":4}</tool_call>']),
+    new RemoteHostRuntime(),
+    new MockCodexRuntime(),
+    () => undefined,
+    new TestEmbeddingRuntime()
+  );
+  try {
+    const sourcePath = path.join(dir, "notes.txt");
+    const modelPath = path.join(dir, "model.gguf");
+    const embeddingPath = path.join(dir, "embed.gguf");
+    fs.writeFileSync(sourcePath, "alpha first paragraph");
+    fs.writeFileSync(modelPath, "");
+    fs.writeFileSync(embeddingPath, "");
+    let state = store.loadState();
+    store.addLocalModel(modelPath);
+    state = store.loadState();
+    const index = store.createDocumentIndex(state.selectedProjectId, "Legacy", sourcePath, embeddingPath);
+    store.replaceDocumentIndexChunks(index.id, [
+      { chunkId: "c1", sourceTitle: "notes.txt", sourcePath, pageStart: 1, pageEnd: 1, text: "alpha first paragraph", tokenCount: 4, ordinalStart: 0, ordinalEnd: 0 }
+    ]);
+    store.updateDocumentIndexStatus(index.id, { state: "ready", progress: 1, message: "Ready" });
+    store.selectDocumentIndex(state.selectedThreadId, index.id);
+    store.updateThreadSettings(state.selectedThreadId, {
+      builtinModelId: state.models[0].id,
+      builtinAgenticFramework: "document_analysis",
+      documentAnalysisEmbeddingModelPath: embeddingPath
+    });
+
+    await service.submit({ text: "Tell me about alpha" });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const next = service.state();
+    const assistant = next.messages.filter((message) => message.role === "assistant").at(-1);
+
+    expect(next.generation).toMatchObject({
+      status: "error",
+      error: "Selected document index does not contain vector embeddings. Rebuild the document group."
+    });
+    expect(assistant?.status).toBe("error");
+    expect(assistant?.timelineBlocks?.at(-1)).toMatchObject({
+      kind: "status",
+      level: "error",
+      message: "Selected document index does not contain vector embeddings. Rebuild the document group.",
+      code: "document_analysis_failed"
+    });
+  } finally {
+    service.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("streams document-analysis reasoning and final answer after tool evidence", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-doc-stream-test-"));
   const store = new ChatStore(path.join(dir, "chat.sqlite"));
@@ -960,7 +1041,8 @@ test("streams document-analysis reasoning and final answer after tool evidence",
     new StreamingDocumentLlamaRuntime(),
     new RemoteHostRuntime(),
     new MockCodexRuntime(),
-    () => snapshots.push(service.state())
+    () => snapshots.push(service.state()),
+    new TestEmbeddingRuntime()
   );
   try {
     const sourcePath = path.join(dir, "notes.txt");
@@ -977,7 +1059,7 @@ test("streams document-analysis reasoning and final answer after tool evidence",
     });
     const index = store.createDocumentIndex(state.selectedProjectId, "Notes", sourcePath);
     store.replaceDocumentIndexChunks(index.id, [
-      { chunkId: "c1", sourceTitle: "notes.txt", sourcePath, pageStart: 1, pageEnd: 1, text: "alpha first paragraph", tokenCount: 4, ordinalStart: 0, ordinalEnd: 0 }
+      { chunkId: "c1", sourceTitle: "notes.txt", sourcePath, pageStart: 1, pageEnd: 1, text: "alpha first paragraph", tokenCount: 4, ordinalStart: 0, ordinalEnd: 0, embedding: [1, 0, 0] }
     ]);
     store.updateDocumentIndexStatus(index.id, { state: "ready", progress: 1, message: "Ready" });
     store.selectDocumentIndex(state.selectedThreadId, index.id);
@@ -1012,7 +1094,7 @@ test("streams document-analysis reasoning and final answer after tool evidence",
 test("keeps transient document-analysis reasoning with a failed tool marker when retry succeeds", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-doc-transient-reasoning-test-"));
   const store = new ChatStore(path.join(dir, "chat.sqlite"));
-  const service = new ChatService(store, new ReasoningOnlyThenToolRuntime(), new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined);
+  const service = new ChatService(store, new ReasoningOnlyThenToolRuntime(), new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined, new TestEmbeddingRuntime());
   try {
     const sourcePath = path.join(dir, "notes.txt");
     const modelPath = path.join(dir, "model.gguf");
@@ -1028,7 +1110,7 @@ test("keeps transient document-analysis reasoning with a failed tool marker when
     });
     const index = store.createDocumentIndex(state.selectedProjectId, "Notes", sourcePath);
     store.replaceDocumentIndexChunks(index.id, [
-      { chunkId: "c1", sourceTitle: "notes.txt", sourcePath, pageStart: 1, pageEnd: 1, text: "alpha first paragraph", tokenCount: 4, ordinalStart: 0, ordinalEnd: 0 }
+      { chunkId: "c1", sourceTitle: "notes.txt", sourcePath, pageStart: 1, pageEnd: 1, text: "alpha first paragraph", tokenCount: 4, ordinalStart: 0, ordinalEnd: 0, embedding: [1, 0, 0] }
     ]);
     store.updateDocumentIndexStatus(index.id, { state: "ready", progress: 1, message: "Ready" });
     store.selectDocumentIndex(state.selectedThreadId, index.id);
@@ -1056,7 +1138,7 @@ test("accepts document-analysis final answers without forcing search", async () 
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-doc-no-forced-search-test-"));
   const store = new ChatStore(path.join(dir, "chat.sqlite"));
   const runtime = new ScriptedLlamaRuntime(["Here is a deliberately long random answer without using document search."]);
-  const service = new ChatService(store, runtime, new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined);
+  const service = new ChatService(store, runtime, new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined, new TestEmbeddingRuntime());
   try {
     const sourcePath = path.join(dir, "notes.txt");
     fs.writeFileSync(sourcePath, "alpha first paragraph");
@@ -1071,7 +1153,7 @@ test("accepts document-analysis final answers without forcing search", async () 
     });
     const index = store.createDocumentIndex(state.selectedProjectId, "Notes", sourcePath);
     store.replaceDocumentIndexChunks(index.id, [
-      { chunkId: "c1", sourceTitle: "notes.txt", sourcePath, pageStart: 1, pageEnd: 1, text: "alpha first paragraph", tokenCount: 4, ordinalStart: 0, ordinalEnd: 0 }
+      { chunkId: "c1", sourceTitle: "notes.txt", sourcePath, pageStart: 1, pageEnd: 1, text: "alpha first paragraph", tokenCount: 4, ordinalStart: 0, ordinalEnd: 0, embedding: [1, 0, 0] }
     ]);
     store.updateDocumentIndexStatus(index.id, { state: "ready", progress: 1, message: "Ready" });
     store.selectDocumentIndex(state.selectedThreadId, index.id);
@@ -1097,7 +1179,7 @@ test("does not retry unwrapped document-analysis JSON as a forced search", async
   const runtime = new ScriptedLlamaRuntime([
     '{"tool":"document_analysis","query":"alpha"}'
   ]);
-  const service = new ChatService(store, runtime, new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined);
+  const service = new ChatService(store, runtime, new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined, new TestEmbeddingRuntime());
   try {
     const sourcePath = path.join(dir, "notes.txt");
     fs.writeFileSync(sourcePath, "alpha first paragraph");
@@ -1112,7 +1194,7 @@ test("does not retry unwrapped document-analysis JSON as a forced search", async
     });
     const index = store.createDocumentIndex(state.selectedProjectId, "Notes", sourcePath);
     store.replaceDocumentIndexChunks(index.id, [
-      { chunkId: "c1", sourceTitle: "notes.txt", sourcePath, pageStart: 1, pageEnd: 1, text: "alpha first paragraph", tokenCount: 4, ordinalStart: 0, ordinalEnd: 0 }
+      { chunkId: "c1", sourceTitle: "notes.txt", sourcePath, pageStart: 1, pageEnd: 1, text: "alpha first paragraph", tokenCount: 4, ordinalStart: 0, ordinalEnd: 0, embedding: [1, 0, 0] }
     ]);
     store.updateDocumentIndexStatus(index.id, { state: "ready", progress: 1, message: "Ready" });
     store.selectDocumentIndex(state.selectedThreadId, index.id);
@@ -1140,7 +1222,7 @@ test("rejects document-analysis tool calls mixed with surrounding text", async (
     '<tool_call>{"tool":"search","query":"alpha","top_k":4}</tool_call>',
     "Alpha appears in the indexed document [r1]."
   ]);
-  const service = new ChatService(store, runtime, new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined);
+  const service = new ChatService(store, runtime, new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined, new TestEmbeddingRuntime());
   try {
     const sourcePath = path.join(dir, "notes.txt");
     fs.writeFileSync(sourcePath, "alpha first paragraph");
@@ -1155,7 +1237,7 @@ test("rejects document-analysis tool calls mixed with surrounding text", async (
     });
     const index = store.createDocumentIndex(state.selectedProjectId, "Notes", sourcePath);
     store.replaceDocumentIndexChunks(index.id, [
-      { chunkId: "c1", sourceTitle: "notes.txt", sourcePath, pageStart: 1, pageEnd: 1, text: "alpha first paragraph", tokenCount: 4, ordinalStart: 0, ordinalEnd: 0 }
+      { chunkId: "c1", sourceTitle: "notes.txt", sourcePath, pageStart: 1, pageEnd: 1, text: "alpha first paragraph", tokenCount: 4, ordinalStart: 0, ordinalEnd: 0, embedding: [1, 0, 0] }
     ]);
     store.updateDocumentIndexStatus(index.id, { state: "ready", progress: 1, message: "Ready" });
     store.selectDocumentIndex(state.selectedThreadId, index.id);
@@ -1193,7 +1275,7 @@ test("rejects document-analysis tool calls emitted only in reasoning", async () 
     }
   }
   const runtime = new ReasoningOnlyToolRuntime({ startupTimeoutMs: 10 });
-  const service = new ChatService(store, runtime, new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined);
+  const service = new ChatService(store, runtime, new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined, new TestEmbeddingRuntime());
   try {
     const sourcePath = path.join(dir, "notes.txt");
     fs.writeFileSync(sourcePath, "alpha first paragraph");
@@ -1208,7 +1290,7 @@ test("rejects document-analysis tool calls emitted only in reasoning", async () 
     });
     const index = store.createDocumentIndex(state.selectedProjectId, "Notes", sourcePath);
     store.replaceDocumentIndexChunks(index.id, [
-      { chunkId: "c1", sourceTitle: "notes.txt", sourcePath, pageStart: 1, pageEnd: 1, text: "alpha first paragraph", tokenCount: 4, ordinalStart: 0, ordinalEnd: 0 }
+      { chunkId: "c1", sourceTitle: "notes.txt", sourcePath, pageStart: 1, pageEnd: 1, text: "alpha first paragraph", tokenCount: 4, ordinalStart: 0, ordinalEnd: 0, embedding: [1, 0, 0] }
     ]);
     store.updateDocumentIndexStatus(index.id, { state: "ready", progress: 1, message: "Ready" });
     store.selectDocumentIndex(state.selectedThreadId, index.id);
@@ -1232,7 +1314,7 @@ test("rejects document-analysis tool calls emitted only in reasoning", async () 
 test("keeps remote-hosted document reasoning and tool output in event order", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-doc-remote-stream-test-"));
   const store = new ChatStore(path.join(dir, "chat.sqlite"));
-  const service = new ChatService(store, new ScriptedLlamaRuntime([]), new StreamingRemoteDocumentRuntime(), new MockCodexRuntime(), () => undefined);
+  const service = new ChatService(store, new ScriptedLlamaRuntime([]), new StreamingRemoteDocumentRuntime(), new MockCodexRuntime(), () => undefined, new TestEmbeddingRuntime());
   try {
     const sourcePath = path.join(dir, "remote-notes.txt");
     fs.writeFileSync(sourcePath, "pdf links are annotations");
@@ -1301,7 +1383,8 @@ test("surfaces exhausted document-analysis evidence budget without tool fallback
     new ScriptedLlamaRuntime(['<tool_call>{"tool":"search","query":"alpha","top_k":4}</tool_call>']),
     new RemoteHostRuntime(),
     new MockCodexRuntime(),
-    () => undefined
+    () => undefined,
+    new TestEmbeddingRuntime()
   );
   try {
     const sourcePath = path.join(dir, "notes.txt");
@@ -1318,7 +1401,7 @@ test("surfaces exhausted document-analysis evidence budget without tool fallback
     });
     const index = store.createDocumentIndex(state.selectedProjectId, "Notes", sourcePath);
     store.replaceDocumentIndexChunks(index.id, [
-      { chunkId: "c1", sourceTitle: "notes.txt", sourcePath, pageStart: 1, pageEnd: 1, text: "alpha first paragraph", tokenCount: 4, ordinalStart: 0, ordinalEnd: 0 }
+      { chunkId: "c1", sourceTitle: "notes.txt", sourcePath, pageStart: 1, pageEnd: 1, text: "alpha first paragraph", tokenCount: 4, ordinalStart: 0, ordinalEnd: 0, embedding: [1, 0, 0] }
     ]);
     store.updateDocumentIndexStatus(index.id, { state: "ready", progress: 1, message: "Ready" });
     store.selectDocumentIndex(state.selectedThreadId, index.id);
@@ -1339,3 +1422,4 @@ test("surfaces exhausted document-analysis evidence budget without tool fallback
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+

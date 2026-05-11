@@ -7928,6 +7928,14 @@ function formatTimelineStatus(value: string) {
 }
 
 function documentIndexProgressPercent(index: ChatDocumentIndex) {
+  if (index.state === "building") {
+    const countMatch = index.message.match(/\b(\d+)\s*\/\s*(\d+)\b/);
+    const completed = countMatch ? Number(countMatch[1]) : NaN;
+    const total = countMatch ? Number(countMatch[2]) : NaN;
+    if (Number.isFinite(completed) && Number.isFinite(total) && total > 0) {
+      return Math.round(Math.min(1, Math.max(0, completed / total)) * 100);
+    }
+  }
   return Math.round(Math.min(1, Math.max(0, index.progress)) * 100);
 }
 

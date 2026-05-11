@@ -37,7 +37,7 @@ export class LocalEmbeddingRuntime implements DocumentEmbeddingRuntime {
   async embedDocuments(options: { modelPath: string; texts: string[]; nCtx: number; nGpuLayers: number; onProgress?: (completed: number, total: number) => void }): Promise<number[][]> {
     const inputs = options.texts.map((text) => embeddingInput(options.modelPath, "document", text));
     const embeddings: number[][] = [];
-    const batchSize = 16;
+    const batchSize = 1;
     for (let offset = 0; offset < inputs.length; offset += batchSize) {
       const batch = inputs.slice(offset, offset + batchSize);
       embeddings.push(...await this.embedBatch({ ...options, inputs: batch }));
@@ -157,6 +157,8 @@ export function buildEmbeddingServerCommand(options: {
       "--model",
       options.modelPath,
       "--ctx-size",
+      String(options.nCtx),
+      "--ubatch-size",
       String(options.nCtx),
       "--n-gpu-layers",
       options.nGpuLayers < 0 ? "auto" : String(options.nGpuLayers),

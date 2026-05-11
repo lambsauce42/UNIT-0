@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { EventEmitter } from "node:events";
+import { buildEmbeddingServerCommand } from "../src/main/embeddingRuntime";
 import { buildLlamaServerCommand, LocalLlamaRuntime, resolveBundledLlamaServerBinary } from "../src/main/localLlamaRuntime";
 
 test("builds a llama-server command for one local slot", () => {
@@ -94,6 +95,39 @@ test("enables special token output when GPT-OSS is detected outside the file pat
   });
 
   expect(command.args).toContain("--special");
+});
+
+test("builds a dedicated embedding llama-server command", () => {
+  const command = buildEmbeddingServerCommand({
+    binaryPath: "C:\\runtime\\llama-server.exe",
+    port: 12345,
+    modelPath: "C:\\models\\nomic-embed.gguf",
+    nCtx: 2048,
+    nGpuLayers: -1
+  });
+
+  expect(command.command).toBe("C:\\runtime\\llama-server.exe");
+  expect(command.cwd).toBe("C:\\runtime");
+  expect(command.args).toEqual([
+    "--host",
+    "127.0.0.1",
+    "--port",
+    "12345",
+    "--model",
+    "C:\\models\\nomic-embed.gguf",
+    "--ctx-size",
+    "2048",
+    "--ubatch-size",
+    "2048",
+    "--n-gpu-layers",
+    "auto",
+    "--embedding",
+    "--pooling",
+    "mean",
+    "-np",
+    "1",
+    "--no-webui"
+  ]);
 });
 
 test("resolves the bundled llama-server binary from runtime/llama.cpp", () => {

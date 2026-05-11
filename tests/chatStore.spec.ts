@@ -214,10 +214,52 @@ test("persists local context trim/reset markers", () => {
   store.close();
 });
 
-test("builds and searches document index chunks", () => {
+test("searches document index chunks by stored vector embeddings", () => {
   const { store, dir } = makeStore();
   const sourcePath = path.join(dir, "notes.txt");
   fs.writeFileSync(sourcePath, "alpha project facts\n\nbeta release notes");
+  const state = store.loadState();
+  const index = store.createDocumentIndex(state.selectedProjectId, "Notes", sourcePath, path.join(dir, "embed.gguf"));
+  store.replaceDocumentIndexChunks(index.id, [
+    {
+      chunkId: "chunk-1",
+      sourceTitle: "notes.txt",
+      sourcePath,
+      pageStart: 1,
+      pageEnd: 1,
+      text: "unrelated surface text",
+      tokenCount: 5,
+      ordinalStart: 0,
+      ordinalEnd: 0,
+      embedding: [1, 0, 0]
+    },
+    {
+      chunkId: "chunk-2",
+      sourceTitle: "notes.txt",
+      sourcePath,
+      pageStart: 2,
+      pageEnd: 2,
+      text: "also unrelated surface text",
+      tokenCount: 5,
+      ordinalStart: 1,
+      ordinalEnd: 1,
+      embedding: [0, 1, 0]
+    }
+  ]);
+  store.updateDocumentIndexStatus(index.id, { state: "ready", progress: 1, message: "Ready" });
+
+  const results = store.searchDocumentIndexByVector(index.id, [0.98, 0.02, 0], 2, 100);
+
+  expect(results).toHaveLength(1);
+  expect(results[0]).toMatchObject({ chunkId: "chunk-1", score: expect.any(Number) });
+  expect(store.searchDocumentIndexByVector(index.id, [0, 0, 1], 2, 100)).toEqual([]);
+  store.close();
+});
+
+test("rejects vector search on indexes without stored embeddings", () => {
+  const { store, dir } = makeStore();
+  const sourcePath = path.join(dir, "notes.txt");
+  fs.writeFileSync(sourcePath, "alpha project facts");
   const state = store.loadState();
   const index = store.createDocumentIndex(state.selectedProjectId, "Notes", sourcePath);
   store.replaceDocumentIndexChunks(index.id, [
@@ -235,88 +277,7 @@ test("builds and searches document index chunks", () => {
   ]);
   store.updateDocumentIndexStatus(index.id, { state: "ready", progress: 1, message: "Ready" });
 
-  const results = store.searchDocumentIndex(index.id, "alpha", 4, 100);
-
-  expect(results).toHaveLength(1);
-  expect(results[0]).toMatchObject({ resultId: "r1", text: "alpha project facts" });
-  store.close();
-});
-
-test("ranks meaningful document search terms above conversational stopwords", () => {
-  const { store, dir } = makeStore();
-  const sourcePath = path.join(dir, "pdf.txt");
-  fs.writeFileSync(sourcePath, "pdf notes");
-  const state = store.loadState();
-  const index = store.createDocumentIndex(state.selectedProjectId, "PDF", sourcePath);
-  store.replaceDocumentIndexChunks(index.id, [
-    {
-      chunkId: "chunk-1",
-      sourceTitle: "pdf.txt",
-      sourcePath,
-      pageStart: 659,
-      pageEnd: 659,
-      text: "The text in this annex is in several encodings. It is in a PDF document and in a table.",
-      tokenCount: 18,
-      ordinalStart: 0,
-      ordinalEnd: 0
-    },
-    {
-      chunkId: "chunk-2",
-      sourceTitle: "pdf.txt",
-      sourcePath,
-      pageStart: 392,
-      pageEnd: 392,
-      text: "A link annotation in a PDF creates a hyperlink action. The link can target a URI or destination.",
-      tokenCount: 19,
-      ordinalStart: 1,
-      ordinalEnd: 1
-    }
-  ]);
-  store.updateDocumentIndexStatus(index.id, { state: "ready", progress: 1, message: "Ready" });
-
-  const results = store.searchDocumentIndex(index.id, "links in pdfs", 2, 100);
-
-  expect(results).toHaveLength(2);
-  expect(results[0]).toMatchObject({ chunkId: "chunk-2", pageStart: 392 });
-  store.close();
-});
-
-test("matches singular and plural document search terms symmetrically", () => {
-  const { store, dir } = makeStore();
-  const sourcePath = path.join(dir, "manual.txt");
-  fs.writeFileSync(sourcePath, "policy notes");
-  const state = store.loadState();
-  const index = store.createDocumentIndex(state.selectedProjectId, "Manual", sourcePath);
-  store.replaceDocumentIndexChunks(index.id, [
-    {
-      chunkId: "chunk-1",
-      sourceTitle: "manual.txt",
-      sourcePath,
-      pageStart: 1,
-      pageEnd: 1,
-      text: "The policy describes audit requirements.",
-      tokenCount: 6,
-      ordinalStart: 0,
-      ordinalEnd: 0
-    },
-    {
-      chunkId: "chunk-2",
-      sourceTitle: "manual.txt",
-      sourcePath,
-      pageStart: 2,
-      pageEnd: 2,
-      text: "These policies describe retention categories.",
-      tokenCount: 6,
-      ordinalStart: 1,
-      ordinalEnd: 1
-    }
-  ]);
-  store.updateDocumentIndexStatus(index.id, { state: "ready", progress: 1, message: "Ready" });
-
-  expect(new Set(store.searchDocumentIndex(index.id, "policies", 2, 100).map((result) => result.chunkId))).toEqual(new Set(["chunk-1", "chunk-2"]));
-  expect(new Set(store.searchDocumentIndex(index.id, "policy", 2, 100).map((result) => result.chunkId))).toEqual(new Set(["chunk-1", "chunk-2"]));
-  expect(store.searchDocumentIndex(index.id, "category", 2, 100).map((result) => result.chunkId)).toEqual(["chunk-2"]);
-  expect(store.searchDocumentIndex(index.id, "categories", 2, 100).map((result) => result.chunkId)).toEqual(["chunk-2"]);
+  expect(() => store.searchDocumentIndexByVector(index.id, [1, 0, 0])).toThrow(/does not contain vector embeddings/);
   store.close();
 });
 
@@ -348,7 +309,7 @@ test("updates and deletes document index groups", () => {
   let next = store.loadState();
   expect(updated).toMatchObject({ id: index.id, title: "Brief", sourcePath: nextSourcePath, state: "building", progress: 0 });
   expect(next.documentIndexes.find((item) => item.id === index.id)).toMatchObject({ title: "Brief", sourcePath: nextSourcePath, state: "building" });
-  expect(() => store.searchDocumentIndex(index.id, "alpha")).toThrow(/not ready/);
+  expect(() => store.searchDocumentIndexByVector(index.id, [1, 0, 0])).toThrow(/not ready/);
 
   store.deleteDocumentIndex(index.id);
   next = store.loadState();

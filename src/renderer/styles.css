@@ -4371,9 +4371,20 @@ button {
 }
 
 .chat-document-status-mark.building {
-  border: 2px solid rgba(122, 170, 215, 0.3);
-  border-top-color: #8dc6f4;
+  color: #8dc6f4;
+}
+
+.chat-document-status-mark.building::before {
+  content: "";
+  width: 14px;
+  height: 14px;
+  border-radius: 999px;
+  background: conic-gradient(from 0deg, rgba(141, 198, 244, 0) 0deg, rgba(141, 198, 244, 0.18) 80deg, #8dc6f4 300deg, rgba(141, 198, 244, 0) 360deg);
+  -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 2px), #000 calc(100% - 2px));
+  mask: radial-gradient(farthest-side, transparent calc(100% - 2px), #000 calc(100% - 2px));
+  transform-origin: 50% 50%;
   animation: chatDocumentStatusSpin 780ms linear infinite;
+  will-change: transform;
 }
 
 .chat-document-status-mark.error {
@@ -4611,7 +4622,7 @@ button {
   display: block;
   height: 100%;
   border-radius: inherit;
-  background: linear-gradient(90deg, #5aa8dd, #79d38a);
+  background: linear-gradient(90deg, #3d8cff 0%, #a7fff4 100%);
 }
 
 .chat-dropup-section-label {

@@ -907,7 +907,17 @@ export class ChatService {
             if (budgetTokens <= 0) {
               throw new Error("Document analysis ran out of safe evidence budget. Start a new thread, reset local context, or use a larger context window.");
             }
-            latestResults = this.store.searchDocumentIndex(documentIndex.id, parsed.query, parsed.topK, budgetTokens);
+            const embeddingModelPath = documentIndex.embeddingModelPath.trim() || options.thread.documentAnalysisEmbeddingModelPath.trim();
+            if (!embeddingModelPath) {
+              throw new Error("Document analysis requires an embedding GGUF path before searching an index.");
+            }
+            const queryEmbedding = await this.embeddingRuntime.embedQuery({
+              modelPath: embeddingModelPath,
+              text: parsed.query,
+              nCtx: documentAnalysisEmbeddingContextSize(),
+              nGpuLayers: -1
+            });
+            latestResults = this.store.searchDocumentIndexByVector(documentIndex.id, queryEmbedding, parsed.topK, budgetTokens);
           }
         } else if (parsed.tool === "modify_results") {
           if (useRemoteDocumentTools) {
@@ -1964,18 +1974,22 @@ function splitExtractedPdfText(text: string): string[] {
   return [text];
 }
 
+const DOCUMENT_EMBEDDING_CHUNK_TOKEN_LIMIT = 300;
+
 function chunkDocumentPages(sourcePath: string, pages: string[], startOrdinal: number): Array<Omit<ChatDocumentSearchEntry, "resultId" | "score">> {
   const chunks: Array<Omit<ChatDocumentSearchEntry, "resultId" | "score">> = [];
   for (const [pageIndex, page] of pages.entries()) {
     const paragraphs = page.split(/\n{2,}/g).map((item) => item.trim()).filter(Boolean);
     let buffer = "";
     for (const paragraph of paragraphs.length > 0 ? paragraphs : [page]) {
-      const next = buffer ? `${buffer}\n\n${paragraph}` : paragraph;
-      if (estimatedTextTokens(next) > 900 && buffer) {
-        chunks.push(documentChunk(sourcePath, buffer, pageIndex + 1, startOrdinal + chunks.length));
-        buffer = paragraph;
-      } else {
-        buffer = next;
+      for (const segment of splitDocumentTextForEmbedding(paragraph, DOCUMENT_EMBEDDING_CHUNK_TOKEN_LIMIT)) {
+        const next = buffer ? `${buffer}\n\n${segment}` : segment;
+        if (estimatedTextTokens(next) > DOCUMENT_EMBEDDING_CHUNK_TOKEN_LIMIT && buffer) {
+          chunks.push(documentChunk(sourcePath, buffer, pageIndex + 1, startOrdinal + chunks.length));
+          buffer = segment;
+        } else {
+          buffer = next;
+        }
       }
     }
     if (buffer.trim()) {
@@ -1983,6 +1997,64 @@ function chunkDocumentPages(sourcePath: string, pages: string[], startOrdinal: n
     }
   }
   return chunks;
+}
+
+function splitDocumentTextForEmbedding(text: string, maxTokens: number): string[] {
+  const trimmed = text.trim();
+  if (!trimmed) {
+    return [];
+  }
+  if (estimatedTextTokens(trimmed) <= maxTokens) {
+    return [trimmed];
+  }
+  const sentences = trimmed.split(/(?<=[.!?])\s+|\n+/g).map((item) => item.trim()).filter(Boolean);
+  const units = sentences.length > 1 ? sentences : splitLongDocumentTextByWords(trimmed, maxTokens);
+  const segments: string[] = [];
+  let buffer = "";
+  for (const unit of units) {
+    if (estimatedTextTokens(unit) > maxTokens) {
+      if (buffer) {
+        segments.push(buffer);
+        buffer = "";
+      }
+      segments.push(...splitLongDocumentTextByWords(unit, maxTokens));
+      continue;
+    }
+    const next = buffer ? `${buffer} ${unit}` : unit;
+    if (estimatedTextTokens(next) > maxTokens && buffer) {
+      segments.push(buffer);
+      buffer = unit;
+    } else {
+      buffer = next;
+    }
+  }
+  if (buffer) {
+    segments.push(buffer);
+  }
+  return segments;
+}
+
+function splitLongDocumentTextByWords(text: string, maxTokens: number): string[] {
+  const maxCharacters = Math.max(256, maxTokens * 3);
+  const segments: string[] = [];
+  let buffer = "";
+  for (const word of text.split(/\s+/g).filter(Boolean)) {
+    const next = buffer ? `${buffer} ${word}` : word;
+    if (next.length > maxCharacters && buffer) {
+      segments.push(buffer);
+      buffer = word;
+    } else {
+      buffer = next;
+    }
+    while (buffer.length > maxCharacters) {
+      segments.push(buffer.slice(0, maxCharacters));
+      buffer = buffer.slice(maxCharacters);
+    }
+  }
+  if (buffer) {
+    segments.push(buffer);
+  }
+  return segments;
 }
 
 function documentChunk(sourcePath: string, text: string, page: number, ordinal: number): Omit<ChatDocumentSearchEntry, "resultId" | "score"> {
@@ -2001,6 +2073,10 @@ function documentChunk(sourcePath: string, text: string, page: number, ordinal: 
 
 function estimatedTextTokens(text: string): number {
   return Math.max(1, Math.ceil(text.length / 4));
+}
+
+function documentAnalysisEmbeddingContextSize(): number {
+  return 2048;
 }
 
 function latestUserText(messages: ChatState["messages"]): string {

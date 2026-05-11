@@ -132,6 +132,8 @@ type ChatDocumentChunkRow = ChatDocumentSearchEntry & {
   embedding?: number[];
 };
 
+const MIN_DOCUMENT_VECTOR_SCORE = 0.6;
+
 const DEFAULT_RUNTIME_SETTINGS: ChatRuntimeSettings = {
   nCtx: 32768,
   nGpuLayers: -1,
@@ -1277,51 +1279,6 @@ export class ChatStore {
     return row ? documentIndexFromRow(row) : undefined;
   }
 
-  searchDocumentIndex(documentIndexId: string, query: string, topK = 8, budgetTokens = 6000): ChatDocumentSearchEntry[] {
-    const index = this.documentIndex(documentIndexId);
-    if (!index) {
-      throw new Error("Selected document index was not found.");
-    }
-    if (index.state !== "ready") {
-      throw new Error("Selected document index is not ready yet.");
-    }
-    const terms = tokenizeSearchQuery(query);
-    if (terms.length === 0) {
-      return [];
-    }
-    const rows = this.documentIndexChunks(documentIndexId);
-    let usedTokens = 0;
-    return rows
-      .map((row) => ({ row, score: scoreDocumentChunk(row.text, terms) }))
-      .filter((item) => item.score > 0)
-      .sort((a, b) => b.score - a.score || a.row.ordinalStart - b.row.ordinalStart)
-      .slice(0, Math.max(1, topK))
-      .filter((item) => {
-        if (usedTokens >= budgetTokens) {
-          return false;
-        }
-        usedTokens += item.row.tokenCount;
-        return true;
-      })
-      .map((item, index) => ({
-        chunkId: item.row.chunkId,
-        resultId: `r${index + 1}`,
-        sourceId: (item.row.sourceId ?? path.basename(item.row.sourcePath)) || item.row.sourcePath,
-        sourceTitle: item.row.sourceTitle,
-        sourcePath: item.row.sourcePath,
-        sectionLabel: item.row.sectionLabel ?? `page ${item.row.pageStart}${item.row.pageEnd !== item.row.pageStart ? `-${item.row.pageEnd}` : ""}`,
-        candidateCount: Math.max(1, Math.floor(item.score)),
-        truncated: usedTokens >= budgetTokens,
-        pageStart: item.row.pageStart,
-        pageEnd: item.row.pageEnd,
-        text: item.row.text,
-        tokenCount: item.row.tokenCount,
-        score: item.score,
-        ordinalStart: item.row.ordinalStart,
-        ordinalEnd: item.row.ordinalEnd
-      }));
-  }
-
   searchDocumentIndexByVector(documentIndexId: string, queryEmbedding: number[], topK = 8, budgetTokens = 6000): ChatDocumentSearchEntry[] {
     const index = this.documentIndex(documentIndexId);
     if (!index) {
@@ -1339,7 +1296,7 @@ export class ChatStore {
     let usedTokens = 0;
     return rows
       .map((row) => ({ row, score: cosineSimilarity(normalizedQuery, row.embedding ?? []) }))
-      .filter((item) => item.score >= 0.25)
+      .filter((item) => item.score >= MIN_DOCUMENT_VECTOR_SCORE)
       .sort((a, b) => b.score - a.score || a.row.ordinalStart - b.row.ordinalStart)
       .slice(0, Math.max(1, topK))
       .filter((item) => {
@@ -2650,82 +2607,6 @@ function documentIndexFromRow(row: ChatDocumentIndexRow): ChatDocumentIndex {
   };
 }
 
-const DOCUMENT_SEARCH_STOPWORDS = new Set([
-  "a",
-  "an",
-  "and",
-  "are",
-  "as",
-  "at",
-  "be",
-  "but",
-  "by",
-  "for",
-  "from",
-  "how",
-  "in",
-  "into",
-  "is",
-  "it",
-  "me",
-  "of",
-  "on",
-  "or",
-  "s",
-  "sth",
-  "tell",
-  "that",
-  "the",
-  "their",
-  "them",
-  "this",
-  "to",
-  "what",
-  "when",
-  "where",
-  "which",
-  "with",
-  "you",
-  "your"
-]);
-
-function tokenizeSearchQuery(value: string): string[] {
-  const terms = value.toLowerCase().match(/[a-z0-9_]{2,}/g) ?? [];
-  const normalized = terms
-    .map(normalizeSearchTerm)
-    .filter((term) => term.length >= 2 && !DOCUMENT_SEARCH_STOPWORDS.has(term));
-  return Array.from(new Set(normalized)).slice(0, 16);
-}
-
-function normalizeSearchTerm(value: string): string {
-  if (value.length > 4 && value.endsWith("ies")) {
-    return `${value.slice(0, -3)}y`;
-  }
-  if (value.length > 3 && value.endsWith("s")) {
-    return value.slice(0, -1);
-  }
-  return value;
-}
-
-function scoreDocumentChunk(text: string, terms: string[]): number {
-  const lower = text.toLowerCase();
-  let score = 0;
-  for (const term of terms) {
-    const pattern = new RegExp(`\\b(?:${searchTermVariants(term).map(escapeRegExp).join("|")})\\b`, "gu");
-    const matches = lower.match(pattern);
-    if (matches) {
-      score += matches.length * 3;
-      continue;
-    }
-    let offset = lower.indexOf(term);
-    while (offset >= 0) {
-      score += 1;
-      offset = lower.indexOf(term, offset + term.length);
-    }
-  }
-  return score / Math.max(1, Math.sqrt(text.length / 1000));
-}
-
 function normalizeEmbedding(vector: number[]): number[] {
   let norm = 0;
   for (const value of vector) {
@@ -2759,20 +2640,6 @@ function parseEmbeddingJson(value: string | null): number[] | undefined {
   }
   const parsed = parseJsonArray<number>(value, []);
   return parsed.length > 0 ? normalizeEmbedding(parsed.map(Number)) : undefined;
-}
-
-function searchTermVariants(term: string): string[] {
-  const variants = [term];
-  if (term.length > 3 && term.endsWith("y")) {
-    variants.push(`${term.slice(0, -1)}ies`);
-  } else if (term.length > 3) {
-    variants.push(`${term}s`);
-  }
-  return variants;
-}
-
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function normalizeCodexApprovalMode(value: unknown, fallback: ChatCodexApprovalMode): ChatCodexApprovalMode {
