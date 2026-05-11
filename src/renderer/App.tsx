@@ -1915,16 +1915,25 @@ function WorkspaceSurface({ state, windowId, workspace }: { state: UnitState; wi
         />
       ) : (
         <div className="workspace-empty" data-testid="workspace-empty">
-          <button
-            className="empty-spawn-button"
-            type="button"
-            onClick={() => {
-              void window.unitApi.applets.createApplet({ workspaceId: workspace.id, kind: "terminal" });
-            }}
-          >
-            <SquareTerminal size={17} />
-            <span>New terminal</span>
-          </button>
+          <div className="empty-spawn-grid" aria-label="Create applet">
+            {appletCatalog.map((item) => {
+              const Icon = iconByKind[item.kind];
+              const label = item.kind === "wslTerminal" ? "New WSL terminal" : `New ${item.label.toLowerCase()}`;
+              return (
+                <button
+                  key={item.kind}
+                  className="empty-spawn-button"
+                  type="button"
+                  onClick={() => {
+                    void window.unitApi.applets.createApplet({ workspaceId: workspace.id, kind: item.kind });
+                  }}
+                >
+                  <Icon size={17} />
+                  <span>{label}</span>
+                </button>
+              );
+            })}
+          </div>
         </div>
       )}
       {appletDrag?.target ? (
@@ -4178,7 +4187,9 @@ function ChatSurface() {
     ? chatState.messages.filter((message) => message.threadId === chatState.selectedThreadId)
     : [];
   const activeRuntimeSettings = selectedThread?.runtimeSettings ?? chatState?.runtimeSettings;
-  const activeBuiltinModelId = selectedThread?.builtinModelId || chatState?.selectedModelId || "";
+  const activeBuiltinModelId = selectedThread?.providerMode === "builtin" && selectedThread.builtinAgenticFramework === "opencode"
+    ? selectedThread.builtinModelId
+    : selectedThread?.builtinModelId || chatState?.selectedModelId || "";
   const selectedModel = chatState?.models.find((model) => model.id === activeBuiltinModelId) ?? null;
   const threadUsesCodex = selectedThread?.providerMode === "codex";
   const selectedCodexModel = threadUsesCodex
@@ -4188,9 +4199,15 @@ function ChatSurface() {
     ? chatState?.settingsPresets.find((preset) => preset.id === selectedThread.selectedSettingsPresetId) ?? chatState?.settingsPresets[0] ?? null
     : null;
   const selectedBuiltinFramework = selectedThread?.builtinAgenticFramework ?? selectedSettingsPreset?.builtinAgenticFramework ?? "chat";
+  const selectableBuiltinModels = selectedBuiltinFramework === "opencode"
+    ? chatState?.models.filter((model) => model.providerId !== "remote") ?? []
+    : chatState?.models ?? [];
+  const selectableBuiltinModelId = selectableBuiltinModels.some((model) => model.id === activeBuiltinModelId) ? activeBuiltinModelId : "";
   const running = chatState?.generation.status === "running";
   const submitBlockedReason = !selectedThread
     ? "Create a new thread to start."
+    : !threadUsesCodex && selectedBuiltinFramework === "opencode" && selectedModel?.providerId === "remote"
+      ? "Select a local GGUF model before using OpenCode."
     : !threadUsesCodex && !selectedModel
       ? "Add and select a local GGUF model before sending."
       : "";
@@ -4214,7 +4231,11 @@ function ChatSurface() {
   const permissionButtonLabel = selectedThread && fallbackRuntimeSettings
     ? (threadUsesCodex ? permissionLabel(codexAccessModeForApprovalMode(selectedThread.codexApprovalMode)) : permissionLabel(fallbackRuntimeSettings.permissionMode))
     : "Full access";
+  const permissionButtonTone = permissionButtonLabel === "Full access" ? "full-access" : "default-access";
+  const PermissionButtonIcon = permissionButtonLabel === "Full access" ? LockOpen : ShieldCheck;
   const settingsPresetButtonLabel = selectedThread ? selectedSettingsPreset?.label ?? "Custom" : "Default";
+  const settingsPresetButtonIconName = selectedSettingsPreset?.iconName ?? "";
+  const settingsPresetButtonProviderMode = selectedSettingsPreset?.providerMode ?? selectedThread?.providerMode ?? "builtin";
   const documentButtonLabel = selectedDocumentIndex?.title ?? "Documents";
   const documentStatusLabel = selectedDocumentIndex ? documentIndexStatusLabel(selectedDocumentIndex) : "No document group selected";
   const modelButtonLabel = threadUsesCodex ? selectedCodexModel?.label ?? "Codex model" : selectedModel?.label ?? "No model";
@@ -5352,7 +5373,7 @@ function ChatSurface() {
                 aria-label="Model settings"
                 onPointerDown={(event) => openChatMenu(event, { kind: "settings" })}
               >
-                <SlidersHorizontal size={15} />
+                <SettingsPresetIcon iconName={settingsPresetButtonIconName} providerMode={settingsPresetButtonProviderMode} size={15} />
                 <span>{settingsPresetButtonLabel}</span>
                 <ChevronRight className="chat-model-caret" size={12} />
               </button>
@@ -5377,13 +5398,13 @@ function ChatSurface() {
               <select
                 className="chat-hidden-select"
                 aria-label="Local chat model"
-                value={activeBuiltinModelId}
+                value={selectableBuiltinModelId}
                 onChange={(event) => void runChatAction(() => window.unitApi.chat.selectModel({ modelId: event.currentTarget.value }))}
               >
                 <option value="" disabled>
                   No model
                 </option>
-                {chatState.models.map((model) => (
+                {selectableBuiltinModels.map((model) => (
                   <option key={model.id} value={model.id}>
                     {model.label}
                   </option>
@@ -5440,11 +5461,11 @@ function ChatSurface() {
           <div className="chat-composer-footer">
             <div className="chat-footer-left-cluster">
               <button
-                className="chat-footer-slot chat-footer-button"
+                className={["chat-footer-slot chat-footer-button", `permission-${permissionButtonTone}`].join(" ")}
                 type="button"
                 onPointerDown={(event) => openChatMenu(event, { kind: "permissions" })}
               >
-                <LockOpen size={13} />
+                <PermissionButtonIcon size={13} />
                 <span>{permissionButtonLabel}</span>
                 <ChevronRight className="chat-model-caret" size={12} />
               </button>
@@ -5577,7 +5598,13 @@ function ChatDropUpMenu({
     ? chatState.codexModels.find((model) => model.id === activeThread.codexModelId) ?? chatState.codexModels.find((model) => model.isDefault) ?? null
     : null;
   const activeRuntimeSettings = activeThread?.runtimeSettings ?? chatState.runtimeSettings;
-  const activeBuiltinModelId = activeThread?.builtinModelId || chatState.selectedModelId;
+  const activeBuiltinModelId = activeThread?.providerMode === "builtin" && activeThread.builtinAgenticFramework === "opencode"
+    ? activeThread.builtinModelId
+    : activeThread?.builtinModelId || chatState.selectedModelId;
+  const activeBuiltinFramework = activeThread?.builtinAgenticFramework ?? "chat";
+  const activeBuiltinModels = activeBuiltinFramework === "opencode"
+    ? chatState.models.filter((model) => model.providerId !== "remote")
+    : chatState.models;
   const activePermissionMode = activeRuntimeSettings.permissionMode;
   const activeAccessMode = activeUsesCodex && activeThread ? codexAccessModeForApprovalMode(activeThread.codexApprovalMode) : activePermissionMode;
   const activeReasoningEffort = activeUsesCodex ? activeThread?.codexReasoningEffort : activeRuntimeSettings.reasoningEffort;
@@ -5656,8 +5683,8 @@ function ChatDropUpMenu({
         ) : (
           <>
             <div className="chat-dropup-section-label">Built-in</div>
-            {chatState.models.length === 0 ? <div className="chat-dropup-empty">No models available</div> : null}
-            {chatState.models.map((model) => (
+            {activeBuiltinModels.length === 0 ? <div className="chat-dropup-empty">{activeBuiltinFramework === "opencode" ? "No local models available" : "No models available"}</div> : null}
+            {activeBuiltinModels.map((model) => (
               <button
                 className={model.id === activeBuiltinModelId ? "selected" : ""}
                 key={model.id}
@@ -5667,7 +5694,7 @@ function ChatDropUpMenu({
                 onClick={() => void onRun(() => window.unitApi.chat.selectModel({ modelId: model.id }))}
               >
                 <Bot size={14} />
-                <span>{model.label}  [Local GGUF]</span>
+                <span>{model.label}  [{model.providerId === "remote" ? "Remote" : "Local GGUF"}]</span>
               </button>
             ))}
             <div className="chat-dropup-divider" />
@@ -5785,32 +5812,35 @@ function ChatDropUpMenu({
         </>
       ) : null}
       {menu.kind === "permissions" ? (
-        CHAT_PERMISSION_OPTIONS.map((option) => (
-          <button
-            className={option.id === activeAccessMode ? "selected" : ""}
-            key={option.id}
-            type="button"
-            role="menuitemradio"
-            aria-checked={option.id === activeAccessMode}
-            onClick={() => {
-              if (activeUsesCodex && activeThread) {
-                void onRun(() => window.unitApi.chat.updateThreadSettings({
-                  threadId: activeThread.id,
-                  permissionMode: option.id,
-                  codexApprovalMode: codexApprovalModeForAccessMode(option.id)
-                }));
-              } else {
-                void onRun(async () => {
-                  await window.unitApi.chat.updateRuntimeSettings({ settings: { permissionMode: option.id } });
-                  return window.unitApi.chat.bootstrap();
-                });
-              }
-            }}
-          >
-            <ShieldCheck size={14} />
-            <span>{option.label}</span>
-          </button>
-        ))
+        CHAT_PERMISSION_OPTIONS.map((option) => {
+          const Icon = option.id === "full_access" ? LockOpen : ShieldCheck;
+          return (
+            <button
+              className={option.id === activeAccessMode ? "selected" : ""}
+              key={option.id}
+              type="button"
+              role="menuitemradio"
+              aria-checked={option.id === activeAccessMode}
+              onClick={() => {
+                if (activeUsesCodex && activeThread) {
+                  void onRun(() => window.unitApi.chat.updateThreadSettings({
+                    threadId: activeThread.id,
+                    permissionMode: option.id,
+                    codexApprovalMode: codexApprovalModeForAccessMode(option.id)
+                  }));
+                } else {
+                  void onRun(async () => {
+                    await window.unitApi.chat.updateRuntimeSettings({ settings: { permissionMode: option.id } });
+                    return window.unitApi.chat.bootstrap();
+                  });
+                }
+              }}
+            >
+              <Icon size={14} />
+              <span>{option.label}</span>
+            </button>
+          );
+        })
       ) : null}
       {menu.kind === "branch" ? (
         gitState?.status === "ready" ? (
@@ -6030,6 +6060,16 @@ function ChatDialog({
     setDocumentIndexPaths(initialDocumentIndexPaths(dialog, state));
   }, [dialog, state]);
 
+  useEffect(() => {
+    if (presetBuiltinFramework !== "opencode") {
+      return;
+    }
+    const selectedModel = state.models.find((model) => model.id === threadBuiltinModelId);
+    if (selectedModel?.providerId === "remote") {
+      setThreadBuiltinModelId("");
+    }
+  }, [presetBuiltinFramework, state.models, threadBuiltinModelId]);
+
   const updateUsageIndicatorPreference = (
     indicatorId: ChatUsageIndicatorId,
     patch: Partial<ChatAppSettings["usageIndicatorPreferences"][ChatUsageIndicatorId]>
@@ -6044,6 +6084,16 @@ function ChatDialog({
         }
       }
     });
+  };
+  const applyBuiltinFramework = (value: ChatBuiltinAgenticFramework) => {
+    setPresetBuiltinFramework(value);
+    if (value !== "opencode") {
+      return;
+    }
+    const selectedModel = state.models.find((model) => model.id === threadBuiltinModelId);
+    if (selectedModel?.providerId === "remote") {
+      setThreadBuiltinModelId("");
+    }
   };
 
   if (!dialog) {
@@ -6217,6 +6267,9 @@ function ChatDialog({
   }
   if (dialog.kind === "settings-preset") {
     const preset = dialog.presetId ? state.settingsPresets.find((candidate) => candidate.id === dialog.presetId) : null;
+    const builtinModelsForHarness = presetBuiltinFramework === "opencode"
+      ? state.models.filter((model) => model.providerId !== "remote")
+      : state.models;
     return (
       <div className="chat-dialog-backdrop" role="presentation" onPointerDown={onClose}>
         <form
@@ -6275,19 +6328,17 @@ function ChatDialog({
               <ChatSettingSelect
                 label="Provider"
                 value={threadProviderMode}
-                options={[{ value: "builtin", label: "Local model" }, { value: "codex", label: "Codex" }]}
+                options={[{ value: "builtin", label: "Built-in model" }, { value: "codex", label: "Codex" }]}
                 onChange={(value) => setThreadProviderMode(value as ChatProviderMode)}
               />
             </section>
             <section className="chat-settings-section">
               <h3>Harness</h3>
               {threadProviderMode === "codex" ? (
-                <ChatSettingSelect
-                  label="Harness"
-                  value="codex"
-                  options={[{ value: "codex", label: "Codex" }]}
-                  onChange={() => undefined}
-                />
+                <label>
+                  <span>Harness</span>
+                  <input readOnly value="Codex" />
+                </label>
               ) : (
                 <ChatSettingSelect
                   label="Harness"
@@ -6297,7 +6348,7 @@ function ChatDialog({
                     { value: "document_analysis", label: "Document analysis" },
                     { value: "opencode", label: "OpenCode" }
                   ]}
-                  onChange={(value) => setPresetBuiltinFramework(value as ChatBuiltinAgenticFramework)}
+                  onChange={(value) => applyBuiltinFramework(value as ChatBuiltinAgenticFramework)}
                 />
               )}
             </section>
@@ -6337,9 +6388,9 @@ function ChatDialog({
               <ChatSettingSelect
                 label="Model"
                 value={threadBuiltinModelId}
-                options={state.models.length === 0
+                options={builtinModelsForHarness.length === 0
                   ? [{ value: "", label: "No local model available", disabled: true }]
-                  : state.models.map((model) => ({ value: model.id, label: `${model.label}  [${model.providerId === "remote" ? "Remote" : "Local GGUF"}]` }))}
+                  : builtinModelsForHarness.map((model) => ({ value: model.id, label: `${model.label}  [${model.providerId === "remote" ? "Remote" : "Local GGUF"}]` }))}
                 onChange={setThreadBuiltinModelId}
               />
               {presetBuiltinFramework === "document_analysis" ? (
@@ -6649,6 +6700,14 @@ function ChatDialog({
   }
   if (dialog.kind === "thread-settings") {
     const thread = state.threads.find((item) => item.id === dialog.threadId);
+    const builtinModelsForHarness = presetBuiltinFramework === "opencode"
+      ? state.models.filter((model) => model.providerId !== "remote")
+      : state.models;
+    const workspaceHint = threadProviderMode === "codex"
+      ? "Codex will run commands in this directory. Confirm it is the intended workspace before starting agent work."
+      : presetBuiltinFramework === "opencode"
+        ? "OpenCode shell tools will run in this directory."
+        : "Local model requests use this project directory for project context.";
     return (
       <div className="chat-dialog-backdrop" role="presentation" onPointerDown={onClose}>
         <form
@@ -6696,16 +6755,24 @@ function ChatDialog({
                 <input name="thread-title" value={title || thread?.title || ""} onChange={(event) => setTitle(event.currentTarget.value)} />
               </label>
               <ChatSettingSelect
-                label="Runtime"
-                ariaLabel="Thread runtime"
+                label="Provider"
+                ariaLabel="Thread provider"
                 value={threadProviderMode}
-                options={[{ value: "builtin", label: "Built-in model" }, { value: "codex", label: "Codex agent" }]}
+                options={[{ value: "builtin", label: "Built-in model" }, { value: "codex", label: "Codex" }]}
                 onChange={(value) => setThreadProviderMode(value as ChatProviderMode)}
               />
             </section>
             {threadProviderMode === "codex" ? (
+            <>
             <section className="chat-settings-section">
-              <h3>Codex Agent</h3>
+              <h3>Harness</h3>
+              <label>
+                <span>Harness</span>
+                <input readOnly value="Codex" />
+              </label>
+            </section>
+            <section className="chat-settings-section">
+              <h3>Defaults</h3>
               <div className="chat-settings-row">
                 <ChatSettingSelect
                   label="Model"
@@ -6746,30 +6813,50 @@ function ChatDialog({
                 </label>
               </div>
             </section>
+            </>
             ) : (
+            <>
             <section className="chat-settings-section">
-              <h3>Runtime Settings</h3>
+              <h3>Harness</h3>
+              <ChatSettingSelect
+                label="Harness"
+                ariaLabel="Thread harness"
+                value={presetBuiltinFramework}
+                options={[
+                  { value: "chat", label: "Chat" },
+                  { value: "document_analysis", label: "Document analysis" },
+                  { value: "opencode", label: "OpenCode" }
+                ]}
+                onChange={(value) => applyBuiltinFramework(value as ChatBuiltinAgenticFramework)}
+              />
+              {presetBuiltinFramework === "document_analysis" ? (
+              <label className="chat-embedding-field">
+                <span>Embedding Model</span>
+                <div className="chat-directory-row">
+                  <input placeholder="Path to embedding GGUF" value={presetEmbeddingModelPath} onChange={(event) => setPresetEmbeddingModelPath(event.currentTarget.value)} />
+                  <button type="button" onClick={() => {
+                    void window.unitApi.fileSystem.selectFiles({ kind: "file", multiple: false }).then((result) => {
+                      if (result.paths[0]) {
+                        setPresetEmbeddingModelPath(result.paths[0]);
+                      }
+                    });
+                  }}>Browse...</button>
+                </div>
+              </label>
+              ) : null}
+            </section>
+            <section className="chat-settings-section">
+              <h3>Defaults</h3>
               <ChatSettingSelect
                 label="Model"
                 ariaLabel="Thread built-in model"
                 value={threadBuiltinModelId}
-                options={state.models.length === 0
+                options={builtinModelsForHarness.length === 0
                   ? [{ value: "", label: "No built-in model available", disabled: true }]
-                  : state.models.map((model) => ({ value: model.id, label: `${model.label}  [Local GGUF]` }))}
+                  : builtinModelsForHarness.map((model) => ({ value: model.id, label: `${model.label}  [${model.providerId === "remote" ? "Remote" : "Local GGUF"}]` }))}
                 onChange={setThreadBuiltinModelId}
               />
               <div className="chat-settings-row">
-                <ChatSettingSelect
-                  label="Harness"
-                  ariaLabel="Thread harness"
-                  value={presetBuiltinFramework}
-                  options={[
-                    { value: "chat", label: "Chat" },
-                    { value: "document_analysis", label: "Document analysis" },
-                    { value: "opencode", label: "OpenCode" }
-                  ]}
-                  onChange={(value) => setPresetBuiltinFramework(value as ChatBuiltinAgenticFramework)}
-                />
                 <ChatSettingSelect
                   label="Context Window"
                   ariaLabel="Thread context window"
@@ -6816,6 +6903,10 @@ function ChatDialog({
                   <span>Repeat Penalty</span>
                   <input value={settings.repeatPenalty} onChange={(event) => setSettings({ ...settings, repeatPenalty: event.currentTarget.value })} />
                 </label>
+                <label>
+                  <span>Max Tokens</span>
+                  <input value={settings.maxTokens} onChange={(event) => setSettings({ ...settings, maxTokens: event.currentTarget.value })} />
+                </label>
               </div>
               <div className="chat-settings-row chat-settings-row-four">
                 <label>
@@ -6835,11 +6926,12 @@ function ChatDialog({
                   <input value={settings.trimAmountPercent} onChange={(event) => setSettings({ ...settings, trimAmountPercent: event.currentTarget.value })} />
                 </label>
               </div>
-              <section className="chat-settings-section chat-nested-settings-section">
-                <h3>System Prompt</h3>
-                <textarea className="chat-settings-prompt" value={settings.systemPrompt} onChange={(event) => setSettings({ ...settings, systemPrompt: event.currentTarget.value })} />
-              </section>
             </section>
+            <section className="chat-settings-section">
+              <h3>System Prompt</h3>
+              <textarea className="chat-settings-prompt" value={settings.systemPrompt} onChange={(event) => setSettings({ ...settings, systemPrompt: event.currentTarget.value })} />
+            </section>
+            </>
             )}
             <section className="chat-settings-section">
               <h3>Workspace</h3>
@@ -6851,7 +6943,7 @@ function ChatDialog({
                 <span>Effective Working Directory</span>
                 <input readOnly placeholder="No project directory set" value={state.projects.find((project) => project.id === thread?.projectId)?.directory ?? ""} />
               </label>
-              <p className="chat-settings-hint">Codex will run commands in this directory. Confirm it is the intended workspace before starting agent work.</p>
+              <p className="chat-settings-hint">{workspaceHint}</p>
             </section>
           </div>
           <div className="chat-dialog-actions chat-dialog-actions-split">
@@ -7099,11 +7191,23 @@ function initialThreadProviderMode(dialog: ChatDialogState, state: ChatState): C
 }
 
 function initialThreadBuiltinModelId(dialog: ChatDialogState, state: ChatState) {
+  const providerMode = initialThreadProviderMode(dialog, state);
+  const builtinFramework = initialSettingsPresetBuiltinFramework(dialog, state);
   if (dialog?.kind === "thread-settings") {
-    return state.threads.find((thread) => thread.id === dialog.threadId)?.builtinModelId || state.selectedModelId || state.models[0]?.id || "";
+    const explicitModelId = state.threads.find((thread) => thread.id === dialog.threadId)?.builtinModelId ?? "";
+    if (providerMode === "builtin" && builtinFramework === "opencode") {
+      const explicitModel = state.models.find((model) => model.id === explicitModelId);
+      return explicitModel && explicitModel.providerId !== "remote" ? explicitModelId : "";
+    }
+    return explicitModelId || state.selectedModelId || state.models[0]?.id || "";
   }
   if (dialog?.kind === "settings-preset" && dialog.presetId) {
-    return state.settingsPresets.find((preset) => preset.id === dialog.presetId)?.builtinModelId || state.selectedModelId || state.models[0]?.id || "";
+    const explicitModelId = state.settingsPresets.find((preset) => preset.id === dialog.presetId)?.builtinModelId ?? "";
+    if (providerMode === "builtin" && builtinFramework === "opencode") {
+      const explicitModel = state.models.find((model) => model.id === explicitModelId);
+      return explicitModel && explicitModel.providerId !== "remote" ? explicitModelId : "";
+    }
+    return explicitModelId || state.selectedModelId || state.models[0]?.id || "";
   }
   return state.selectedModelId || state.models[0]?.id || "";
 }
@@ -7268,6 +7372,7 @@ function ChatMessageBubble({
   const standaloneReasoning = message.role === "assistant" && message.reasoning
     ? remainingAssistantReasoning(message.reasoning, timelineReasoning)
     : "";
+  const standaloneReasoningStatus = message.status === "streaming" && !displayContent.trim() ? message.status : "complete";
   const codexTimelineOwnsAssistantContent = message.role === "assistant" && message.timelineBlocks?.some((block) => block.kind === "assistant_message");
   const shouldRenderMessageBody = message.role === "user" || (!codexTimelineOwnsAssistantContent && Boolean(html));
   const hasVisibleAssistantContent = Boolean(message.timelineBlocks?.length || standaloneReasoning || shouldRenderMessageBody);
@@ -7300,7 +7405,7 @@ function ChatMessageBubble({
       {message.role === "assistant" && standaloneReasoning ? (
         <ChatReasoningDisclosure
           disclosureId={`${message.id}-reasoning`}
-          status={message.status}
+          status={standaloneReasoningStatus}
           reasoning={standaloneReasoning}
           initiallyExpanded={reasoningInitialExpansion(message)}
           autoExpandDisclosures={autoExpandDisclosures}

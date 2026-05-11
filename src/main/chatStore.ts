@@ -89,6 +89,7 @@ type ChatDocumentIndexRow = {
   project_id: string;
   title: string;
   source_path: string;
+  embedding_model_path: string | null;
   state: string;
   progress: number | null;
   message: string | null;
@@ -121,6 +122,14 @@ export type ChatDocumentSearchEntry = {
   score: number;
   ordinalStart: number;
   ordinalEnd: number;
+};
+
+type ChatDocumentChunkInput = Omit<ChatDocumentSearchEntry, "resultId" | "score"> & {
+  embedding?: number[];
+};
+
+type ChatDocumentChunkRow = ChatDocumentSearchEntry & {
+  embedding?: number[];
 };
 
 const DEFAULT_RUNTIME_SETTINGS: ChatRuntimeSettings = {
@@ -310,7 +319,7 @@ export class ChatStore {
     const remoteModels = parseJsonArray<ChatModel>(this.setting("remote_models_json"), []).map(normalizeRemoteModel).filter((model) => model.id);
     const documentIndexes = (this.db
       .prepare(
-        `SELECT id, project_id, title, source_path, state,
+        `SELECT id, project_id, title, source_path, COALESCE(embedding_model_path, '') AS embedding_model_path, state,
                 COALESCE(progress, 0) AS progress,
                 COALESCE(message, '') AS message,
                 created_at, updated_at
@@ -612,7 +621,7 @@ export class ChatStore {
       this.setSettingInTransaction("selected_model_id", model.id);
       const threadId = this.setting("selected_thread_id");
       if (threadId) {
-        this.db.prepare("UPDATE chat_threads SET builtin_model_id = ?, updated_at = ? WHERE id = ?").run(model.id, now, threadId);
+        this.db.prepare("UPDATE chat_threads SET selected_settings_preset_id = ?, builtin_model_id = ?, updated_at = ? WHERE id = ?").run(DEFAULT_SETTINGS_PRESET_ID, model.id, now, threadId);
       }
       this.db.exec("COMMIT");
     } catch (error) {
@@ -632,7 +641,7 @@ export class ChatStore {
     try {
       this.setSettingInTransaction("selected_model_id", model.id);
       if (threadId) {
-        this.db.prepare("UPDATE chat_threads SET builtin_model_id = ?, updated_at = ? WHERE id = ?").run(model.id, timestamp(), threadId);
+        this.db.prepare("UPDATE chat_threads SET selected_settings_preset_id = ?, builtin_model_id = ?, updated_at = ? WHERE id = ?").run(DEFAULT_SETTINGS_PRESET_ID, model.id, timestamp(), threadId);
       }
       this.db.exec("COMMIT");
     } catch (error) {
@@ -869,7 +878,7 @@ export class ChatStore {
     try {
       this.setSettingInTransaction("runtime_settings_json", JSON.stringify(nextSettings));
       if (selectedThreadId) {
-        this.db.prepare("UPDATE chat_threads SET runtime_settings_json = ?, updated_at = ? WHERE id = ?").run(JSON.stringify(nextSettings), timestamp(), selectedThreadId);
+        this.db.prepare("UPDATE chat_threads SET selected_settings_preset_id = ?, runtime_settings_json = ?, updated_at = ? WHERE id = ?").run(DEFAULT_SETTINGS_PRESET_ID, JSON.stringify(nextSettings), timestamp(), selectedThreadId);
       }
       this.db.exec("COMMIT");
     } catch (error) {
@@ -886,8 +895,26 @@ export class ChatStore {
     threadId: string,
     settings: Partial<Omit<Pick<ChatThread, "providerMode" | "selectedSettingsPresetId" | "builtinModelId" | "builtinAgenticFramework" | "documentAnalysisEmbeddingModelPath" | "codexModelId" | "codexReasoningEffort" | "permissionMode" | "codexApprovalMode" | "planModeEnabled" | "documentIndexId" | "codexLastSessionId" | "remoteSessionId" | "remoteSlotId" | "remoteSettingsSignature" | "remoteHostIdentity">, never>> & { runtimeSettings?: Partial<ChatRuntimeSettings> }
   ): void {
-    const row = this.db.prepare("SELECT id, project_id, runtime_settings_json FROM chat_threads WHERE id = ?").get(threadId) as
-      | { id: string; project_id: string; runtime_settings_json: string | null }
+    const row = this.db.prepare(
+      `SELECT id, project_id, provider_mode, builtin_model_id, runtime_settings_json, builtin_agentic_framework,
+              document_analysis_embedding_model_path, codex_model_id, codex_reasoning_effort, permission_mode,
+              codex_approval_mode, plan_mode_enabled
+       FROM chat_threads WHERE id = ?`
+    ).get(threadId) as
+      | {
+        id: string;
+        project_id: string;
+        provider_mode: string | null;
+        builtin_model_id: string | null;
+        runtime_settings_json: string | null;
+        builtin_agentic_framework: string | null;
+        document_analysis_embedding_model_path: string | null;
+        codex_model_id: string | null;
+        codex_reasoning_effort: string | null;
+        permission_mode: string | null;
+        codex_approval_mode: string | null;
+        plan_mode_enabled: number | null;
+      }
       | undefined;
     if (!row) {
       throw new Error(`Chat thread does not exist: ${threadId}`);
@@ -898,7 +925,8 @@ export class ChatStore {
     const currentThreadSettings = row.runtime_settings_json
       ? normalizeRuntimeSettings(parseJsonObject(row.runtime_settings_json) as Partial<ChatRuntimeSettings>)
       : this.runtimeSettings();
-    const runtimeSettings = settings.runtimeSettings === undefined ? undefined : JSON.stringify(normalizeRuntimeSettings({ ...currentThreadSettings, ...settings.runtimeSettings }));
+    const runtimeSettingsValue = settings.runtimeSettings === undefined ? undefined : normalizeRuntimeSettings({ ...currentThreadSettings, ...settings.runtimeSettings });
+    const runtimeSettings = runtimeSettingsValue === undefined ? undefined : JSON.stringify(runtimeSettingsValue);
     const builtinAgenticFramework = settings.builtinAgenticFramework ? normalizeBuiltinAgenticFramework(settings.builtinAgenticFramework) : undefined;
     const documentAnalysisEmbeddingModelPath = settings.documentAnalysisEmbeddingModelPath === undefined ? undefined : settings.documentAnalysisEmbeddingModelPath.trim();
     const codexModelId = settings.codexModelId ? normalizeCodexModelId(settings.codexModelId) : undefined;
@@ -908,6 +936,47 @@ export class ChatStore {
     const permissionMode = settings.permissionMode ? normalizePermissionMode(settings.permissionMode, DEFAULT_RUNTIME_SETTINGS.permissionMode) : undefined;
     const codexApprovalMode = settings.codexApprovalMode ? normalizeCodexApprovalMode(settings.codexApprovalMode, "default") : undefined;
     const planModeEnabled = settings.planModeEnabled === undefined ? undefined : (settings.planModeEnabled ? 1 : 0);
+    const currentThread = threadFromRow({
+      id: row.id,
+      project_id: row.project_id,
+      title: "",
+      directory: "",
+      action_buttons_json: null,
+      created_at: "",
+      updated_at: "",
+      provider_mode: row.provider_mode,
+      selected_settings_preset_id: null,
+      builtin_model_id: row.builtin_model_id,
+      runtime_settings_json: row.runtime_settings_json,
+      builtin_agentic_framework: row.builtin_agentic_framework,
+      document_analysis_embedding_model_path: row.document_analysis_embedding_model_path,
+      codex_model_id: row.codex_model_id,
+      codex_reasoning_effort: row.codex_reasoning_effort,
+      permission_mode: row.permission_mode,
+      codex_approval_mode: row.codex_approval_mode,
+      plan_mode_enabled: row.plan_mode_enabled,
+      document_index_id: null,
+      codex_last_session_id: null,
+      remote_session_id: null,
+      remote_slot_id: null,
+      remote_settings_signature: null,
+      remote_host_identity: null,
+      active_context_start_message_index: null,
+      context_revision: null,
+      context_markers_json: null
+    });
+    const selectedSettingsPresetIdUpdate = selectedSettingsPresetId ?? (threadSettingsChangeInvalidatesPreset(currentThread, {
+      providerMode,
+      builtinModelId,
+      runtimeSettings: runtimeSettingsValue,
+      builtinAgenticFramework,
+      documentAnalysisEmbeddingModelPath,
+      codexModelId,
+      codexReasoningEffort,
+      permissionMode,
+      codexApprovalMode,
+      planModeEnabled: planModeEnabled === undefined ? undefined : Boolean(planModeEnabled)
+    }) ? DEFAULT_SETTINGS_PRESET_ID : undefined);
     const documentIndexId = settings.documentIndexId === undefined ? undefined : settings.documentIndexId.trim();
     const codexLastSessionId = settings.codexLastSessionId === undefined ? undefined : settings.codexLastSessionId.trim();
     const remoteSessionId = settings.remoteSessionId === undefined ? undefined : settings.remoteSessionId.trim();
@@ -940,7 +1009,7 @@ export class ChatStore {
                updated_at = ?
            WHERE id = ?`
         )
-        .run(providerMode ?? null, selectedSettingsPresetId ?? null, builtinModelId ?? null, runtimeSettings ?? null, builtinAgenticFramework ?? null, documentAnalysisEmbeddingModelPath ?? null, codexModelId ?? null, codexReasoningEffort ?? null, permissionMode ?? null, codexApprovalMode ?? null, planModeEnabled ?? null, documentIndexId ?? null, codexLastSessionId ?? null, remoteSessionId ?? null, remoteSlotId ?? null, remoteSettingsSignature ?? null, remoteHostIdentity ?? null, now, row.id);
+        .run(providerMode ?? null, selectedSettingsPresetIdUpdate ?? null, builtinModelId ?? null, runtimeSettings ?? null, builtinAgenticFramework ?? null, documentAnalysisEmbeddingModelPath ?? null, codexModelId ?? null, codexReasoningEffort ?? null, permissionMode ?? null, codexApprovalMode ?? null, planModeEnabled ?? null, documentIndexId ?? null, codexLastSessionId ?? null, remoteSessionId ?? null, remoteSlotId ?? null, remoteSettingsSignature ?? null, remoteHostIdentity ?? null, now, row.id);
       this.db.prepare("UPDATE chat_projects SET updated_at = ? WHERE id = ?").run(now, row.project_id);
       this.db.exec("COMMIT");
     } catch (error) {
@@ -1036,7 +1105,7 @@ export class ChatStore {
       .run(DEFAULT_SETTINGS_PRESET_ID, normalizedId);
   }
 
-  createDocumentIndex(projectId: string, title: string, sourcePath: string): ChatDocumentIndex {
+  createDocumentIndex(projectId: string, title: string, sourcePath: string, embeddingModelPath = ""): ChatDocumentIndex {
     const project = this.db.prepare("SELECT id FROM chat_projects WHERE id = ?").get(projectId) as { id: string } | undefined;
     if (!project) {
       throw new Error(`Chat project does not exist: ${projectId}`);
@@ -1061,6 +1130,7 @@ export class ChatStore {
       projectId: project.id,
       title: normalizedTitle,
       sourcePath: normalizedSourcePath,
+      embeddingModelPath: embeddingModelPath.trim(),
       state: "building",
       progress: 0,
       message: "Queued",
@@ -1069,13 +1139,13 @@ export class ChatStore {
     };
     this.db
       .prepare(`INSERT INTO chat_document_indexes
-        (id, project_id, title, source_path, state, progress, message, created_at, updated_at, sort_order)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-      .run(documentIndex.id, documentIndex.projectId, documentIndex.title, documentIndex.sourcePath, documentIndex.state, documentIndex.progress, documentIndex.message, documentIndex.createdAt, documentIndex.updatedAt, this.nextSortOrder("chat_document_indexes"));
+        (id, project_id, title, source_path, embedding_model_path, state, progress, message, created_at, updated_at, sort_order)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(documentIndex.id, documentIndex.projectId, documentIndex.title, documentIndex.sourcePath, documentIndex.embeddingModelPath, documentIndex.state, documentIndex.progress, documentIndex.message, documentIndex.createdAt, documentIndex.updatedAt, this.nextSortOrder("chat_document_indexes"));
     return documentIndex;
   }
 
-  updateDocumentIndex(documentIndexId: string, title: string, sourcePath: string): ChatDocumentIndex {
+  updateDocumentIndex(documentIndexId: string, title: string, sourcePath: string, embeddingModelPath = ""): ChatDocumentIndex {
     const current = this.documentIndex(documentIndexId);
     if (!current) {
       throw new Error(`Document index does not exist: ${documentIndexId}`);
@@ -1097,15 +1167,16 @@ export class ChatStore {
     const now = timestamp();
     this.db
       .prepare(`UPDATE chat_document_indexes
-        SET title = ?, source_path = ?, state = ?, progress = ?, message = ?, updated_at = ?
+        SET title = ?, source_path = ?, embedding_model_path = ?, state = ?, progress = ?, message = ?, updated_at = ?
         WHERE id = ?`)
-      .run(normalizedTitle, normalizedSourcePath, "building", 0, "Queued", now, current.id);
+      .run(normalizedTitle, normalizedSourcePath, embeddingModelPath.trim(), "building", 0, "Queued", now, current.id);
     this.db.prepare("DELETE FROM chat_document_index_chunks WHERE document_index_id = ?").run(current.id);
     this.db.prepare("UPDATE chat_projects SET updated_at = ? WHERE id = ?").run(now, current.projectId);
     return {
       ...current,
       title: normalizedTitle,
       sourcePath: normalizedSourcePath,
+      embeddingModelPath: embeddingModelPath.trim(),
       state: "building",
       progress: 0,
       message: "Queued",
@@ -1140,12 +1211,13 @@ export class ChatStore {
     const now = timestamp();
     this.db
       .prepare(`INSERT INTO chat_document_indexes
-        (id, project_id, title, source_path, state, progress, message, created_at, updated_at, sort_order)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (id, project_id, title, source_path, embedding_model_path, state, progress, message, created_at, updated_at, sort_order)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
           project_id = excluded.project_id,
           title = excluded.title,
           source_path = excluded.source_path,
+          embedding_model_path = excluded.embedding_model_path,
           state = excluded.state,
           progress = excluded.progress,
           message = excluded.message,
@@ -1155,6 +1227,7 @@ export class ChatStore {
         normalizedProjectId,
         normalizeTitle(documentIndex.title, 80) || "Remote document",
         documentIndex.sourcePath,
+        documentIndex.embeddingModelPath ?? "",
         documentIndex.state,
         Math.max(0, Math.min(1, documentIndex.progress)),
         documentIndex.message,
@@ -1170,7 +1243,7 @@ export class ChatStore {
       .run(status.state, Math.max(0, Math.min(1, status.progress)), status.message, now, documentIndexId);
   }
 
-  replaceDocumentIndexChunks(documentIndexId: string, chunks: Array<Omit<ChatDocumentSearchEntry, "resultId" | "score">>): void {
+  replaceDocumentIndexChunks(documentIndexId: string, chunks: ChatDocumentChunkInput[]): void {
     const index = this.db.prepare("SELECT id FROM chat_document_indexes WHERE id = ?").get(documentIndexId) as { id: string } | undefined;
     if (!index) {
       throw new Error(`Document index does not exist: ${documentIndexId}`);
@@ -1180,11 +1253,11 @@ export class ChatStore {
       this.db.prepare("DELETE FROM chat_document_index_chunks WHERE document_index_id = ?").run(documentIndexId);
       const insert = this.db.prepare(
         `INSERT INTO chat_document_index_chunks
-          (id, document_index_id, source_title, source_path, page_start, page_end, text, token_count, ordinal)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          (id, document_index_id, source_title, source_path, page_start, page_end, text, token_count, ordinal, embedding_json)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       );
       chunks.forEach((chunk, ordinal) => {
-        insert.run(chunk.chunkId, documentIndexId, chunk.sourceTitle, chunk.sourcePath, chunk.pageStart, chunk.pageEnd, chunk.text, chunk.tokenCount, ordinal);
+        insert.run(chunk.chunkId, documentIndexId, chunk.sourceTitle, chunk.sourcePath, chunk.pageStart, chunk.pageEnd, chunk.text, chunk.tokenCount, ordinal, chunk.embedding ? JSON.stringify(normalizeEmbedding(chunk.embedding)) : null);
       });
       this.db.exec("COMMIT");
     } catch (error) {
@@ -1195,7 +1268,7 @@ export class ChatStore {
 
   documentIndex(documentIndexId: string): ChatDocumentIndex | undefined {
     const row = this.db.prepare(
-      `SELECT id, project_id, title, source_path, state,
+      `SELECT id, project_id, title, source_path, COALESCE(embedding_model_path, '') AS embedding_model_path, state,
               COALESCE(progress, 0) AS progress,
               COALESCE(message, '') AS message,
               created_at, updated_at
@@ -1249,6 +1322,52 @@ export class ChatStore {
       }));
   }
 
+  searchDocumentIndexByVector(documentIndexId: string, queryEmbedding: number[], topK = 8, budgetTokens = 6000): ChatDocumentSearchEntry[] {
+    const index = this.documentIndex(documentIndexId);
+    if (!index) {
+      throw new Error("Selected document index was not found.");
+    }
+    if (index.state !== "ready") {
+      throw new Error("Selected document index is not ready yet.");
+    }
+    const normalizedQuery = normalizeEmbedding(queryEmbedding);
+    const rows = this.documentIndexChunks(documentIndexId);
+    const missingEmbeddings = rows.some((row) => !row.embedding);
+    if (rows.length === 0 || missingEmbeddings) {
+      throw new Error("Selected document index does not contain vector embeddings. Rebuild the document group.");
+    }
+    let usedTokens = 0;
+    return rows
+      .map((row) => ({ row, score: cosineSimilarity(normalizedQuery, row.embedding ?? []) }))
+      .filter((item) => item.score >= 0.25)
+      .sort((a, b) => b.score - a.score || a.row.ordinalStart - b.row.ordinalStart)
+      .slice(0, Math.max(1, topK))
+      .filter((item) => {
+        if (usedTokens >= budgetTokens) {
+          return false;
+        }
+        usedTokens += item.row.tokenCount;
+        return true;
+      })
+      .map((item, index) => ({
+        chunkId: item.row.chunkId,
+        resultId: `r${index + 1}`,
+        sourceId: (item.row.sourceId ?? path.basename(item.row.sourcePath)) || item.row.sourcePath,
+        sourceTitle: item.row.sourceTitle,
+        sourcePath: item.row.sourcePath,
+        sectionLabel: item.row.sectionLabel ?? `page ${item.row.pageStart}${item.row.pageEnd !== item.row.pageStart ? `-${item.row.pageEnd}` : ""}`,
+        candidateCount: rows.length,
+        truncated: usedTokens >= budgetTokens,
+        pageStart: item.row.pageStart,
+        pageEnd: item.row.pageEnd,
+        text: item.row.text,
+        tokenCount: item.row.tokenCount,
+        score: item.score,
+        ordinalStart: item.row.ordinalStart,
+        ordinalEnd: item.row.ordinalEnd
+      }));
+  }
+
   modifyDocumentSearchResults(
     documentIndexId: string,
     results: ChatDocumentSearchEntry[],
@@ -1291,9 +1410,9 @@ export class ChatStore {
     return expanded;
   }
 
-  private documentIndexChunks(documentIndexId: string): ChatDocumentSearchEntry[] {
+  private documentIndexChunks(documentIndexId: string): ChatDocumentChunkRow[] {
     const rows = this.db.prepare(
-      `SELECT id, source_title, source_path, page_start, page_end, text, token_count, ordinal
+      `SELECT id, source_title, source_path, page_start, page_end, text, token_count, ordinal, embedding_json
        FROM chat_document_index_chunks WHERE document_index_id = ? ORDER BY ordinal`
     ).all(documentIndexId) as Array<{
       id: string;
@@ -1304,6 +1423,7 @@ export class ChatStore {
       text: string;
       token_count: number;
       ordinal: number;
+      embedding_json: string | null;
     }>;
     return rows.map((row) => ({
       chunkId: row.id,
@@ -1320,7 +1440,8 @@ export class ChatStore {
       tokenCount: row.token_count,
       score: 0,
       ordinalStart: row.ordinal,
-      ordinalEnd: row.ordinal
+      ordinalEnd: row.ordinal,
+      embedding: parseEmbeddingJson(row.embedding_json)
     }));
   }
 
@@ -1553,6 +1674,7 @@ export class ChatStore {
         project_id TEXT NOT NULL REFERENCES chat_projects(id) ON DELETE CASCADE,
         title TEXT NOT NULL,
         source_path TEXT NOT NULL,
+        embedding_model_path TEXT NOT NULL DEFAULT '',
         state TEXT NOT NULL DEFAULT 'ready',
         progress REAL NOT NULL DEFAULT 1,
         message TEXT NOT NULL DEFAULT '',
@@ -1570,7 +1692,8 @@ export class ChatStore {
         page_end INTEGER NOT NULL,
         text TEXT NOT NULL,
         token_count INTEGER NOT NULL,
-        ordinal INTEGER NOT NULL
+        ordinal INTEGER NOT NULL,
+        embedding_json TEXT
       );
 
       CREATE TABLE IF NOT EXISTS chat_settings (
@@ -1622,6 +1745,14 @@ export class ChatStore {
     ensureMessageColumn("source_label", "source_label TEXT");
     ensureMessageColumn("reasoning", "reasoning TEXT");
     ensureMessageColumn("metadata_json", "metadata_json TEXT");
+    const documentIndexColumns = this.db.prepare("PRAGMA table_info(chat_document_indexes)").all() as Array<{ name: string }>;
+    if (!documentIndexColumns.some((column) => column.name === "embedding_model_path")) {
+      this.db.exec("ALTER TABLE chat_document_indexes ADD COLUMN embedding_model_path TEXT NOT NULL DEFAULT ''");
+    }
+    const documentChunkColumns = this.db.prepare("PRAGMA table_info(chat_document_index_chunks)").all() as Array<{ name: string }>;
+    if (!documentChunkColumns.some((column) => column.name === "embedding_json")) {
+      this.db.exec("ALTER TABLE chat_document_index_chunks ADD COLUMN embedding_json TEXT");
+    }
   }
 
   private importLegacyHistoryIfEmpty(): void {
@@ -2374,6 +2505,30 @@ function normalizeAppSettings(value: Partial<ChatAppSettings>): ChatAppSettings 
   };
 }
 
+function threadSettingsChangeInvalidatesPreset(current: ChatThread, next: {
+  providerMode?: ChatProviderMode;
+  builtinModelId?: string;
+  runtimeSettings?: ChatRuntimeSettings;
+  builtinAgenticFramework?: ChatBuiltinAgenticFramework;
+  documentAnalysisEmbeddingModelPath?: string;
+  codexModelId?: string;
+  codexReasoningEffort?: ChatReasoningEffort;
+  permissionMode?: ChatPermissionMode;
+  codexApprovalMode?: ChatCodexApprovalMode;
+  planModeEnabled?: boolean;
+}): boolean {
+  return (next.providerMode !== undefined && next.providerMode !== current.providerMode)
+    || (next.builtinModelId !== undefined && next.builtinModelId !== current.builtinModelId)
+    || (next.runtimeSettings !== undefined && JSON.stringify(next.runtimeSettings) !== JSON.stringify(current.runtimeSettings))
+    || (next.builtinAgenticFramework !== undefined && next.builtinAgenticFramework !== current.builtinAgenticFramework)
+    || (next.documentAnalysisEmbeddingModelPath !== undefined && next.documentAnalysisEmbeddingModelPath !== current.documentAnalysisEmbeddingModelPath)
+    || (next.codexModelId !== undefined && next.codexModelId !== current.codexModelId)
+    || (next.codexReasoningEffort !== undefined && next.codexReasoningEffort !== current.codexReasoningEffort)
+    || (next.permissionMode !== undefined && next.permissionMode !== current.permissionMode)
+    || (next.codexApprovalMode !== undefined && next.codexApprovalMode !== current.codexApprovalMode)
+    || (next.planModeEnabled !== undefined && next.planModeEnabled !== current.planModeEnabled);
+}
+
 function normalizeUsageIndicatorPreferences(value: Partial<Record<ChatUsageIndicatorId, Partial<ChatUsageIndicatorPreference>>> | undefined): Record<ChatUsageIndicatorId, ChatUsageIndicatorPreference> {
   return {
     git_diff: normalizeUsageIndicatorPreference(value?.git_diff, DEFAULT_APP_SETTINGS.usageIndicatorPreferences.git_diff),
@@ -2486,6 +2641,7 @@ function documentIndexFromRow(row: ChatDocumentIndexRow): ChatDocumentIndex {
     projectId: row.project_id,
     title: row.title,
     sourcePath: row.source_path,
+    embeddingModelPath: row.embedding_model_path ?? "",
     state,
     progress: Math.max(0, Math.min(1, Number(row.progress ?? 0))),
     message: row.message ?? "",
@@ -2494,14 +2650,73 @@ function documentIndexFromRow(row: ChatDocumentIndexRow): ChatDocumentIndex {
   };
 }
 
+const DOCUMENT_SEARCH_STOPWORDS = new Set([
+  "a",
+  "an",
+  "and",
+  "are",
+  "as",
+  "at",
+  "be",
+  "but",
+  "by",
+  "for",
+  "from",
+  "how",
+  "in",
+  "into",
+  "is",
+  "it",
+  "me",
+  "of",
+  "on",
+  "or",
+  "s",
+  "sth",
+  "tell",
+  "that",
+  "the",
+  "their",
+  "them",
+  "this",
+  "to",
+  "what",
+  "when",
+  "where",
+  "which",
+  "with",
+  "you",
+  "your"
+]);
+
 function tokenizeSearchQuery(value: string): string[] {
-  return Array.from(new Set(value.toLowerCase().match(/[a-z0-9_]{2,}/g) ?? [])).slice(0, 16);
+  const terms = value.toLowerCase().match(/[a-z0-9_]{2,}/g) ?? [];
+  const normalized = terms
+    .map(normalizeSearchTerm)
+    .filter((term) => term.length >= 2 && !DOCUMENT_SEARCH_STOPWORDS.has(term));
+  return Array.from(new Set(normalized)).slice(0, 16);
+}
+
+function normalizeSearchTerm(value: string): string {
+  if (value.length > 4 && value.endsWith("ies")) {
+    return `${value.slice(0, -3)}y`;
+  }
+  if (value.length > 3 && value.endsWith("s")) {
+    return value.slice(0, -1);
+  }
+  return value;
 }
 
 function scoreDocumentChunk(text: string, terms: string[]): number {
   const lower = text.toLowerCase();
   let score = 0;
   for (const term of terms) {
+    const pattern = new RegExp(`\\b(?:${searchTermVariants(term).map(escapeRegExp).join("|")})\\b`, "gu");
+    const matches = lower.match(pattern);
+    if (matches) {
+      score += matches.length * 3;
+      continue;
+    }
     let offset = lower.indexOf(term);
     while (offset >= 0) {
       score += 1;
@@ -2509,6 +2724,55 @@ function scoreDocumentChunk(text: string, terms: string[]): number {
     }
   }
   return score / Math.max(1, Math.sqrt(text.length / 1000));
+}
+
+function normalizeEmbedding(vector: number[]): number[] {
+  let norm = 0;
+  for (const value of vector) {
+    if (!Number.isFinite(value)) {
+      throw new Error("Document embedding contains a non-finite value.");
+    }
+    norm += value * value;
+  }
+  norm = Math.sqrt(norm);
+  if (!Number.isFinite(norm) || norm <= 0) {
+    throw new Error("Document embedding cannot be empty.");
+  }
+  return vector.map((value) => value / norm);
+}
+
+function cosineSimilarity(left: number[], right: number[]): number {
+  const length = Math.min(left.length, right.length);
+  if (length === 0 || left.length !== right.length) {
+    return -1;
+  }
+  let score = 0;
+  for (let index = 0; index < length; index += 1) {
+    score += left[index] * right[index];
+  }
+  return score;
+}
+
+function parseEmbeddingJson(value: string | null): number[] | undefined {
+  if (!value) {
+    return undefined;
+  }
+  const parsed = parseJsonArray<number>(value, []);
+  return parsed.length > 0 ? normalizeEmbedding(parsed.map(Number)) : undefined;
+}
+
+function searchTermVariants(term: string): string[] {
+  const variants = [term];
+  if (term.length > 3 && term.endsWith("y")) {
+    variants.push(`${term.slice(0, -1)}ies`);
+  } else if (term.length > 3) {
+    variants.push(`${term}s`);
+  }
+  return variants;
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function normalizeCodexApprovalMode(value: unknown, fallback: ChatCodexApprovalMode): ChatCodexApprovalMode {

@@ -1254,11 +1254,20 @@ button {
   background: var(--bg-panel);
 }
 
+.empty-spawn-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(132px, 1fr));
+  gap: 8px;
+  width: min(456px, calc(100% - 32px));
+}
+
 .empty-spawn-button {
-  display: inline-flex;
+  display: flex;
   align-items: center;
+  justify-content: flex-start;
   gap: 8px;
   height: 34px;
+  min-width: 0;
   padding: 0 12px;
   border: 1px solid var(--border-strong);
   border-radius: 4px;
@@ -1268,6 +1277,20 @@ button {
 
 .empty-spawn-button:hover {
   background: var(--bg-hover);
+}
+
+.empty-spawn-button span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+@media (max-width: 620px) {
+  .empty-spawn-grid {
+    grid-template-columns: repeat(2, minmax(132px, 1fr));
+    width: min(304px, calc(100% - 24px));
+  }
 }
 
 .workspace-shelf {
@@ -4847,9 +4870,22 @@ button {
   cursor: pointer;
 }
 
-.chat-footer-left-cluster .chat-footer-button:first-child {
+.chat-footer-button.permission-full-access {
   justify-content: flex-start;
   color: #de6b66;
+}
+
+.chat-footer-button.permission-full-access:hover {
+  color: #de6b66;
+}
+
+.chat-footer-button.permission-default-access {
+  justify-content: flex-start;
+  color: #8f9aa7;
+}
+
+.chat-footer-button.permission-default-access:hover {
+  color: #8f9aa7;
 }
 
 .chat-footer-slot.right {
@@ -5411,7 +5447,8 @@ button {
 }
 
 .chat-embedding-field {
-  display: none;
+  display: grid;
+  gap: 6px;
 }
 
 .chat-document-index-toolbar {

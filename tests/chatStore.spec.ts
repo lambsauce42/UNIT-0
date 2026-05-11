@@ -242,6 +242,84 @@ test("builds and searches document index chunks", () => {
   store.close();
 });
 
+test("ranks meaningful document search terms above conversational stopwords", () => {
+  const { store, dir } = makeStore();
+  const sourcePath = path.join(dir, "pdf.txt");
+  fs.writeFileSync(sourcePath, "pdf notes");
+  const state = store.loadState();
+  const index = store.createDocumentIndex(state.selectedProjectId, "PDF", sourcePath);
+  store.replaceDocumentIndexChunks(index.id, [
+    {
+      chunkId: "chunk-1",
+      sourceTitle: "pdf.txt",
+      sourcePath,
+      pageStart: 659,
+      pageEnd: 659,
+      text: "The text in this annex is in several encodings. It is in a PDF document and in a table.",
+      tokenCount: 18,
+      ordinalStart: 0,
+      ordinalEnd: 0
+    },
+    {
+      chunkId: "chunk-2",
+      sourceTitle: "pdf.txt",
+      sourcePath,
+      pageStart: 392,
+      pageEnd: 392,
+      text: "A link annotation in a PDF creates a hyperlink action. The link can target a URI or destination.",
+      tokenCount: 19,
+      ordinalStart: 1,
+      ordinalEnd: 1
+    }
+  ]);
+  store.updateDocumentIndexStatus(index.id, { state: "ready", progress: 1, message: "Ready" });
+
+  const results = store.searchDocumentIndex(index.id, "links in pdfs", 2, 100);
+
+  expect(results).toHaveLength(2);
+  expect(results[0]).toMatchObject({ chunkId: "chunk-2", pageStart: 392 });
+  store.close();
+});
+
+test("matches singular and plural document search terms symmetrically", () => {
+  const { store, dir } = makeStore();
+  const sourcePath = path.join(dir, "manual.txt");
+  fs.writeFileSync(sourcePath, "policy notes");
+  const state = store.loadState();
+  const index = store.createDocumentIndex(state.selectedProjectId, "Manual", sourcePath);
+  store.replaceDocumentIndexChunks(index.id, [
+    {
+      chunkId: "chunk-1",
+      sourceTitle: "manual.txt",
+      sourcePath,
+      pageStart: 1,
+      pageEnd: 1,
+      text: "The policy describes audit requirements.",
+      tokenCount: 6,
+      ordinalStart: 0,
+      ordinalEnd: 0
+    },
+    {
+      chunkId: "chunk-2",
+      sourceTitle: "manual.txt",
+      sourcePath,
+      pageStart: 2,
+      pageEnd: 2,
+      text: "These policies describe retention categories.",
+      tokenCount: 6,
+      ordinalStart: 1,
+      ordinalEnd: 1
+    }
+  ]);
+  store.updateDocumentIndexStatus(index.id, { state: "ready", progress: 1, message: "Ready" });
+
+  expect(new Set(store.searchDocumentIndex(index.id, "policies", 2, 100).map((result) => result.chunkId))).toEqual(new Set(["chunk-1", "chunk-2"]));
+  expect(new Set(store.searchDocumentIndex(index.id, "policy", 2, 100).map((result) => result.chunkId))).toEqual(new Set(["chunk-1", "chunk-2"]));
+  expect(store.searchDocumentIndex(index.id, "category", 2, 100).map((result) => result.chunkId)).toEqual(["chunk-2"]);
+  expect(store.searchDocumentIndex(index.id, "categories", 2, 100).map((result) => result.chunkId)).toEqual(["chunk-2"]);
+  store.close();
+});
+
 test("updates and deletes document index groups", () => {
   const { store, dir } = makeStore();
   const sourcePath = path.join(dir, "notes.txt");
@@ -375,6 +453,13 @@ test("persists settings presets and applies provider/framework state", () => {
     selectedSettingsPresetId: openCodePreset.id,
     builtinAgenticFramework: "opencode"
   });
+  store.updateThreadSettings(threadId, { builtinAgenticFramework: "chat" });
+  state = store.loadState();
+  expect(state.threads.find((thread) => thread.id === threadId)?.selectedSettingsPresetId).toBe("custom::default");
+  store.applySettingsPreset(threadId, openCodePreset.id);
+  store.updateRuntimeSettings({ temperature: 0.7 });
+  state = store.loadState();
+  expect(state.threads.find((thread) => thread.id === threadId)?.selectedSettingsPresetId).toBe("custom::default");
 
   store.deleteSettingsPreset("builtin::fast");
   expect(store.loadState().settingsPresets.some((item) => item.id === "builtin::fast")).toBe(false);

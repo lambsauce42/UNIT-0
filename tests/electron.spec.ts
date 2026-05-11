@@ -356,6 +356,7 @@ test("chat creates and selects threads through the applet API", async () => {
 });
 
 test("chat project actions and composer menus are backed by persistent state", async () => {
+  test.setTimeout(90_000);
   const app = await launchApp();
   const page = await firstWindow(app);
   await expect(page.getByTestId("chat-surface")).toBeVisible();
@@ -401,6 +402,20 @@ test("chat project actions and composer menus are backed by persistent state", a
   await presetDialog.getByRole("button", { name: "Save" }).click();
   state = await page.evaluate(() => window.unitApi.chat.bootstrap());
   expect(state.settingsPresets.some((preset) => preset.label === "Parity Preset" && preset.iconName === "git_branch")).toBe(true);
+
+  await page.getByLabel("Model settings").click();
+  await page.getByRole("menuitemradio", { name: "Parity Preset" }).click();
+  state = await page.evaluate(() => window.unitApi.chat.bootstrap());
+  const selectedPresetId = state.threads.find((thread) => thread.id === state.selectedThreadId)?.selectedSettingsPresetId;
+  const selectedPreset = state.settingsPresets.find((preset) => preset.id === selectedPresetId);
+  expect(selectedPreset?.label).toBe("Parity Preset");
+  expect(selectedPreset?.iconName).toBe("git_branch");
+  const composerSettingsButton = page.locator("button.chat-settings-menu-button").filter({ hasText: "Parity Preset" }).first();
+  await expect(composerSettingsButton).toContainText("Parity Preset");
+  const settingsButtonIconSvg = await composerSettingsButton.locator("svg").first().evaluate((svg) => svg.outerHTML);
+  expect(settingsButtonIconSvg).toContain("<line");
+  expect(settingsButtonIconSvg).toContain('x1="6"');
+  expect(settingsButtonIconSvg).toContain('y2="15"');
 
   await page.getByLabel("Model settings").click();
   const editPresetButton = page.getByLabel("Edit Parity Preset");

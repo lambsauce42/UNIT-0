@@ -122,6 +122,7 @@ export interface ChatDocumentIndex {
   projectId: string;
   title: string;
   sourcePath: string;
+  embeddingModelPath: string;
   state: "ready" | "building" | "error";
   progress: number;
   message: string;

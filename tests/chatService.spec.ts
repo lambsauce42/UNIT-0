@@ -22,7 +22,10 @@ class ScriptedLlamaRuntime extends LocalLlamaRuntime {
   readonly frameworkCalls: string[] = [];
   readonly documentTitleCalls: string[] = [];
 
-  constructor(private readonly replies: string[]) {
+  constructor(
+    private readonly replies: string[],
+    private readonly beforeReply?: (callIndex: number) => Promise<void> | void
+  ) {
     super({ startupTimeoutMs: 10 });
   }
 
@@ -39,6 +42,7 @@ class ScriptedLlamaRuntime extends LocalLlamaRuntime {
     this.settingsCalls.push({ ...options.settings });
     this.frameworkCalls.push(options.builtinAgenticFramework ?? "chat");
     this.documentTitleCalls.push(options.documentTitle ?? "");
+    await this.beforeReply?.(this.calls.length - 1);
     const reply = this.replies.shift() ?? "";
     options.onToken(reply);
   }
@@ -65,6 +69,34 @@ class StreamingDocumentLlamaRuntime extends LocalLlamaRuntime {
     for (const token of reply.tokens) {
       options.onToken(token);
       await Promise.resolve();
+    }
+  }
+}
+
+class StreamingOpenCodeLlamaRuntime extends LocalLlamaRuntime {
+  constructor(
+    private readonly tokens: string[],
+    private readonly afterToken?: (index: number) => Promise<void> | void,
+    private readonly reasoningTokens: string[] = []
+  ) {
+    super({ startupTimeoutMs: 10 });
+  }
+
+  override async streamChat(options: {
+    model: ChatModel;
+    settings: ChatRuntimeSettings;
+    messages: ChatMessage[];
+    onToken: (token: string) => void;
+    onReasoning?: (token: string) => void;
+    builtinAgenticFramework?: ChatBuiltinAgenticFramework;
+  }): Promise<void> {
+    for (const token of this.reasoningTokens) {
+      options.onReasoning?.(token);
+      await Promise.resolve();
+    }
+    for (let index = 0; index < this.tokens.length; index += 1) {
+      options.onToken(this.tokens[index]);
+      await this.afterToken?.(index);
     }
   }
 }
@@ -205,6 +237,15 @@ class EmptySummaryPartCodexRuntime extends MockCodexRuntime {
   }
 }
 
+class CapturingCodexRuntime extends MockCodexRuntime {
+  lastOptions: CodexRunOptions | null = null;
+
+  override async *runTurn(options: CodexRunOptions): AsyncIterable<CodexThreadEvent> {
+    this.lastOptions = options;
+    yield* super.runTurn(options);
+  }
+}
+
 test("keeps Codex assistant and reasoning timeline blocks in stream order", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-codex-order-test-"));
   const store = new ChatStore(path.join(dir, "chat.sqlite"));
@@ -328,6 +369,53 @@ test("Codex account refresh recovers without surfacing a chat generation error",
   }
 });
 
+test("does not pass local system prompt as Codex base instructions", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-codex-system-prompt-test-"));
+  const store = new ChatStore(path.join(dir, "chat.sqlite"));
+  const codexRuntime = new CapturingCodexRuntime();
+  const service = new ChatService(store, new LocalLlamaRuntime(), new RemoteHostRuntime(), codexRuntime, () => undefined);
+  try {
+    let state = store.loadState();
+    store.updateProjectSettings(state.selectedProjectId, "Codex Project", dir);
+    store.updateThreadSettings(state.selectedThreadId, {
+      providerMode: "codex",
+      runtimeSettings: { systemPrompt: "hidden local prompt" }
+    });
+
+    await service.submit({ text: "ignore local prompt" });
+    await expect.poll(() => service.state().generation.status).toBe("idle");
+
+    expect(codexRuntime.lastOptions?.baseInstructions).toBe("");
+  } finally {
+    service.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("blocks Codex submit when the project directory is empty", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-codex-empty-dir-test-"));
+  const store = new ChatStore(path.join(dir, "chat.sqlite"));
+  const codexRuntime = new CapturingCodexRuntime();
+  const service = new ChatService(store, new LocalLlamaRuntime(), new RemoteHostRuntime(), codexRuntime, () => undefined);
+  try {
+    const state = store.loadState();
+    store.updateProjectSettings(state.selectedProjectId, "No Directory Project", "");
+    store.updateThreadSettings(state.selectedThreadId, { providerMode: "codex" });
+
+    const blocked = await service.submit({ text: "should not start" });
+
+    expect(blocked.generation).toMatchObject({
+      status: "error",
+      error: "Select a project directory before running a Codex thread."
+    });
+    expect(store.messageCount(state.selectedThreadId)).toBe(0);
+    expect(codexRuntime.lastOptions).toBeNull();
+  } finally {
+    service.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("blocks switching a local-history thread to Codex", () => {
   const { service, store, cleanup } = makeService();
   try {
@@ -347,7 +435,7 @@ test("blocks switching a local-history thread to Codex", () => {
     });
     expect(blocked.threads.find((thread) => thread.id === state.selectedThreadId)?.providerMode).toBe("builtin");
   } finally {
-    store.close();
+    service.close();
     cleanup();
   }
 });
@@ -392,7 +480,7 @@ test("handles local /reset without starting generation", async () => {
     expect(thread?.contextMarkers[0]).toMatchObject({ kind: "reset", boundaryMessageCount: 2 });
     expect(next.messages.at(-1)?.content).toContain("Local context reset");
   } finally {
-    store.close();
+    service.close();
     cleanup();
   }
 });
@@ -427,6 +515,251 @@ test("runs OpenCode shell tool calls through local harness timeline blocks", asy
     expect(runtime.frameworkCalls).toEqual(["opencode", "opencode"]);
     expect(runtime.calls[1].at(-1)?.content).toContain("Tool result:");
   } finally {
+    service.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("streams OpenCode final answer content after tool-call prefix is ruled out", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-opencode-stream-test-"));
+  const modelPath = path.join(dir, "model.gguf");
+  fs.writeFileSync(modelPath, "");
+  let releaseSecondToken: (() => void) | null = null;
+  const secondTokenGate = new Promise<void>((resolve) => {
+    releaseSecondToken = resolve;
+  });
+  const store = new ChatStore(path.join(dir, "chat.sqlite"));
+  const runtime = new StreamingOpenCodeLlamaRuntime(["Streaming ", "answer."], async (index) => {
+    if (index === 0) {
+      await secondTokenGate;
+    }
+  }, ["Thinking ", "first."]);
+  const service = new ChatService(store, runtime, new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined);
+  try {
+    let state = store.loadState();
+    store.updateProjectSettings(state.selectedProjectId, "OpenCode Stream Project", dir);
+    store.addLocalModel(modelPath);
+    state = store.loadState();
+    store.updateThreadSettings(state.selectedThreadId, {
+      builtinAgenticFramework: "opencode",
+      builtinModelId: state.selectedModelId
+    });
+
+    await service.submit({ text: "stream final answer" });
+    await expect.poll(() => service.state().messages.find((message) => message.role === "assistant")?.content).toBe("Streaming ");
+    const streamingAssistant = service.state().messages.find((message) => message.role === "assistant");
+    expect(streamingAssistant?.timelineBlocks?.find((block) => block.kind === "reasoning")).toMatchObject({
+      status: "completed",
+      text: "Thinking first."
+    });
+    expect(service.state().generation.status).toBe("running");
+
+    releaseSecondToken?.();
+    await expect.poll(() => service.state().generation.status).toBe("idle");
+    state = store.loadState();
+    const assistant = state.messages.find((message) => message.role === "assistant");
+    expect(assistant?.content).toBe("Streaming answer.");
+    expect(assistant?.status).toBe("complete");
+  } finally {
+    releaseSecondToken?.();
+    service.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("rejects remote models for OpenCode harness settings", async () => {
+  const { service, store, cleanup } = makeService();
+  const localModelDir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-opencode-local-model-"));
+  const localModelPath = path.join(localModelDir, "model.gguf");
+  fs.writeFileSync(localModelPath, "");
+  try {
+    store.replaceRemoteModels([{
+      id: "remote-model",
+      label: "Remote Model",
+      path: "remote://model",
+      providerId: "remote",
+      reference: "remote-model",
+      sourceLabel: "Remote Built-in",
+      hostId: "host",
+      createdAt: new Date().toISOString()
+    }], { hostId: "host", hostIdentity: "Remote Host", protocolVersion: "1" });
+    const state = store.loadState();
+    service.selectModel("remote-model");
+
+    const next = service.updateThreadSettings({
+      threadId: state.selectedThreadId,
+      builtinAgenticFramework: "opencode",
+      builtinModelId: "remote-model"
+    });
+
+    expect(next.generation).toMatchObject({
+      status: "error",
+      error: "OpenCode requires a local built-in model."
+    });
+
+    const blankModel = service.updateThreadSettings({
+      threadId: state.selectedThreadId,
+      builtinAgenticFramework: "opencode",
+      builtinModelId: ""
+    });
+    expect(blankModel.generation).toMatchObject({
+      status: "error",
+      error: "OpenCode requires a local built-in model."
+    });
+
+    const rejectedPresetSave = service.saveSettingsPreset({
+      label: "Blank OpenCode",
+      runtimeSettings: {},
+      providerMode: "builtin",
+      builtinAgenticFramework: "opencode",
+      builtinModelId: ""
+    });
+    expect(rejectedPresetSave.generation).toMatchObject({
+      status: "error",
+      error: "OpenCode requires a local built-in model."
+    });
+
+    store.saveSettingsPreset({
+      label: "Legacy Blank OpenCode",
+      providerMode: "builtin",
+      builtinAgenticFramework: "opencode",
+      builtinModelId: ""
+    });
+    const legacyBlankPreset = store.loadState().settingsPresets.find((preset) => preset.label === "Legacy Blank OpenCode");
+    expect(legacyBlankPreset).toBeTruthy();
+    const rejectedPresetApply = service.applySettingsPreset({
+      threadId: state.selectedThreadId,
+      presetId: legacyBlankPreset!.id
+    });
+    expect(rejectedPresetApply.generation).toMatchObject({
+      status: "error",
+      error: "OpenCode requires a local built-in model."
+    });
+
+    const codexWithHiddenOpenCodeState = service.saveSettingsPreset({
+      label: "Codex Preset",
+      runtimeSettings: {},
+      providerMode: "codex",
+      builtinAgenticFramework: "opencode",
+      builtinModelId: "remote-model"
+    });
+    expect(codexWithHiddenOpenCodeState.generation.status).toBe("idle");
+    const savedCodexPreset = store.loadState().settingsPresets.find((preset) => preset.label === "Codex Preset");
+    expect(savedCodexPreset).toMatchObject({
+      providerMode: "codex",
+      builtinAgenticFramework: "chat"
+    });
+
+    store.addLocalModel(localModelPath);
+    const localState = store.loadState();
+    service.updateThreadSettings({
+      threadId: localState.selectedThreadId,
+      builtinAgenticFramework: "opencode",
+      builtinModelId: localState.selectedModelId
+    });
+
+    const blockedSelect = service.selectModel("remote-model");
+
+    expect(blockedSelect.generation).toMatchObject({
+      status: "error",
+      error: "OpenCode requires a local built-in model."
+    });
+    expect(store.loadState().threads.find((thread) => thread.id === localState.selectedThreadId)?.builtinModelId).toBe(localState.selectedModelId);
+  } finally {
+    service.close();
+    cleanup();
+    fs.rmSync(localModelDir, { recursive: true, force: true });
+  }
+});
+
+test("cancels active OpenCode shell tool execution", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-opencode-cancel-test-"));
+  const modelPath = path.join(dir, "model.gguf");
+  fs.writeFileSync(modelPath, "");
+  const command = `${JSON.stringify(process.execPath)} -e "setTimeout(()=>{}, 30000)"`;
+  const store = new ChatStore(path.join(dir, "chat.sqlite"));
+  const runtime = new ScriptedLlamaRuntime([
+    `<tool_call>${JSON.stringify({ tool: "shell", command })}</tool_call>`,
+    "Should not continue."
+  ]);
+  const service = new ChatService(store, runtime, new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined);
+  try {
+    let state = store.loadState();
+    store.updateProjectSettings(state.selectedProjectId, "OpenCode Cancel Project", dir);
+    store.addLocalModel(modelPath);
+    state = store.loadState();
+    store.updateThreadSettings(state.selectedThreadId, {
+      builtinAgenticFramework: "opencode",
+      builtinModelId: state.selectedModelId
+    });
+
+    await service.submit({ text: "start long command" });
+    await expect.poll(() => service.state().messages.find((message) => message.role === "assistant")?.timelineBlocks?.some((block) => block.kind === "tool" && block.status === "started") ?? false).toBe(true);
+    service.cancel();
+    await expect.poll(() => service.state().generation.status).toBe("idle");
+    await expect.poll(() => service.state().messages.find((message) => message.role === "assistant")?.timelineBlocks?.some((block) => block.kind === "tool" && block.status === "interrupted") ?? false).toBe(true);
+
+    state = store.loadState();
+    const assistant = state.messages.find((message) => message.role === "assistant");
+    expect(assistant?.status).toBe("interrupted");
+    expect(runtime.frameworkCalls).toEqual(["opencode"]);
+  } finally {
+    service.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("cancelled OpenCode run does not clear a newer generation", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-opencode-race-test-"));
+  const modelPath = path.join(dir, "model.gguf");
+  fs.writeFileSync(modelPath, "");
+  const command = `${JSON.stringify(process.execPath)} -e "setTimeout(()=>{}, 30000)"`;
+  let releaseSecondReply: (() => void) | null = null;
+  const secondReplyGate = new Promise<void>((resolve) => {
+    releaseSecondReply = resolve;
+  });
+  let secondReplyStarted: (() => void) | null = null;
+  const secondReplyStartedGate = new Promise<void>((resolve) => {
+    secondReplyStarted = resolve;
+  });
+  const store = new ChatStore(path.join(dir, "chat.sqlite"));
+  const runtime = new ScriptedLlamaRuntime([
+    `<tool_call>${JSON.stringify({ tool: "shell", command })}</tool_call>`,
+    "Second response."
+  ], async (callIndex) => {
+    if (callIndex === 1) {
+      secondReplyStarted?.();
+      await secondReplyGate;
+    }
+  });
+  const service = new ChatService(store, runtime, new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined);
+  try {
+    let state = store.loadState();
+    store.updateProjectSettings(state.selectedProjectId, "OpenCode Race Project", dir);
+    store.addLocalModel(modelPath);
+    state = store.loadState();
+    store.updateThreadSettings(state.selectedThreadId, {
+      builtinAgenticFramework: "opencode",
+      builtinModelId: state.selectedModelId
+    });
+
+    await service.submit({ text: "start long command" });
+    await expect.poll(() => service.state().messages.find((message) => message.role === "assistant")?.timelineBlocks?.some((block) => block.kind === "tool" && block.status === "started") ?? false).toBe(true);
+    service.cancel();
+    await service.submit({ text: "new request" });
+    await secondReplyStartedGate;
+    await expect.poll(() => service.state().messages.find((message) => message.role === "assistant" && message.timelineBlocks?.some((block) => block.kind === "tool" && block.status === "interrupted"))?.status).toBe("interrupted");
+
+    expect(service.state().generation.status).toBe("running");
+
+    releaseSecondReply?.();
+    await expect.poll(() => service.state().generation.status).toBe("idle");
+    state = store.loadState();
+    const assistants = state.messages.filter((message) => message.role === "assistant");
+    expect(assistants.at(-1)?.content).toBe("Second response.");
+    expect(assistants.at(-1)?.status).toBe("complete");
+  } finally {
+    releaseSecondReply?.();
     service.close();
     fs.rmSync(dir, { recursive: true, force: true });
   }
@@ -719,13 +1052,50 @@ test("keeps transient document-analysis reasoning with a failed tool marker when
   }
 });
 
-test("does not treat unwrapped document-analysis JSON as a local tool call", async () => {
+test("accepts document-analysis final answers without forcing search", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-doc-no-forced-search-test-"));
+  const store = new ChatStore(path.join(dir, "chat.sqlite"));
+  const runtime = new ScriptedLlamaRuntime(["Here is a deliberately long random answer without using document search."]);
+  const service = new ChatService(store, runtime, new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined);
+  try {
+    const sourcePath = path.join(dir, "notes.txt");
+    fs.writeFileSync(sourcePath, "alpha first paragraph");
+    let state = store.loadState();
+    fs.writeFileSync(path.join(dir, "model.gguf"), "");
+    store.addLocalModel(path.join(dir, "model.gguf"));
+    state = store.loadState();
+    store.updateThreadSettings(state.selectedThreadId, {
+      builtinModelId: state.models[0].id,
+      builtinAgenticFramework: "document_analysis",
+      documentAnalysisEmbeddingModelPath: path.join(dir, "embed.gguf")
+    });
+    const index = store.createDocumentIndex(state.selectedProjectId, "Notes", sourcePath);
+    store.replaceDocumentIndexChunks(index.id, [
+      { chunkId: "c1", sourceTitle: "notes.txt", sourcePath, pageStart: 1, pageEnd: 1, text: "alpha first paragraph", tokenCount: 4, ordinalStart: 0, ordinalEnd: 0 }
+    ]);
+    store.updateDocumentIndexStatus(index.id, { state: "ready", progress: 1, message: "Ready" });
+    store.selectDocumentIndex(state.selectedThreadId, index.id);
+
+    await service.submit({ text: "write random long texts (dont care what about, dont use search)" });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const next = service.state();
+    const assistant = next.messages.filter((message) => message.role === "assistant").at(-1);
+
+    expect(assistant?.status).toBe("complete");
+    expect(assistant?.content).toBe("Here is a deliberately long random answer without using document search.");
+    expect(assistant?.timelineBlocks ?? []).toEqual([]);
+    expect(runtime.calls).toHaveLength(1);
+  } finally {
+    service.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("does not retry unwrapped document-analysis JSON as a forced search", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-doc-unwrapped-json-test-"));
   const store = new ChatStore(path.join(dir, "chat.sqlite"));
   const runtime = new ScriptedLlamaRuntime([
-    '{"tool":"document_analysis","query":"alpha"}',
-    '<tool_call>{"tool":"search","query":"alpha","top_k":4}</tool_call>',
-    "Alpha appears in the indexed document [r1]."
+    '{"tool":"document_analysis","query":"alpha"}'
   ]);
   const service = new ChatService(store, runtime, new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined);
   try {
@@ -753,9 +1123,9 @@ test("does not treat unwrapped document-analysis JSON as a local tool call", asy
     const assistant = next.messages.filter((message) => message.role === "assistant").at(-1);
 
     expect(assistant?.status).toBe("complete");
-    expect(assistant?.timelineBlocks?.map((block) => block.kind)).toEqual(["tool"]);
-    expect(assistant?.timelineBlocks?.[0]).toMatchObject({ kind: "tool", initiallyExpanded: true });
-    expect(runtime.calls[1].at(-1)?.content).toContain("Grounding required:");
+    expect(assistant?.content).toBe('{"tool":"document_analysis","query":"alpha"}');
+    expect(assistant?.timelineBlocks ?? []).toEqual([]);
+    expect(runtime.calls).toHaveLength(1);
   } finally {
     service.close();
     fs.rmSync(dir, { recursive: true, force: true });

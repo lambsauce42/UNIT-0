@@ -251,6 +251,112 @@ test("uses native GPT-OSS prompt channels for document analysis", async () => {
   runtime.close();
 });
 
+test("streams native GPT-OSS final channel tokens before the completion ends", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit-0-llama-gptoss-final-stream-"));
+  const binaryPath = path.join(dir, "llama-server.exe");
+  const modelPath = path.join(dir, "gpt-oss-20b-mxfp4.gguf");
+  fs.writeFileSync(binaryPath, "");
+  fs.writeFileSync(modelPath, "");
+  const spawned = Object.assign(new EventEmitter(), {
+    exitCode: null as number | null,
+    kill: () => undefined
+  });
+  let resolveFirstFinalToken: (() => void) | null = null;
+  const firstFinalTokenSeen = new Promise<void>((resolve) => {
+    resolveFirstFinalToken = resolve;
+  });
+  let releaseRemainingTokens: (() => void) | null = null;
+  const remainingTokensGate = new Promise<void>((resolve) => {
+    releaseRemainingTokens = resolve;
+  });
+  const fetchImpl = async (input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url.endsWith("/health")) {
+      return Response.json({ status: "ok" });
+    }
+    if (url.endsWith("/v1/models")) {
+      return Response.json({ data: [{ id: "local-model" }] });
+    }
+    const stream = new ReadableStream<Uint8Array>({
+      async start(controller) {
+        const encoder = new TextEncoder();
+        for (const content of [
+          "<|channel|>",
+          "analysis",
+          "<|message|>",
+          "Need",
+          " exactly",
+          " six",
+          " words",
+          ".",
+          "<|end|>",
+          "<|start|>",
+          "assistant",
+          "<|channel|>",
+          "final",
+          "<|message|>",
+          "hello"
+        ]) {
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify({ content })}\n\n`));
+        }
+        await remainingTokensGate;
+        for (const content of [" from", " streaming", " probe", " now", " please", "<|return|>"]) {
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify({ content })}\n\n`));
+        }
+        controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+        controller.close();
+      }
+    });
+    return new Response(stream, { status: 200 });
+  };
+  const runtime = new LocalLlamaRuntime({
+    binaryPath,
+    fetchImpl: fetchImpl as typeof fetch,
+    spawnImpl: (() => spawned) as unknown as typeof import("node:child_process").spawn,
+    startupTimeoutMs: 1000
+  });
+  let content = "";
+  let reasoning = "";
+  const run = runtime.streamChat({
+    model: { id: "model", label: "gpt-oss-20b-mxfp4", path: modelPath, createdAt: new Date().toISOString() },
+    settings: {
+      nCtx: 4096,
+      nGpuLayers: 0,
+      temperature: 1,
+      repeatPenalty: 1,
+      maxTokens: 1024,
+      reasoningEffort: "low",
+      permissionMode: "full_access",
+      trimReserveTokens: 2000,
+      trimReservePercent: 15,
+      trimAmountTokens: 4000,
+      trimAmountPercent: 30,
+      systemPrompt: ""
+    },
+    messages: [{ id: "m1", threadId: "t1", role: "user", content: "Reply with exactly six words.", status: "complete", createdAt: "", updatedAt: "" }],
+    builtinAgenticFramework: "opencode",
+    onToken: (token) => {
+      content += token;
+      if (content === "hello") {
+        resolveFirstFinalToken?.();
+      }
+    },
+    onReasoning: (token) => {
+      reasoning += token;
+    }
+  });
+
+  await firstFinalTokenSeen;
+  expect(content).toBe("hello");
+  expect(reasoning).toBe("Need exactly six words.");
+
+  releaseRemainingTokens?.();
+  await run;
+  expect(content).toBe("hello from streaming probe now please");
+  runtime.close();
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
 test("decodes GPT-OSS commentary final JSON", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit-0-llama-gptoss-json-"));
   const binaryPath = path.join(dir, "llama-server.exe");

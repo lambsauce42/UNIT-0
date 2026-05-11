@@ -20,7 +20,7 @@ import type {
   ChatRefreshCodexAccountPayload,
   ChatUpdateThreadSettingsPayload
 } from "../shared/types.js";
-import { execFile } from "node:child_process";
+import { execFile, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -28,6 +28,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { PDFParse } from "pdf-parse";
 import { codexItemToTimelineBlock, type CodexRuntime, type CodexThreadEvent, type CodexThreadItem } from "./codexRuntime.js";
+import { LocalEmbeddingRuntime, type DocumentEmbeddingRuntime } from "./embeddingRuntime.js";
 import { ChatStore, DEFAULT_CODEX_MODELS, type ChatDocumentSearchEntry } from "./chatStore.js";
 import { LocalLlamaRuntime } from "./localLlamaRuntime.js";
 import { RemoteHostRuntime, type RemoteStreamMetrics } from "./remoteHostRuntime.js";
@@ -205,13 +206,18 @@ export class ChatService {
   private codexAccount: ChatCodexAccountState = { status: "unknown" };
   private queuedSubmissions: ChatQueuedSubmission[] = [];
   private queuedSubmissionPayloads = new Map<string, { text: string; attachments: ChatAttachment[] }>();
+  private openCodeAbortController: AbortController | null = null;
+  private activeOpenCodeRunId = 0;
+  private nextOpenCodeRunId = 0;
+  private cancelledOpenCodeRunIds = new Set<number>();
 
   constructor(
     private readonly store: ChatStore,
     private readonly runtime: LocalLlamaRuntime,
     private readonly remoteRuntime: RemoteHostRuntime,
     private readonly codexRuntime: CodexRuntime,
-    private readonly broadcast: () => void
+    private readonly broadcast: () => void,
+    private readonly embeddingRuntime: DocumentEmbeddingRuntime = new LocalEmbeddingRuntime()
   ) {}
 
   state(): ChatState {
@@ -324,6 +330,13 @@ export class ChatService {
   }
 
   selectModel(modelId: string): ChatState {
+    const state = this.store.loadState();
+    const thread = state.threads.find((item) => item.id === state.selectedThreadId);
+    if (thread?.providerMode === "builtin" && thread.builtinAgenticFramework === "opencode" && isRemoteModelId(state.models, modelId)) {
+      this.setError("OpenCode requires a local built-in model.");
+      this.broadcast();
+      return this.state();
+    }
     this.store.selectModel(modelId);
     this.clearError();
     this.broadcast();
@@ -347,6 +360,16 @@ export class ChatService {
   updateThreadSettings(payload: ChatUpdateThreadSettingsPayload): ChatState {
     if (payload.providerMode === "codex" && this.threadHasNonCodexAssistantHistory(payload.threadId)) {
       this.setError(localToCodexBlockReason());
+      this.broadcast();
+      return this.state();
+    }
+    const state = this.store.loadState();
+    const thread = state.threads.find((item) => item.id === payload.threadId);
+    const nextProviderMode = payload.providerMode ?? thread?.providerMode;
+    const nextFramework = payload.builtinAgenticFramework ?? thread?.builtinAgenticFramework;
+    const nextModelId = (payload.builtinModelId ?? thread?.builtinModelId ?? "").trim();
+    if (nextProviderMode === "builtin" && nextFramework === "opencode" && !isLocalModelId(state.models, nextModelId)) {
+      this.setError("OpenCode requires a local built-in model.");
       this.broadcast();
       return this.state();
     }
@@ -375,9 +398,15 @@ export class ChatService {
   }
 
   applySettingsPreset(payload: ChatApplySettingsPresetPayload): ChatState {
-    const preset = this.store.loadState().settingsPresets.find((candidate) => candidate.id === payload.presetId);
+    const state = this.store.loadState();
+    const preset = state.settingsPresets.find((candidate) => candidate.id === payload.presetId);
     if (preset?.providerMode === "codex" && this.threadHasNonCodexAssistantHistory(payload.threadId)) {
       this.setError(localToCodexBlockReason());
+      this.broadcast();
+      return this.state();
+    }
+    if (preset?.providerMode === "builtin" && preset.builtinAgenticFramework === "opencode" && !isLocalModelId(state.models, preset.builtinModelId)) {
+      this.setError("OpenCode requires a local built-in model.");
       this.broadcast();
       return this.state();
     }
@@ -388,14 +417,20 @@ export class ChatService {
   }
 
   saveSettingsPreset(payload: ChatSaveSettingsPresetPayload): ChatState {
+    const providerMode = payload.providerMode ?? "builtin";
+    if (providerMode === "builtin" && payload.builtinAgenticFramework === "opencode" && !isLocalModelId(this.store.loadState().models, payload.builtinModelId ?? "")) {
+      this.setError("OpenCode requires a local built-in model.");
+      this.broadcast();
+      return this.state();
+    }
     this.store.saveSettingsPreset({
       id: payload.presetId,
       label: payload.label,
       runtimeSettings: payload.runtimeSettings,
       providerMode: payload.providerMode,
       iconName: payload.iconName,
-      builtinModelId: payload.builtinModelId,
-      builtinAgenticFramework: payload.builtinAgenticFramework,
+      builtinModelId: providerMode === "builtin" ? payload.builtinModelId : undefined,
+      builtinAgenticFramework: providerMode === "builtin" ? payload.builtinAgenticFramework : "chat",
       documentAnalysisEmbeddingModelPath: payload.documentAnalysisEmbeddingModelPath,
       codexModelId: payload.codexModelId,
       codexReasoningEffort: payload.codexReasoningEffort
@@ -545,7 +580,10 @@ export class ChatService {
     const selectedThread = state.threads.find((thread) => thread.id === threadId);
     const text = options.text.trim();
     const attachments = options.attachments;
-    const selectedModel = state.models.find((model) => model.id === (selectedThread?.builtinModelId || state.selectedModelId));
+    const selectedBuiltinModelId = selectedThread?.providerMode === "builtin" && selectedThread.builtinAgenticFramework === "opencode"
+      ? selectedThread.builtinModelId
+      : selectedThread?.builtinModelId || state.selectedModelId;
+    const selectedModel = state.models.find((model) => model.id === selectedBuiltinModelId);
     if (!threadId) {
       this.setError("No chat thread is selected.");
       return this.state();
@@ -554,9 +592,20 @@ export class ChatService {
       this.setError("Selected chat thread could not be loaded.");
       return this.state();
     }
+    if (selectedThread.providerMode === "builtin" && selectedThread.builtinAgenticFramework === "opencode" && !isLocalModelId(state.models, selectedThread.builtinModelId)) {
+      this.setError("OpenCode requires a local built-in model.");
+      return this.state();
+    }
     if (selectedThread.providerMode === "builtin" && !selectedModel) {
       this.setError("Add and select a local GGUF model before sending.");
       return this.state();
+    }
+    if (selectedThread.providerMode === "codex") {
+      const project = state.projects.find((item) => item.id === selectedThread.projectId);
+      if (!project?.directory) {
+        this.setError("Select a project directory before running a Codex thread.");
+        return this.state();
+      }
     }
     if (selectedThread.providerMode === "codex" && this.threadHasNonCodexAssistantHistory(threadId)) {
       this.setError(localToCodexBlockReason());
@@ -591,6 +640,10 @@ export class ChatService {
     this.runtime.cancelActiveRequest();
     this.remoteRuntime.cancelActiveRequest();
     this.codexRuntime.cancelActiveRequest();
+    if (this.activeOpenCodeRunId) {
+      this.cancelledOpenCodeRunIds.add(this.activeOpenCodeRunId);
+    }
+    this.openCodeAbortController?.abort();
     this.store.updateMessageStatus(this.generation.assistantMessageId, "interrupted");
     this.generation = { status: "idle" };
     this.broadcast();
@@ -603,6 +656,7 @@ export class ChatService {
     }
     this.closed = true;
     this.runtime.close();
+    this.embeddingRuntime.close();
     this.remoteRuntime.cancelActiveRequest();
     this.codexRuntime.close();
     this.store.close();
@@ -756,16 +810,16 @@ export class ChatService {
       }
       let latestResults: ChatDocumentSearchEntry[] = [];
       let latestRemoteResult: RemoteDocumentSearchResult | null = null;
-      let forcedGroundingRetries = 0;
       let malformedAttempts = 0;
       for (let toolCallCount = 0; toolCallCount <= 8; toolCallCount += 1) {
-        const shouldStreamFinalCandidate = !documentAnalysisRequiresSearchFirst(workingMessages)
-          && (latestResults.length > 0 || Boolean(latestRemoteResult));
+        const shouldStreamFinalCandidate = latestResults.length > 0 || Boolean(latestRemoteResult);
         const reasoningBlockId = `document-reasoning-${randomUUID()}`;
+        let latestReasoningText = "";
         const updateReasoningTimeline = (text: string, status: string) => {
           if (!text.trim()) {
             return;
           }
+          latestReasoningText = text;
           const block: ChatTimelineBlock = {
             kind: "reasoning",
             id: reasoningBlockId,
@@ -792,21 +846,13 @@ export class ChatService {
           streamToAssistant: {
             assistantMessageId: options.assistantMessageId,
             content: shouldStreamFinalCandidate ? "final_candidate" : "off",
+            onContentStart: () => updateReasoningTimeline(latestReasoningText, "completed"),
             onReasoning: (text) => updateReasoningTimeline(text, "updated")
           }
         });
         updateReasoningTimeline(pass.reasoning, "completed");
         const parsed = parseDocumentToolCallResponse(pass.content, pass.reasoning);
         if (parsed.status === "final") {
-          if (documentAnalysisRequiresSearchFirst(workingMessages)) {
-            forcedGroundingRetries += 1;
-            if (forcedGroundingRetries > 1) {
-              throw new Error("Document analysis must ground answers in the selected document. Call `search` first.");
-            }
-            workingMessages.push(syntheticChatMessage("assistant", pass.content));
-            workingMessages.push(syntheticChatMessage("user", "Grounding required: this request is about the selected document. Call `search` first with exactly one <tool_call> JSON block. Do not answer from general knowledge."));
-            continue;
-          }
           const contentRemainder = pass.content.slice(pass.streamedContentLength);
           if (contentRemainder) {
             this.store.appendToMessage(options.assistantMessageId, contentRemainder);
@@ -932,6 +978,7 @@ export class ChatService {
     streamToAssistant: {
       assistantMessageId: string;
       content: "off" | "final_candidate";
+      onContentStart?: () => void;
       onReasoning?: (text: string) => void;
     };
   }): Promise<{ content: string; reasoning: string; streamedContentLength: number; streamedReasoningLength: number }> {
@@ -940,6 +987,7 @@ export class ChatService {
     let streamedContentLength = 0;
     let streamedReasoningLength = 0;
     let contentStreamingStarted = false;
+    let contentStartNotified = false;
     const appendContentToken = (token: string) => {
       contentParts.push(token);
       if (options.streamToAssistant.content !== "final_candidate") {
@@ -955,6 +1003,10 @@ export class ChatService {
           return;
         }
         contentStreamingStarted = true;
+      }
+      if (!contentStartNotified) {
+        contentStartNotified = true;
+        options.streamToAssistant.onContentStart?.();
       }
       const delta = content.slice(streamedContentLength);
       if (delta) {
@@ -1000,6 +1052,11 @@ export class ChatService {
     assistantMessageId: string;
     model: ChatModel;
   }): Promise<void> {
+    const runId = ++this.nextOpenCodeRunId;
+    this.activeOpenCodeRunId = runId;
+    const runCancelled = () => this.cancelledOpenCodeRunIds.has(runId);
+    const ownsActiveGeneration = () => this.generation.status === "running" && this.generation.assistantMessageId === options.assistantMessageId;
+    let finishedActiveGeneration = false;
     try {
       if (options.model.providerId === "remote") {
         throw new Error("OpenCode requires a local built-in model.");
@@ -1012,10 +1069,12 @@ export class ChatService {
       const timelineBlocks: ChatTimelineBlock[] = [];
       for (let toolCallCount = 0; toolCallCount <= 12; toolCallCount += 1) {
         const reasoningBlockId = `opencode-reasoning-${randomUUID()}`;
+        let latestReasoningText = "";
         const updateReasoningTimeline = (text: string, status: string) => {
           if (!text.trim()) {
             return;
           }
+          latestReasoningText = text;
           const block: ChatTimelineBlock = {
             kind: "reasoning",
             id: reasoningBlockId,
@@ -1032,24 +1091,35 @@ export class ChatService {
           this.store.updateMessageTimelineBlocks(options.assistantMessageId, timelineBlocks);
           this.broadcast();
         };
+        const assistantContentBeforePass = this.assistantMessageContent(options.assistantMessageId);
         const pass = await this.runDocumentModelPass({
           model: options.model,
-          settings: options.thread.runtimeSettings,
+          settings: openCodeModelSettings(options.model, options.thread.runtimeSettings),
           messages: workingMessages,
           builtinAgenticFramework: "opencode",
           streamToAssistant: {
             assistantMessageId: options.assistantMessageId,
-            content: "off",
+            content: "final_candidate",
+            onContentStart: () => updateReasoningTimeline(latestReasoningText, "completed"),
             onReasoning: (text) => updateReasoningTimeline(text, "updated")
           }
         });
+        if (runCancelled()) {
+          break;
+        }
         updateReasoningTimeline(pass.reasoning, "completed");
         const parsed = parseOpenCodeToolCallResponse(pass.content, pass.reasoning);
         if (parsed.status === "final") {
-          this.store.appendToMessage(options.assistantMessageId, pass.content);
+          const contentRemainder = pass.content.slice(pass.streamedContentLength);
+          if (contentRemainder) {
+            this.store.appendToMessage(options.assistantMessageId, contentRemainder);
+          }
           break;
         }
         if (parsed.status !== "tool_call") {
+          if (pass.streamedContentLength > 0) {
+            this.store.replaceMessageContent(options.assistantMessageId, assistantContentBeforePass);
+          }
           const errorText = parsed.status === "malformed" ? parsed.error : "Empty OpenCode response.";
           timelineBlocks.push({
             kind: "tool",
@@ -1079,8 +1149,33 @@ export class ChatService {
         });
         this.store.updateMessageTimelineBlocks(options.assistantMessageId, timelineBlocks);
         this.broadcast();
-        const toolResult = await runOpenCodeShellCommand(parsed.command, project.directory);
+        if (runCancelled()) {
+          break;
+        }
+        const abortController = new AbortController();
+        this.openCodeAbortController = abortController;
+        const toolResult = await runOpenCodeShellCommand(parsed.command, project.directory, abortController.signal);
+        if (this.openCodeAbortController === abortController) {
+          this.openCodeAbortController = null;
+        }
         const toolIndex = timelineBlocks.findIndex((item) => item.id === toolBlockId);
+        if (runCancelled()) {
+          if (toolIndex >= 0) {
+            timelineBlocks[toolIndex] = {
+              kind: "tool",
+              id: toolBlockId,
+              toolName: "shell",
+              status: "interrupted",
+              summary: parsed.command,
+              command: parsed.command,
+              directory: project.directory,
+              output: "Command cancelled.",
+              initiallyExpanded: true
+            };
+            this.store.updateMessageTimelineBlocks(options.assistantMessageId, timelineBlocks);
+          }
+          break;
+        }
         if (toolIndex >= 0) {
           timelineBlocks[toolIndex] = {
             kind: "tool",
@@ -1099,19 +1194,36 @@ export class ChatService {
         workingMessages.push(syntheticChatMessage("assistant", pass.content, pass.reasoning));
         workingMessages.push(syntheticChatMessage("user", `Tool result:\n${formatOpenCodeShellOutput(toolResult)}\n${openCodeToolResultGuidance(toolResult.exitCode)}`));
       }
-      this.store.updateMessageStatus(options.assistantMessageId, this.cancelRequested ? "interrupted" : "complete");
-      this.generation = { status: "idle" };
+      this.store.updateMessageStatus(options.assistantMessageId, runCancelled() ? "interrupted" : "complete");
+      if (ownsActiveGeneration()) {
+        this.generation = { status: "idle" };
+        finishedActiveGeneration = true;
+      }
     } catch (error) {
       const message = errorMessage(error);
-      this.store.updateMessageStatus(options.assistantMessageId, this.cancelRequested ? "interrupted" : "error");
-      if (!this.cancelRequested) {
+      this.store.updateMessageStatus(options.assistantMessageId, runCancelled() ? "interrupted" : "error");
+      if (!runCancelled()) {
         this.appendAssistantErrorBlock(options.assistantMessageId, message, "opencode_failed");
       }
-      this.generation = this.cancelRequested ? { status: "idle" } : { status: "error", error: message };
+      if (ownsActiveGeneration()) {
+        this.generation = runCancelled() ? { status: "idle" } : { status: "error", error: message };
+        finishedActiveGeneration = true;
+      }
     } finally {
-      this.cancelRequested = false;
+      const wasCancelled = runCancelled();
+      if (this.activeOpenCodeRunId === runId) {
+        this.openCodeAbortController?.abort();
+        this.openCodeAbortController = null;
+        this.activeOpenCodeRunId = 0;
+      }
+      this.cancelledOpenCodeRunIds.delete(runId);
+      if (!wasCancelled) {
+        this.cancelRequested = false;
+      }
       this.broadcast();
-      void this.drainNextQueuedSubmission();
+      if (finishedActiveGeneration) {
+        void this.drainNextQueuedSubmission();
+      }
     }
   }
 
@@ -1252,7 +1364,7 @@ export class ChatService {
         cwd: project.directory,
         prompt: lastUserMessage.content,
         imagePaths: preparedImages.imagePaths,
-        baseInstructions: thread.runtimeSettings.systemPrompt,
+        baseInstructions: "",
         resumeThreadId: thread.codexLastSessionId,
         model: thread.codexModelId,
         reasoningEffort: thread.codexReasoningEffort,
@@ -1550,7 +1662,7 @@ export class ChatService {
       this.broadcast();
       return this.state();
     }
-    const documentIndex = this.store.createDocumentIndex(payload.projectId, payload.title, payload.sourcePath);
+    const documentIndex = this.store.createDocumentIndex(payload.projectId, payload.title, payload.sourcePath, embeddingModelPath);
     if (selectedThread) {
       this.store.selectDocumentIndex(selectedThread.id, documentIndex.id);
     }
@@ -1595,7 +1707,7 @@ export class ChatService {
       this.broadcast();
       return this.state();
     }
-    const updated = this.store.updateDocumentIndex(payload.documentIndexId, payload.title, payload.sourcePath);
+    const updated = this.store.updateDocumentIndex(payload.documentIndexId, payload.title, payload.sourcePath, embeddingModelPath);
     this.store.selectDocumentIndex(selectedThread.id, updated.id);
     this.clearError();
     this.broadcast();
@@ -1645,11 +1757,33 @@ export class ChatService {
       if (chunks.length === 0) {
         throw new Error("Document index did not produce any searchable text chunks.");
       }
-      this.store.replaceDocumentIndexChunks(documentIndexId, chunks);
+      if (!documentIndex.embeddingModelPath.trim()) {
+        throw new Error("Document index requires an embedding model path.");
+      }
+      this.store.updateDocumentIndexStatus(documentIndexId, { state: "building", progress: 0.88, message: `Embedding 0/${chunks.length} chunks` });
+      this.broadcast();
+      const embeddings = await this.embeddingRuntime.embedDocuments({
+        modelPath: documentIndex.embeddingModelPath,
+        texts: chunks.map((chunk) => chunk.text),
+        nCtx: documentAnalysisEmbeddingContextSize(),
+        nGpuLayers: -1,
+        onProgress: (completed, total) => {
+          this.store.updateDocumentIndexStatus(documentIndexId, {
+            state: "building",
+            progress: 0.88 + (0.1 * (completed / Math.max(1, total))),
+            message: `Embedding ${completed}/${total} chunks`
+          });
+          this.broadcast();
+        }
+      });
+      this.store.replaceDocumentIndexChunks(documentIndexId, chunks.map((chunk, index) => ({
+        ...chunk,
+        embedding: embeddings[index]
+      })));
       this.store.updateDocumentIndexStatus(documentIndexId, {
         state: "ready",
         progress: 1,
-        message: `Ready (${chunks.length} chunks)`
+        message: `Ready (${chunks.length} embedded chunks)`
       });
     } catch (error) {
       this.store.updateDocumentIndexStatus(documentIndexId, {
@@ -1774,6 +1908,15 @@ function errorMessage(error: unknown): string {
 
 function localToCodexBlockReason(): string {
   return "Local to Codex is not yet supported in the same thread. You cannot send messages with Codex models in a thread that already used built-in/local models.";
+}
+
+function isRemoteModelId(models: ChatModel[], modelId: string): boolean {
+  return models.find((model) => model.id === modelId)?.providerId === "remote";
+}
+
+function isLocalModelId(models: ChatModel[], modelId: string): boolean {
+  const model = models.find((item) => item.id === modelId);
+  return Boolean(model && model.providerId !== "remote");
 }
 
 function plannedLocalContextStart(messages: ChatState["messages"], currentStart: number, settings: ChatState["runtimeSettings"]): number {
@@ -2139,24 +2282,51 @@ function parseOpenCodePayloadText(text: string): ParsedOpenCodeToolCall {
   }
 }
 
-async function runOpenCodeShellCommand(command: string, cwd: string): Promise<OpenCodeShellResult> {
-  try {
-    const result = await execFileAsync(command, [], {
+async function runOpenCodeShellCommand(command: string, cwd: string, signal: AbortSignal): Promise<OpenCodeShellResult> {
+  return new Promise((resolve) => {
+    let stdout = "";
+    let stderr = "";
+    const child = execFile(command, [], {
       cwd,
       shell: true,
       windowsHide: true,
       timeout: 120_000,
       maxBuffer: 1024 * 1024
+    }, (error, callbackStdout, callbackStderr) => {
+      stdout += callbackStdout;
+      stderr += callbackStderr;
+      if (signal.aborted) {
+        resolve({ exitCode: 130, stdout, stderr: stderr || "Command cancelled." });
+        return;
+      }
+      if (!error) {
+        resolve({ exitCode: 0, stdout, stderr });
+        return;
+      }
+      const shellError = error as { code?: unknown };
+      resolve({
+        exitCode: typeof shellError.code === "number" ? shellError.code : 1,
+        stdout,
+        stderr: stderr || errorMessage(error)
+      });
     });
-    return { exitCode: 0, stdout: result.stdout, stderr: result.stderr };
-  } catch (error) {
-    const shellError = error as { code?: unknown; stdout?: unknown; stderr?: unknown };
-    return {
-      exitCode: typeof shellError.code === "number" ? shellError.code : 1,
-      stdout: typeof shellError.stdout === "string" ? shellError.stdout : "",
-      stderr: typeof shellError.stderr === "string" ? shellError.stderr : errorMessage(error)
-    };
+    if (signal.aborted) {
+      terminateProcessTree(child);
+      return;
+    }
+    signal.addEventListener("abort", () => terminateProcessTree(child), { once: true });
+  });
+}
+
+function terminateProcessTree(child: ChildProcess): void {
+  if (child.exitCode !== null || child.killed) {
+    return;
   }
+  if (process.platform === "win32" && child.pid) {
+    execFile("taskkill", ["/pid", String(child.pid), "/t", "/f"], { windowsHide: true }, () => undefined);
+    return;
+  }
+  child.kill();
 }
 
 function formatOpenCodeShellOutput(result: OpenCodeShellResult): string {
@@ -2248,31 +2418,6 @@ function parseDocumentPayload(payload: Record<string, unknown>): ParsedDocumentT
   return { status: "malformed", error: "Only the `search` and `modify_results` tools are available." };
 }
 
-function documentAnalysisRequiresSearchFirst(messages: ChatState["messages"]): boolean {
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    const message = messages[index];
-    if (message.role !== "user") {
-      continue;
-    }
-    const content = message.content.trim();
-    if (content.startsWith("Document analysis mode is active for")) {
-      continue;
-    }
-    if (content.startsWith("Tool result:")) {
-      return false;
-    }
-    if (content.startsWith("Grounding required:") || content.startsWith("Tool call error:")) {
-      continue;
-    }
-    const normalized = content.toLowerCase();
-    if (isDocumentAnalysisMetaQuestion(normalized)) {
-      return false;
-    }
-    return Boolean(normalized && !["hi", "hello", "hey", "thanks", "thank you", "ok", "okay", "cool"].includes(normalized));
-  }
-  return false;
-}
-
 function documentAnalysisToolRetryMessage(errorText: string, hasDocumentEvidence: boolean): string {
   if (hasDocumentEvidence) {
     return [
@@ -2343,6 +2488,16 @@ function documentAnalysisModelSettings(
   return isNativeGptOssModel(model) ? threadSettings : documentSettings;
 }
 
+function openCodeModelSettings(model: ChatModel, settings: ChatState["runtimeSettings"]): ChatState["runtimeSettings"] {
+  if (isNativeGptOssModel(model)) {
+    return settings;
+  }
+  return {
+    ...settings,
+    systemPrompt: openCodeSystemPrompt(settings)
+  };
+}
+
 function isNativeGptOssModel(model: ChatModel): boolean {
   return [model.label, model.path, model.reference].filter(Boolean).join(" ").toLowerCase().includes("gpt-oss");
 }
@@ -2395,19 +2550,31 @@ function documentAnalysisSystemPrompt(settings: ChatState["runtimeSettings"], do
   ].filter(Boolean).join("\n");
 }
 
-function isDocumentAnalysisMetaQuestion(text: string): boolean {
+function openCodeSystemPrompt(settings: ChatState["runtimeSettings"]): string {
+  const currentDate = new Date().toISOString().slice(0, 10);
+  const customPrompt = settings.systemPrompt.trim();
   return [
-    "what tool",
-    "which tool",
-    "available tool",
-    "system prompt",
-    "how does this",
-    "how do you",
-    "framework",
-    "capabilit",
-    "document analysis mode",
-    "what can you do"
-  ].some((needle) => text.includes(needle));
+    "You are ChatGPT, a large language model trained by OpenAI.",
+    "Knowledge cutoff: 2024-06",
+    `Current date: ${currentDate}`,
+    "",
+    `Reasoning: ${settings.reasoningEffort}`,
+    "",
+    "# Valid channels: analysis, commentary, final. Channel must be included for every message.",
+    "OpenCode mode is for coding work inside the selected project directory.",
+    "You have exactly one host-managed tool available: `shell`.",
+    "Use shell commands to inspect files, run tests, and make focused edits.",
+    "The host calls tools. The user never calls tools directly.",
+    "Any later `Tool result:` message is host-injected shell output, not user-authored input.",
+    "If a shell command is needed, output exactly one strict tool-call block and nothing else in the final assistant message:",
+    "<tool_call>",
+    "{\"tool\":\"shell\",\"command\":\"rg -n \\\"TODO\\\" src\"}",
+    "</tool_call>",
+    "Do not put raw tool-call JSON in reasoning.",
+    "Never mix tool calls and the final answer in the same message.",
+    "After tool output is returned, use it to decide whether to call another tool or answer the user.",
+    customPrompt ? `\nAdditional user system instructions:\n${customPrompt}` : ""
+  ].filter(Boolean).join("\n");
 }
 
 function documentEvidenceBudget(settings: ChatState["runtimeSettings"], messages: ChatState["messages"] = [], documentTitle = ""): number {
