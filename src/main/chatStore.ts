@@ -1035,7 +1035,18 @@ export class ChatStore {
     if (!preset) {
       throw new Error(`Chat settings preset does not exist: ${presetId}`);
     }
-    const thread = this.db.prepare("SELECT id FROM chat_threads WHERE id = ?").get(threadId) as { id: string } | undefined;
+    const thread = this.db.prepare(
+      `SELECT id, provider_mode, runtime_settings_json, permission_mode, codex_approval_mode
+       FROM chat_threads WHERE id = ?`
+    ).get(threadId) as
+      | {
+        id: string;
+        provider_mode: string | null;
+        runtime_settings_json: string | null;
+        permission_mode: string | null;
+        codex_approval_mode: string | null;
+      }
+      | undefined;
     if (!thread) {
       throw new Error(`Chat thread does not exist: ${threadId}`);
     }
@@ -1043,15 +1054,24 @@ export class ChatStore {
       this.selectModel(preset.builtinModelId);
     }
     const { permissionMode: _permissionMode, ...runtimeSettingsWithoutAccess } = preset.runtimeSettings;
+    const currentRuntimeSettings = thread.runtime_settings_json
+      ? normalizeRuntimeSettings(parseJsonObject(thread.runtime_settings_json) as Partial<ChatRuntimeSettings>)
+      : this.runtimeSettings();
+    const currentProviderMode = normalizeProviderMode(thread.provider_mode, "builtin");
+    const currentAccessMode = currentProviderMode === "codex"
+      ? accessModeForCodexApprovalMode(normalizeCodexApprovalMode(thread.codex_approval_mode, "default"))
+      : normalizePermissionMode(currentRuntimeSettings.permissionMode, DEFAULT_RUNTIME_SETTINGS.permissionMode);
     this.updateThreadSettings(thread.id, {
       providerMode: preset.providerMode,
       selectedSettingsPresetId: preset.id,
       builtinModelId: preset.builtinModelId,
-      runtimeSettings: runtimeSettingsWithoutAccess,
+      runtimeSettings: { ...runtimeSettingsWithoutAccess, permissionMode: currentAccessMode },
       builtinAgenticFramework: preset.builtinAgenticFramework,
       documentAnalysisEmbeddingModelPath: preset.documentAnalysisEmbeddingModelPath,
       codexModelId: preset.codexModelId || defaultCodexModelId(),
-      codexReasoningEffort: preset.codexReasoningEffort
+      codexReasoningEffort: preset.codexReasoningEffort,
+      permissionMode: currentAccessMode,
+      codexApprovalMode: codexApprovalModeForAccessMode(currentAccessMode)
     });
   }
 
@@ -2799,6 +2819,14 @@ function normalizeCodexApprovalMode(value: unknown, fallback: ChatCodexApprovalM
     return "never";
   }
   return value === "default" || value === "on-request" || value === "on-failure" || value === "untrusted" || value === "never" ? value : fallback;
+}
+
+function codexApprovalModeForAccessMode(value: ChatPermissionMode): ChatCodexApprovalMode {
+  return value === "full_access" ? "never" : "default";
+}
+
+function accessModeForCodexApprovalMode(value: ChatCodexApprovalMode): ChatPermissionMode {
+  return value === "never" ? "full_access" : "default_permissions";
 }
 
 function normalizeActionButtons(value: ChatActionButton[]): ChatActionButton[] {

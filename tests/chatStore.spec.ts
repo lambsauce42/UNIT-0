@@ -429,21 +429,31 @@ test("persists settings presets and applies provider/framework state", () => {
   store.updateRuntimeSettings({ permissionMode: "default_permissions" });
   state = store.loadState();
   expect(state.threads.find((thread) => thread.id === threadId)?.selectedSettingsPresetId).toBe(openCodePreset.id);
+  store.applySettingsPreset(threadId, preset.id);
+  state = store.loadState();
+  expect(state.runtimeSettings.permissionMode).toBe("default_permissions");
+  expect(state.threads.find((thread) => thread.id === threadId)).toMatchObject({
+    permissionMode: "default_permissions",
+    codexApprovalMode: "default"
+  });
   store.updateRuntimeSettings({ temperature: 0.7 });
   state = store.loadState();
   expect(state.threads.find((thread) => thread.id === threadId)?.selectedSettingsPresetId).toBe("custom::default");
 
   store.updateThreadSettings(threadId, {
-    permissionMode: "full_access",
-    codexApprovalMode: "never"
+    providerMode: "codex",
+    permissionMode: "default_permissions",
+    codexApprovalMode: "default"
   });
-  store.applySettingsPreset(threadId, codexPreset.id);
+  store.applySettingsPreset(threadId, openCodePreset.id);
   state = store.loadState();
   expect(state.threads.find((thread) => thread.id === threadId)).toMatchObject({
-    selectedSettingsPresetId: codexPreset.id,
-    permissionMode: "full_access",
-    codexApprovalMode: "never"
+    selectedSettingsPresetId: openCodePreset.id,
+    providerMode: "builtin",
+    permissionMode: "default_permissions",
+    codexApprovalMode: "default"
   });
+  expect(state.runtimeSettings.permissionMode).toBe("default_permissions");
 
   store.deleteSettingsPreset("builtin::fast");
   expect(store.loadState().settingsPresets.some((item) => item.id === "builtin::fast")).toBe(false);
