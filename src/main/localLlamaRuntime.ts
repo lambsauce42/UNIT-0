@@ -355,8 +355,9 @@ export class LocalLlamaRuntime {
   }
 
   private slotSavePath(binaryPath: string): string {
-    const root = this.options.runtimeRoot ? path.resolve(this.options.runtimeRoot) : path.dirname(binaryPath);
-    const slotDir = path.join(root, "runtime", "llama.cpp", "slots");
+    const slotDir = this.options.runtimeRoot
+      ? path.join(path.resolve(this.options.runtimeRoot), "runtime", "llama.cpp", "slots")
+      : path.join(path.dirname(binaryPath), "slots");
     fs.mkdirSync(slotDir, { recursive: true });
     return slotDir;
   }
@@ -399,12 +400,7 @@ export function buildLlamaServerCommand(options: {
 
 export function resolveBundledLlamaServerBinary(runtimeRoot?: string): string | null {
   const names = process.platform === "win32" ? ["llama-server.exe", "llama-server"] : ["llama-server", "llama-server.exe"];
-  const roots = runtimeRoot
-    ? [runtimeRoot]
-    : [
-        path.resolve(process.cwd()),
-        path.resolve(__dirname, "../..")
-      ];
+  const roots = runtimeRoot ? [runtimeRoot] : defaultRuntimeRoots();
   const seen = new Set<string>();
   for (const root of roots) {
     const resolvedRoot = path.resolve(root);
@@ -427,6 +423,15 @@ export function resolveBundledLlamaServerBinary(runtimeRoot?: string): string | 
     }
   }
   return null;
+}
+
+function defaultRuntimeRoots(): string[] {
+  const electronResourcesPath = (process as NodeJS.Process & { resourcesPath?: unknown }).resourcesPath;
+  const roots = typeof electronResourcesPath === "string" && electronResourcesPath.trim()
+    ? [electronResourcesPath]
+    : [];
+  roots.push(process.cwd(), path.resolve(__dirname, "../.."));
+  return roots;
 }
 
 async function readServerSentEvents(body: ReadableStream<Uint8Array>, onPayload: (payload: string) => void): Promise<void> {

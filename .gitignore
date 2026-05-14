@@ -28,6 +28,9 @@ runtime/
 dist/
 build/
 out/
+release/
+portable-release/
+portable-dist/
 coverage/
 test-results/
 playwright-report/

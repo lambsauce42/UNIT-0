@@ -7,8 +7,45 @@
     "dev": "concurrently -k \"vite --host 127.0.0.1\" \"wait-on http://127.0.0.1:5173 && npm run build:main && cross-env VITE_DEV_SERVER_URL=http://127.0.0.1:5173 electron .\"",
     "build": "npm run build:main && vite build",
     "build:main": "tsc -p tsconfig.main.json",
+    "build:portable": "npm run build && electron-builder --win dir --x64",
     "test": "playwright test",
     "test:visible": "cross-env UNIT0_E2E_WINDOW_MODE=visible playwright test"
+  },
+  "build": {
+    "appId": "app.unit0.desktop",
+    "productName": "Unit 0",
+    "directories": {
+      "output": "portable-dist"
+    },
+    "files": [
+      "dist/**/*",
+      "node_modules/pdf-parse/dist/**/*",
+      "node_modules/pdfjs-dist/build/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "runtime/llama.cpp",
+        "to": "runtime/llama.cpp",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
+    "npmRebuild": false,
+    "asar": false,
+    "win": {
+      "signAndEditExecutable": false,
+      "signExts": [],
+      "target": [
+        {
+          "target": "dir",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    }
   },
   "dependencies": {
     "@codemirror/language-data": "^6.5.2",
@@ -19,7 +56,6 @@
     "@vitejs/plugin-react": "^5.0.4",
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/xterm": "^6.0.0",
-    "electron": "^39.1.2",
     "katex": "^0.16.45",
     "lucide-react": "^0.468.0",
     "markdown-it": "^14.1.1",
@@ -39,6 +75,8 @@
     "@types/react-dom": "^19.2.2",
     "concurrently": "^9.2.1",
     "cross-env": "^10.1.0",
+    "electron": "^39.8.10",
+    "electron-builder": "^26.8.1",
     "typescript": "^5.9.3",
     "wait-on": "^9.0.1"
   }

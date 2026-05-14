@@ -23,8 +23,10 @@ import type {
 import { execFile, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
+import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { PDFParse } from "pdf-parse";
 import { codexItemToTimelineBlock, type CodexRuntime, type CodexThreadEvent, type CodexThreadItem } from "./codexRuntime.js";
@@ -34,6 +36,7 @@ import { LocalLlamaRuntime } from "./localLlamaRuntime.js";
 import { RemoteHostRuntime, type RemoteStreamMetrics } from "./remoteHostRuntime.js";
 
 const execFileAsync = promisify(execFile);
+const requireFromMain = createRequire(__filename);
 const CODEX_ATTACHMENT_TEMP_PREFIX = "unit0-codex-attachments-";
 type RemoteDocumentSearchResult = { document_id?: string; entries?: unknown[] };
 type CodexTextTimelineBlock = Extract<ChatTimelineBlock, { kind: "assistant_message" | "reasoning" }>;
@@ -1954,6 +1957,7 @@ async function extractDocumentPages(sourcePath: string): Promise<string[]> {
     throw new Error(`Document source does not exist: ${resolvedPath}`);
   }
   if (path.extname(resolvedPath).toLowerCase() === ".pdf") {
+    configurePdfParseWorker();
     const parser = new PDFParse({ data: new Uint8Array(fs.readFileSync(resolvedPath)) });
     try {
       const parsed = await parser.getText();
@@ -1964,6 +1968,15 @@ async function extractDocumentPages(sourcePath: string): Promise<string[]> {
     }
   }
   return [fs.readFileSync(resolvedPath, "utf8")];
+}
+
+function configurePdfParseWorker(): void {
+  const pdfParseEntry = requireFromMain.resolve("pdf-parse");
+  const workerPath = path.join(path.dirname(pdfParseEntry), "pdf.worker.mjs");
+  if (!fs.existsSync(workerPath) || !fs.statSync(workerPath).isFile()) {
+    throw new Error(`Bundled PDF worker was not found: ${workerPath}`);
+  }
+  PDFParse.setWorker(pathToFileURL(workerPath).href);
 }
 
 function splitExtractedPdfText(text: string): string[] {
