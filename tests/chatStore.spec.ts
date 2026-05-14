@@ -548,16 +548,14 @@ test("new threads inherit active provider and thread settings without runtime se
   store.close();
 });
 
-test("normalizes invalid remote document tool settings to local execution", () => {
+test("ignores legacy remote document indexing settings", () => {
   const { store } = makeStore();
   store.updateAppSettings({
     documentIndexLocation: "local",
     documentToolExecutionLocation: "remote"
-  });
+  } as never);
 
-  expect(store.loadState().appSettings).toMatchObject({
-    documentIndexLocation: "local",
-    documentToolExecutionLocation: "local"
-  });
+  expect(store.loadState().appSettings).not.toHaveProperty("documentIndexLocation");
+  expect(store.loadState().appSettings).not.toHaveProperty("documentToolExecutionLocation");
   store.close();
 });

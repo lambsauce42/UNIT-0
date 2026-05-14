@@ -20,6 +20,9 @@
     },
     "files": [
       "dist/**/*",
+      "node_modules/opencode-ai/**/*",
+      "node_modules/opencode-windows-x64/**/*",
+      "node_modules/opencode-windows-x64-baseline/**/*",
       "node_modules/pdf-parse/dist/**/*",
       "node_modules/pdfjs-dist/build/**/*",
       "package.json"
@@ -63,6 +66,7 @@
     "markdown-it-footnote": "^4.0.0",
     "markdown-it-task-lists": "^2.1.1",
     "node-pty": "^1.1.0",
+    "opencode-ai": "^1.14.50",
     "pdf-parse": "^2.4.5",
     "react": "^19.2.0",
     "react-arborist": "^3.5.0",

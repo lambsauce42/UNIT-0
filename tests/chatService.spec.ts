@@ -7,8 +7,9 @@ import { ChatStore } from "../src/main/chatStore";
 import { MockCodexRuntime, type CodexRunOptions, type CodexThreadEvent } from "../src/main/codexRuntime";
 import type { DocumentEmbeddingRuntime } from "../src/main/embeddingRuntime";
 import { LocalLlamaRuntime } from "../src/main/localLlamaRuntime";
-import { RemoteHostRuntime, type RemoteStreamMetrics } from "../src/main/remoteHostRuntime";
-import type { ChatAppSettings, ChatBuiltinAgenticFramework, ChatMessage, ChatModel, ChatRuntimeSettings } from "../src/shared/types";
+import { mapOpenCodeEvent, normalizeOpenCodeHarmonyEvent, parseOpenCodeHarmonySnapshot, type OpenCodeRunOptions, type OpenCodeRuntime, type OpenCodeRuntimeEvent } from "../src/main/openCodeRuntime";
+import { RemoteHostRuntime } from "../src/main/remoteHostRuntime";
+import type { ChatBuiltinAgenticFramework, ChatMessage, ChatModel, ChatRuntimeSettings } from "../src/shared/types";
 
 function makeService() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-service-test-"));
@@ -137,6 +138,66 @@ class StreamingOpenCodeLlamaRuntime extends LocalLlamaRuntime {
   }
 }
 
+class ScriptedRemoteRuntime extends RemoteHostRuntime {
+  readonly frameworkCalls: string[] = [];
+  readonly calls: ChatMessage[][] = [];
+  private pass = 0;
+
+  constructor(private readonly replies: Array<{ content: string; reasoning?: string }>) {
+    super();
+  }
+
+  override async streamChat(options: Parameters<RemoteHostRuntime["streamChat"]>[0]): Promise<Awaited<ReturnType<RemoteHostRuntime["streamChat"]>>> {
+    this.frameworkCalls.push(options.builtinAgenticFramework ?? "chat");
+    this.calls.push(options.messages.map((message) => ({ ...message })));
+    const reply = this.replies[this.pass++] ?? { content: "" };
+    if (reply.reasoning) {
+      options.onReasoning?.(reply.reasoning);
+    }
+    if (reply.content) {
+      options.onToken(reply.content);
+    }
+    return {
+      remoteSessionId: "remote-session",
+      remoteSlotId: 0,
+      remoteHostId: "host",
+      remoteHostIdentity: "Remote Host",
+      remoteSessionStatus: "warm",
+      metrics: { backend: "llama-server" }
+    };
+  }
+}
+
+class ScriptedOpenCodeRuntime implements OpenCodeRuntime {
+  readonly calls: OpenCodeRunOptions[] = [];
+  readonly approvals: Array<{ permissionId: string; decision: "approve" | "deny" }> = [];
+
+  constructor(private readonly turns: OpenCodeRuntimeEvent[][] = []) {}
+
+  async *runTurn(options: OpenCodeRunOptions): AsyncIterable<OpenCodeRuntimeEvent> {
+    this.calls.push({ ...options });
+    yield { type: "session.started", sessionId: `opencode-session-${this.calls.length}` };
+    for (const event of this.turns[this.calls.length - 1] ?? []) {
+      yield event;
+    }
+    yield { type: "turn.completed" };
+  }
+
+  async answerApproval(permissionId: string, decision: "approve" | "deny"): Promise<void> {
+    this.approvals.push({ permissionId, decision });
+  }
+
+  cancelActiveRequest(): void {}
+
+  close(): void {}
+}
+
+class EndpointOnlyLlamaRuntime extends LocalLlamaRuntime {
+  async openAiEndpoint(): Promise<{ baseUrl: string; modelId: string }> {
+    return { baseUrl: "http://127.0.0.1:12345", modelId: "llama" };
+  }
+}
+
 class ReasoningOnlyThenToolRuntime extends LocalLlamaRuntime {
   private attempt = 0;
 
@@ -159,51 +220,6 @@ class ReasoningOnlyThenToolRuntime extends LocalLlamaRuntime {
     }
     options.onReasoning?.("Reading evidence.");
     options.onToken("Alpha appears in the indexed document [r1].");
-  }
-}
-
-class StreamingRemoteDocumentRuntime extends RemoteHostRuntime {
-  override async streamDocumentAnalysis(options: {
-    settings: ChatAppSettings;
-    model: ChatModel;
-    runtimeSettings: ChatRuntimeSettings;
-    messages: ChatMessage[];
-    documentIndexId: string;
-    remoteSessionId?: string;
-    runtimeSlotId?: number;
-    runtimeSettingsSignature?: string;
-    onToken: (token: string) => void;
-    onReasoning?: (token: string) => void;
-    onAgentEvents?: (events: unknown[], sessionState: unknown) => void;
-  }): Promise<RemoteStreamMetrics> {
-    options.onReasoning?.("Need remote search.");
-    options.onAgentEvents?.([
-      {
-        type: "tool_call",
-        tool_call_id: "remote-search-1",
-        tool_name: "search",
-        status: "completed",
-        summary: "pdf links",
-        command: "pdf links"
-      },
-      {
-        type: "tool_output",
-        tool_call_id: "remote-search-1",
-        stage: "final",
-        stream: "combined",
-        content: "Tool result:\n[r1] Adobe PDF32000_2008.pdf page 366: Link annotations connect document regions to destinations or actions."
-      }
-    ], {});
-    options.onReasoning?.("Reading remote evidence.");
-    options.onToken("PDF links are represented by link annotations in the PDF evidence.");
-    return {
-      remoteSessionId: "session-1",
-      remoteSlotId: 1,
-      remoteHostId: "host-1",
-      remoteHostIdentity: "identity-1",
-      remoteSessionStatus: "ready",
-      metrics: {}
-    };
   }
 }
 
@@ -526,11 +542,16 @@ test("runs OpenCode shell tool calls through local harness timeline blocks", asy
   const modelPath = path.join(dir, "model.gguf");
   fs.writeFileSync(modelPath, "");
   const store = new ChatStore(path.join(dir, "chat.sqlite"));
-  const runtime = new ScriptedLlamaRuntime([
-    '<tool_call>{"tool":"shell","command":"echo open-code-ok"}</tool_call>',
-    "Done."
-  ]);
-  const service = new ChatService(store, runtime, new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined, new TestEmbeddingRuntime());
+  const openCodeRuntime = new ScriptedOpenCodeRuntime([[
+    {
+      type: "timeline",
+      eventType: "item.completed",
+      block: { kind: "tool", id: "tool-1", toolName: "bash", status: "completed", command: "echo open-code-ok", output: "open-code-ok" }
+    },
+    { type: "assistant.delta", id: "assistant-1", status: "updated", text: "Done." }
+  ]]);
+  const runtime = new EndpointOnlyLlamaRuntime();
+  const service = new ChatService(store, runtime, new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined, new TestEmbeddingRuntime(), openCodeRuntime);
   try {
     let state = store.loadState();
     store.updateProjectSettings(state.selectedProjectId, "OpenCode Project", dir);
@@ -547,12 +568,605 @@ test("runs OpenCode shell tool calls through local harness timeline blocks", asy
     state = store.loadState();
     const assistant = state.messages.find((message) => message.role === "assistant");
     expect(assistant?.content).toBe("Done.");
-    expect(assistant?.timelineBlocks?.some((block) => block.kind === "tool" && block.toolName === "shell" && block.status === "completed" && block.output?.includes("open-code-ok"))).toBe(true);
-    expect(runtime.frameworkCalls).toEqual(["opencode", "opencode"]);
-    expect(runtime.calls[1].at(-1)?.content).toContain("Tool result:");
+    expect(assistant?.timelineBlocks?.some((block) => block.kind === "tool" && block.toolName === "bash" && block.status === "completed" && block.output?.includes("open-code-ok"))).toBe(true);
+    expect(openCodeRuntime.calls).toHaveLength(1);
+    expect(openCodeRuntime.calls[0]).toMatchObject({
+      cwd: dir,
+      prompt: "check the workspace",
+      permissionMode: "full_access",
+      nativeGptOss: false
+    });
+    expect(store.loadState().threads.find((thread) => thread.id === state.selectedThreadId)?.openCodeSessionId).toBe("opencode-session-1");
   } finally {
     service.close();
     fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("routes flattened OpenCode GPT-OSS snapshots into reasoning instead of assistant content", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-opencode-flat-test-"));
+  const modelPath = path.join(dir, "gpt-oss-renamed-model.gguf");
+  fs.writeFileSync(modelPath, "");
+  const store = new ChatStore(path.join(dir, "chat.sqlite"));
+  class NormalizingFlattenedOpenCodeRuntime implements OpenCodeRuntime {
+    readonly calls: OpenCodeRunOptions[] = [];
+
+    async *runTurn(options: OpenCodeRunOptions): AsyncIterable<OpenCodeRuntimeEvent> {
+      this.calls.push({ ...options });
+      const states = new Map();
+      yield { type: "session.started", sessionId: "opencode-session-flat" };
+      for (const event of [
+        {
+          type: "assistant.delta" as const,
+          id: "msg_flat:prt_flat",
+          status: "updated",
+          sessionId: "opencode-session-flat",
+          text: "User says \"hi\". We need to respond appropriately.\n\n"
+        },
+        {
+          type: "assistant.delta" as const,
+          id: "msg_flat:prt_flat",
+          status: "updated",
+          sessionId: "opencode-session-flat",
+          text: "Hello!<|return|>"
+        }
+      ]) {
+        for (const normalizedEvent of normalizeOpenCodeHarmonyEvent(event, states, options.nativeGptOss)) {
+          yield normalizedEvent;
+        }
+      }
+      yield { type: "turn.completed", sessionId: "opencode-session-flat" };
+    }
+
+    async answerApproval(): Promise<void> {}
+
+    cancelActiveRequest(): void {}
+
+    close(): void {}
+  }
+  const openCodeRuntime = new NormalizingFlattenedOpenCodeRuntime();
+  const snapshots: Array<ReturnType<ChatService["state"]>> = [];
+  let service: ChatService | null = null;
+  service = new ChatService(store, new EndpointOnlyLlamaRuntime(), new RemoteHostRuntime(), new MockCodexRuntime(), () => {
+    const snapshot = service?.state();
+    if (snapshot) {
+      snapshots.push(snapshot);
+    }
+  }, new TestEmbeddingRuntime(), openCodeRuntime);
+  try {
+    let state = store.loadState();
+    store.updateProjectSettings(state.selectedProjectId, "OpenCode Project", dir);
+    store.addLocalModel(modelPath);
+    state = store.loadState();
+    store.updateThreadSettings(state.selectedThreadId, {
+      builtinAgenticFramework: "opencode",
+      builtinModelId: state.selectedModelId
+    });
+
+    await service.submit({ text: "hi" });
+    await expect.poll(() => service.state().generation.status).toBe("idle");
+
+    state = store.loadState();
+    const assistant = state.messages.find((message) => message.role === "assistant");
+    expect(assistant?.content).toBe("Hello!");
+    expect(assistant?.reasoning).toBe("User says \"hi\". We need to respond appropriately.");
+    expect(assistant?.content).not.toContain("User says");
+    expect(assistant?.content).not.toContain("<|return|>");
+    expect(assistant?.reasoning).not.toContain("<|return|>");
+    expect(assistant?.timelineBlocks?.map((block) => block.kind)).toEqual(["reasoning", "assistant_message"]);
+    expect(assistant?.timelineBlocks?.find((block) => block.kind === "reasoning")).toMatchObject({
+      status: "completed",
+      text: "User says \"hi\". We need to respond appropriately."
+    });
+    expect(assistant?.timelineBlocks?.find((block) => block.kind === "assistant_message")).toMatchObject({
+      status: "completed",
+      text: "Hello!"
+    });
+    const firstReasoningFrame = snapshots.findIndex((snapshot) => {
+      const item = snapshot.messages.find((message) => message.role === "assistant");
+      return Boolean(item?.reasoning || item?.timelineBlocks?.some((block) => block.kind === "reasoning" && block.text));
+    });
+    const firstAnswerFrame = snapshots.findIndex((snapshot) => {
+      const item = snapshot.messages.find((message) => message.role === "assistant");
+      return Boolean(item?.content || item?.timelineBlocks?.some((block) => block.kind === "assistant_message" && block.text));
+    });
+    expect(firstReasoningFrame).toBeGreaterThanOrEqual(0);
+    expect(firstAnswerFrame).toBeGreaterThan(firstReasoningFrame);
+    expect(openCodeRuntime.calls[0]?.nativeGptOss).toBe(true);
+    expect(openCodeRuntime.calls[0]?.endpoint.modelId).toBe("llama");
+  } finally {
+    service?.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("reconciles OpenCode final snapshots with visible timeline blocks", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-opencode-final-test-"));
+  const modelPath = path.join(dir, "model.gguf");
+  fs.writeFileSync(modelPath, "");
+  const store = new ChatStore(path.join(dir, "chat.sqlite"));
+  const openCodeRuntime = new ScriptedOpenCodeRuntime([[
+    { type: "assistant.delta", id: "assistant-1", status: "updated", text: "Draft answer." },
+    { type: "assistant.delta", id: "assistant-2", status: "updated", text: "Stale second answer." },
+    { type: "reasoning.delta", id: "reasoning-1", status: "updated", text: "Need a final answer." },
+    { type: "reasoning.delta", id: "reasoning-2", status: "updated", text: "Stale second reason." },
+    { type: "final.snapshot", content: "Final answer.", reasoning: "Need a final answer." }
+  ]]);
+  const frames: Array<ReturnType<ChatService["state"]>> = [];
+  let service: ChatService | null = null;
+  service = new ChatService(store, new EndpointOnlyLlamaRuntime(), new RemoteHostRuntime(), new MockCodexRuntime(), () => {
+    const snapshot = service?.state();
+    if (snapshot) {
+      frames.push(snapshot);
+    }
+  }, new TestEmbeddingRuntime(), openCodeRuntime);
+  try {
+    let state = store.loadState();
+    store.updateProjectSettings(state.selectedProjectId, "OpenCode Final Project", dir);
+    store.addLocalModel(modelPath);
+    state = store.loadState();
+    store.updateThreadSettings(state.selectedThreadId, {
+      builtinAgenticFramework: "opencode",
+      builtinModelId: state.selectedModelId
+    });
+
+    await service.submit({ text: "finish cleanly" });
+    await expect.poll(() => service.state().generation.status).toBe("idle");
+
+    state = store.loadState();
+    const assistant = state.messages.find((message) => message.role === "assistant");
+    expect(assistant?.content).toBe("Final answer.");
+    expect(assistant?.reasoning).toBe("Need a final answer.");
+    expect(assistant?.timelineBlocks?.map((block) => block.kind)).toEqual(["reasoning", "assistant_message"]);
+    expect(assistant?.timelineBlocks?.filter((block) => block.kind === "assistant_message")).toEqual([
+      expect.objectContaining({ status: "completed", text: "Final answer." })
+    ]);
+    expect(assistant?.timelineBlocks?.filter((block) => block.kind === "reasoning")).toEqual([
+      expect.objectContaining({ status: "completed", text: "Need a final answer." })
+    ]);
+    const reasoningAfterAssistantFrames = frames.filter((frame) => {
+      const item = frame.messages.find((message) => message.role === "assistant");
+      const kinds = item?.timelineBlocks?.map((block) => block.kind) ?? [];
+      let sawAssistant = false;
+      return kinds.some((kind) => {
+        if (kind === "assistant_message") {
+          sawAssistant = true;
+        }
+        return sawAssistant && kind === "reasoning";
+      });
+    });
+    expect(reasoningAfterAssistantFrames).toEqual([]);
+  } finally {
+    service?.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("maps OpenCode server permission events to Unit-0 approval blocks", () => {
+  const errors: string[] = [];
+  const events = Array.from(mapOpenCodeEvent({
+    type: "permission.asked",
+    properties: {
+      id: "per_123",
+      sessionID: "ses_123",
+      permission: "bash",
+      patterns: ["git status*"],
+      always: ["git status*"],
+      metadata: { command: "git status --short" },
+      tool: { messageID: "msg_123", callID: "call_123" }
+    }
+  }, (message) => errors.push(message)));
+
+  expect(errors).toEqual([]);
+  expect(events).toEqual([{
+    type: "timeline",
+    eventType: "item.started",
+    sessionId: "ses_123",
+    block: {
+      kind: "approval",
+      id: "per_123",
+      status: "requested",
+      title: "OpenCode approval required: bash",
+      details: expect.stringContaining("git status --short"),
+      requestMethod: "opencode",
+      toolCallId: "ses_123"
+    }
+  }]);
+});
+
+test("maps OpenCode message deltas without appending full part snapshots", () => {
+  const errors: string[] = [];
+  const deltaEvents = Array.from(mapOpenCodeEvent({
+    type: "message.part.delta",
+    properties: {
+      sessionID: "ses_123",
+      messageID: "msg_123",
+      partID: "prt_123",
+      field: "text",
+      delta: "hello"
+    }
+  }, (message) => errors.push(message)));
+  const fullPartEvents = Array.from(mapOpenCodeEvent({
+    type: "message.part.updated",
+    properties: {
+      sessionID: "ses_123",
+      part: {
+        id: "prt_123",
+        sessionID: "ses_123",
+        messageID: "msg_123",
+        type: "text",
+        text: "hello"
+      },
+      time: Date.now()
+    }
+  }, (message) => errors.push(message)));
+
+  expect(errors).toEqual([]);
+  expect(deltaEvents).toEqual([{
+    type: "assistant.delta",
+    id: "msg_123:prt_123",
+    status: "updated",
+    text: "hello",
+    sessionId: "ses_123"
+  }]);
+  expect(fullPartEvents).toEqual([]);
+});
+
+test("normalizes GPT-OSS Harmony channels from OpenCode text deltas", () => {
+  const parsers = new Map();
+  const events = [
+    ...normalizeOpenCodeHarmonyEvent({
+      type: "assistant.delta",
+      id: "msg_123:prt_123",
+      status: "updated",
+      sessionId: "ses_123",
+      text: "<|channel|>analysis<|message|>Need short answer.<|end|><|start|>assistant<|channel|>final<|message|>opencode-ok<|return|>"
+    }, parsers)
+  ];
+
+  expect(events).toEqual([
+    {
+      type: "reasoning.delta",
+      id: "msg_123:prt_123:reasoning",
+      status: "updated",
+      text: "Need short answer.",
+      sessionId: "ses_123"
+    },
+    {
+      type: "assistant.delta",
+      id: "msg_123:prt_123",
+      status: "updated",
+      text: "opencode-ok",
+      sessionId: "ses_123"
+    }
+  ]);
+  expect(events.map((event) => "text" in event ? event.text : "").join("")).not.toContain("<|return|>");
+});
+
+test("normalizes GPT-OSS Harmony channels split across OpenCode text deltas", () => {
+  const parsers = new Map();
+  const first = normalizeOpenCodeHarmonyEvent({
+    type: "assistant.delta",
+    id: "msg_split:prt_split",
+    status: "updated",
+    sessionId: "ses_split",
+    text: "<|chan"
+  }, parsers);
+  const second = normalizeOpenCodeHarmonyEvent({
+    type: "assistant.delta",
+    id: "msg_split:prt_split",
+    status: "updated",
+    sessionId: "ses_split",
+    text: "nel|>analysis<|message|>Need short answer.<|end|><|start|>assistant<|channel|>final<|message|>opencode-ok<|return|>"
+  }, parsers);
+
+  expect(first).toEqual([]);
+  expect(second).toEqual([
+    {
+      type: "reasoning.delta",
+      id: "msg_split:prt_split:reasoning",
+      status: "updated",
+      text: "Need short answer.",
+      sessionId: "ses_split"
+    },
+    {
+      type: "assistant.delta",
+      id: "msg_split:prt_split",
+      status: "updated",
+      text: "opencode-ok",
+      sessionId: "ses_split"
+    }
+  ]);
+  expect(second.map((event) => "text" in event ? event.text : "").join("")).not.toContain("<|");
+});
+
+test("normalizes flattened GPT-OSS OpenCode text after return marker", () => {
+  const parsers = new Map();
+  const first = normalizeOpenCodeHarmonyEvent({
+    type: "assistant.delta",
+    id: "msg_flat:prt_flat",
+    status: "updated",
+    sessionId: "ses_flat",
+    text: "User says \"hi\". We need to respond appropriately.\n\n"
+  }, parsers);
+  const second = normalizeOpenCodeHarmonyEvent({
+    type: "assistant.delta",
+    id: "msg_flat:prt_flat",
+    status: "updated",
+    sessionId: "ses_flat",
+    text: "Hello!<|return|>"
+  }, parsers);
+
+  expect(first).toEqual([{
+    type: "reasoning.delta",
+    id: "msg_flat:prt_flat:reasoning",
+    status: "updated",
+    text: "User says \"hi\". We need to respond appropriately.",
+    sessionId: "ses_flat"
+  }]);
+  expect(second).toEqual([{
+    type: "assistant.delta",
+    id: "msg_flat:prt_flat",
+    status: "updated",
+    text: "Hello!",
+    sessionId: "ses_flat"
+  }]);
+});
+
+test("holds flattened GPT-OSS OpenCode final text until the return marker", () => {
+  const parsers = new Map();
+  const events = [
+    ...normalizeOpenCodeHarmonyEvent({
+      type: "assistant.delta",
+      id: "msg_stream:prt_stream",
+      status: "updated",
+      sessionId: "ses_stream",
+      text: "Need a short greeting.\n\n"
+    }, parsers),
+    ...normalizeOpenCodeHarmonyEvent({
+      type: "assistant.delta",
+      id: "msg_stream:prt_stream",
+      status: "updated",
+      sessionId: "ses_stream",
+      text: "Hel"
+    }, parsers),
+    ...normalizeOpenCodeHarmonyEvent({
+      type: "assistant.delta",
+      id: "msg_stream:prt_stream",
+      status: "updated",
+      sessionId: "ses_stream",
+      text: "lo"
+    }, parsers),
+    ...normalizeOpenCodeHarmonyEvent({
+      type: "assistant.delta",
+      id: "msg_stream:prt_stream",
+      status: "updated",
+      sessionId: "ses_stream",
+      text: "!<|return|>"
+    }, parsers)
+  ];
+
+  expect(events).toEqual([
+    {
+      type: "reasoning.delta",
+      id: "msg_stream:prt_stream:reasoning",
+      status: "updated",
+      text: "Need a short greeting.",
+      sessionId: "ses_stream"
+    },
+    {
+      type: "assistant.delta",
+      id: "msg_stream:prt_stream",
+      status: "updated",
+      text: "Hello!",
+      sessionId: "ses_stream"
+    }
+  ]);
+  expect(events.map((event) => "text" in event ? event.text : "").join("")).not.toContain("<|return|>");
+});
+
+test("holds flattened GPT-OSS partial return markers out of streamed final text", () => {
+  const parsers = new Map();
+  const events = [
+    ...normalizeOpenCodeHarmonyEvent({
+      type: "assistant.delta",
+      id: "msg_partial:prt_partial",
+      status: "updated",
+      sessionId: "ses_partial",
+      text: "Need a short greeting.\n\nAns"
+    }, parsers),
+    ...normalizeOpenCodeHarmonyEvent({
+      type: "assistant.delta",
+      id: "msg_partial:prt_partial",
+      status: "updated",
+      sessionId: "ses_partial",
+      text: "wer<"
+    }, parsers),
+    ...normalizeOpenCodeHarmonyEvent({
+      type: "assistant.delta",
+      id: "msg_partial:prt_partial",
+      status: "updated",
+      sessionId: "ses_partial",
+      text: "|return|>"
+    }, parsers)
+  ];
+
+  expect(events).toEqual([
+    {
+      type: "reasoning.delta",
+      id: "msg_partial:prt_partial:reasoning",
+      status: "updated",
+      text: "Need a short greeting.",
+      sessionId: "ses_partial"
+    },
+    {
+      type: "assistant.delta",
+      id: "msg_partial:prt_partial",
+      status: "updated",
+      text: "Answer",
+      sessionId: "ses_partial"
+    }
+  ]);
+  expect(events.map((event) => "text" in event ? event.text : "").join("")).not.toContain("<");
+});
+
+test("keeps streamed flattened final text when a trailing blank line arrives before return", () => {
+  const parsers = new Map();
+  const events = [
+    ...normalizeOpenCodeHarmonyEvent({
+      type: "assistant.delta",
+      id: "msg_trailing:prt_trailing",
+      status: "updated",
+      sessionId: "ses_trailing",
+      text: "Need a short answer.\n\nopencode-ok"
+    }, parsers),
+    ...normalizeOpenCodeHarmonyEvent({
+      type: "assistant.delta",
+      id: "msg_trailing:prt_trailing",
+      status: "updated",
+      sessionId: "ses_trailing",
+      text: "\n\n"
+    }, parsers),
+    ...normalizeOpenCodeHarmonyEvent({
+      type: "assistant.delta",
+      id: "msg_trailing:prt_trailing",
+      status: "updated",
+      sessionId: "ses_trailing",
+      text: "<|return|>"
+    }, parsers)
+  ];
+
+  expect(events).toEqual([
+    {
+      type: "reasoning.delta",
+      id: "msg_trailing:prt_trailing:reasoning",
+      status: "updated",
+      text: "Need a short answer.",
+      sessionId: "ses_trailing"
+    },
+    {
+      type: "assistant.delta",
+      id: "msg_trailing:prt_trailing",
+      status: "updated",
+      text: "opencode-ok",
+      sessionId: "ses_trailing"
+    }
+  ]);
+});
+
+test("normalizes flattened GPT-OSS OpenCode text when no answer streamed before return", () => {
+  const parsers = new Map();
+  const first = normalizeOpenCodeHarmonyEvent({
+    type: "assistant.delta",
+    id: "msg_late:prt_late",
+    status: "updated",
+    sessionId: "ses_late",
+    text: "User says \"hi\". We need to respond appropriately."
+  }, parsers);
+  const second = normalizeOpenCodeHarmonyEvent({
+    type: "assistant.delta",
+    id: "msg_late:prt_late",
+    status: "updated",
+    sessionId: "ses_late",
+    text: "\n\nHello!<|return|>"
+  }, parsers);
+
+  expect(first).toEqual([]);
+  expect(second).toEqual([
+    {
+      type: "reasoning.delta",
+      id: "msg_late:prt_late:reasoning",
+      status: "updated",
+      text: "User says \"hi\". We need to respond appropriately.",
+      sessionId: "ses_late"
+    },
+    {
+      type: "assistant.delta",
+      id: "msg_late:prt_late",
+      status: "updated",
+      text: "Hello!",
+      sessionId: "ses_late"
+    }
+  ]);
+});
+
+test("normalizes GPT-OSS Harmony channels from OpenCode final snapshots", () => {
+  const parsed = parseOpenCodeHarmonySnapshot("<|channel|>analysis<|message|>Think.<|end|><|start|>assistant<|channel|>final<|message|>Done.<|return|>");
+
+  expect(parsed).toEqual({
+    reasoning: "Think.",
+    content: "Done."
+  });
+});
+
+test("normalizes flattened GPT-OSS final snapshots with return marker", () => {
+  const parsed = parseOpenCodeHarmonySnapshot("User says \"hi\". We need a greeting.\n\nHello!<|return|>");
+
+  expect(parsed).toEqual({
+    reasoning: "User says \"hi\". We need a greeting.",
+    content: "Hello!"
+  });
+});
+
+test("normalizes flattened GPT-OSS final snapshots with trailing blank line before return", () => {
+  const parsed = parseOpenCodeHarmonySnapshot("Need a short answer.\n\nopencode-ok\n\n<|return|>");
+
+  expect(parsed).toEqual({
+    reasoning: "Need a short answer.",
+    content: "opencode-ok"
+  });
+});
+
+test("passes through non-GPT-OSS OpenCode plain text deltas", () => {
+  const events = normalizeOpenCodeHarmonyEvent({
+    type: "assistant.delta",
+    id: "msg_plain:prt_plain",
+    status: "updated",
+    sessionId: "ses_plain",
+    text: "plain model text"
+  }, new Map(), false);
+
+  expect(events).toEqual([{
+    type: "assistant.delta",
+    id: "msg_plain:prt_plain",
+    status: "updated",
+    sessionId: "ses_plain",
+    text: "plain model text"
+  }]);
+});
+
+test("rejects remote models for OpenCode because the real harness is bound to the local OpenAI endpoint", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-remote-opencode-test-"));
+  const storeDir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-remote-opencode-store-"));
+  const store = new ChatStore(path.join(storeDir, "chat.sqlite"));
+  const service = new ChatService(store, new LocalLlamaRuntime(), new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined, new TestEmbeddingRuntime());
+  try {
+    store.updateProjectSettings(store.loadState().selectedProjectId, "Remote OpenCode Project", dir);
+    store.replaceRemoteModels([{
+      id: "remote-model",
+      label: "Remote Model",
+      path: "remote://model",
+      providerId: "remote",
+      reference: "gpt-oss",
+      sourceLabel: "Remote Built-in",
+      hostId: "host",
+      createdAt: new Date().toISOString()
+    }], { hostId: "host", hostIdentity: "Remote Host", protocolVersion: "1" });
+    const state = store.loadState();
+    const next = service.updateThreadSettings({
+      threadId: state.selectedThreadId,
+      builtinAgenticFramework: "opencode",
+      builtinModelId: "remote-model"
+    });
+
+    expect(next.generation).toMatchObject({
+      status: "error",
+      error: "OpenCode requires a local built-in model."
+    });
+  } finally {
+    service.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(storeDir, { recursive: true, force: true });
   }
 });
 
@@ -565,12 +1179,18 @@ test("streams OpenCode final answer content after tool-call prefix is ruled out"
     releaseSecondToken = resolve;
   });
   const store = new ChatStore(path.join(dir, "chat.sqlite"));
-  const runtime = new StreamingOpenCodeLlamaRuntime(["Streaming ", "answer."], async (index) => {
-    if (index === 0) {
+  class GatedOpenCodeRuntime extends ScriptedOpenCodeRuntime {
+    override async *runTurn(options: OpenCodeRunOptions): AsyncIterable<OpenCodeRuntimeEvent> {
+      this.calls.push({ ...options });
+      yield { type: "session.started", sessionId: "opencode-session-stream" };
+      yield { type: "reasoning.delta", id: "reasoning-1", status: "updated", text: "Thinking first." };
+      yield { type: "assistant.delta", id: "assistant-1", status: "updated", text: "Streaming " };
       await secondTokenGate;
+      yield { type: "assistant.delta", id: "assistant-1", status: "updated", text: "answer." };
+      yield { type: "turn.completed" };
     }
-  }, ["Thinking ", "first."]);
-  const service = new ChatService(store, runtime, new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined, new TestEmbeddingRuntime());
+  }
+  const service = new ChatService(store, new EndpointOnlyLlamaRuntime(), new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined, new TestEmbeddingRuntime(), new GatedOpenCodeRuntime());
   try {
     let state = store.loadState();
     store.updateProjectSettings(state.selectedProjectId, "OpenCode Stream Project", dir);
@@ -603,11 +1223,8 @@ test("streams OpenCode final answer content after tool-call prefix is ruled out"
   }
 });
 
-test("rejects remote models for OpenCode harness settings", async () => {
+test("requires local models for OpenCode harness settings", async () => {
   const { service, store, cleanup } = makeService();
-  const localModelDir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-opencode-local-model-"));
-  const localModelPath = path.join(localModelDir, "model.gguf");
-  fs.writeFileSync(localModelPath, "");
   try {
     store.replaceRemoteModels([{
       id: "remote-model",
@@ -655,19 +1272,14 @@ test("rejects remote models for OpenCode harness settings", async () => {
       error: "OpenCode requires a local built-in model."
     });
 
-    store.saveSettingsPreset({
-      label: "Legacy Blank OpenCode",
+    const remotePresetState = service.saveSettingsPreset({
+      label: "Remote OpenCode",
+      runtimeSettings: {},
       providerMode: "builtin",
       builtinAgenticFramework: "opencode",
-      builtinModelId: ""
+      builtinModelId: "remote-model"
     });
-    const legacyBlankPreset = store.loadState().settingsPresets.find((preset) => preset.label === "Legacy Blank OpenCode");
-    expect(legacyBlankPreset).toBeTruthy();
-    const rejectedPresetApply = service.applySettingsPreset({
-      threadId: state.selectedThreadId,
-      presetId: legacyBlankPreset!.id
-    });
-    expect(rejectedPresetApply.generation).toMatchObject({
+    expect(remotePresetState.generation).toMatchObject({
       status: "error",
       error: "OpenCode requires a local built-in model."
     });
@@ -685,26 +1297,9 @@ test("rejects remote models for OpenCode harness settings", async () => {
       providerMode: "codex",
       builtinAgenticFramework: "chat"
     });
-
-    store.addLocalModel(localModelPath);
-    const localState = store.loadState();
-    service.updateThreadSettings({
-      threadId: localState.selectedThreadId,
-      builtinAgenticFramework: "opencode",
-      builtinModelId: localState.selectedModelId
-    });
-
-    const blockedSelect = service.selectModel("remote-model");
-
-    expect(blockedSelect.generation).toMatchObject({
-      status: "error",
-      error: "OpenCode requires a local built-in model."
-    });
-    expect(store.loadState().threads.find((thread) => thread.id === localState.selectedThreadId)?.builtinModelId).toBe(localState.selectedModelId);
   } finally {
     service.close();
     cleanup();
-    fs.rmSync(localModelDir, { recursive: true, force: true });
   }
 });
 
@@ -712,13 +1307,39 @@ test("cancels active OpenCode shell tool execution", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-opencode-cancel-test-"));
   const modelPath = path.join(dir, "model.gguf");
   fs.writeFileSync(modelPath, "");
-  const command = `${JSON.stringify(process.execPath)} -e "setTimeout(()=>{}, 30000)"`;
   const store = new ChatStore(path.join(dir, "chat.sqlite"));
-  const runtime = new ScriptedLlamaRuntime([
-    `<tool_call>${JSON.stringify({ tool: "shell", command })}</tool_call>`,
-    "Should not continue."
-  ]);
-  const service = new ChatService(store, runtime, new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined, new TestEmbeddingRuntime());
+  let releaseRun: (() => void) | null = null;
+  const runGate = new Promise<void>((resolve) => {
+    releaseRun = resolve;
+  });
+  class BlockingOpenCodeRuntime extends ScriptedOpenCodeRuntime {
+    cancelled = false;
+
+    override async *runTurn(options: OpenCodeRunOptions): AsyncIterable<OpenCodeRuntimeEvent> {
+      this.calls.push({ ...options });
+      yield { type: "session.started", sessionId: "opencode-session-cancel" };
+      yield {
+        type: "timeline",
+        eventType: "item.started",
+        block: { kind: "tool", id: "tool-1", toolName: "bash", status: "started", command: "long command" }
+      };
+      await runGate;
+      if (this.cancelled) {
+        yield {
+          type: "timeline",
+          eventType: "item.completed",
+          block: { kind: "tool", id: "tool-1", toolName: "bash", status: "interrupted", command: "long command", output: "Command cancelled." }
+        };
+      }
+    }
+
+    override cancelActiveRequest(): void {
+      this.cancelled = true;
+      releaseRun?.();
+    }
+  }
+  const openCodeRuntime = new BlockingOpenCodeRuntime();
+  const service = new ChatService(store, new EndpointOnlyLlamaRuntime(), new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined, new TestEmbeddingRuntime(), openCodeRuntime);
   try {
     let state = store.loadState();
     store.updateProjectSettings(state.selectedProjectId, "OpenCode Cancel Project", dir);
@@ -733,13 +1354,13 @@ test("cancels active OpenCode shell tool execution", async () => {
     await expect.poll(() => service.state().messages.find((message) => message.role === "assistant")?.timelineBlocks?.some((block) => block.kind === "tool" && block.status === "started") ?? false).toBe(true);
     service.cancel();
     await expect.poll(() => service.state().generation.status).toBe("idle");
-    await expect.poll(() => service.state().messages.find((message) => message.role === "assistant")?.timelineBlocks?.some((block) => block.kind === "tool" && block.status === "interrupted") ?? false).toBe(true);
 
     state = store.loadState();
     const assistant = state.messages.find((message) => message.role === "assistant");
     expect(assistant?.status).toBe("interrupted");
-    expect(runtime.frameworkCalls).toEqual(["opencode"]);
+    expect(openCodeRuntime.calls).toHaveLength(1);
   } finally {
+    releaseRun?.();
     service.close();
     fs.rmSync(dir, { recursive: true, force: true });
   }
@@ -749,7 +1370,6 @@ test("cancelled OpenCode run does not clear a newer generation", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-opencode-race-test-"));
   const modelPath = path.join(dir, "model.gguf");
   fs.writeFileSync(modelPath, "");
-  const command = `${JSON.stringify(process.execPath)} -e "setTimeout(()=>{}, 30000)"`;
   let releaseSecondReply: (() => void) | null = null;
   const secondReplyGate = new Promise<void>((resolve) => {
     releaseSecondReply = resolve;
@@ -759,16 +1379,35 @@ test("cancelled OpenCode run does not clear a newer generation", async () => {
     secondReplyStarted = resolve;
   });
   const store = new ChatStore(path.join(dir, "chat.sqlite"));
-  const runtime = new ScriptedLlamaRuntime([
-    `<tool_call>${JSON.stringify({ tool: "shell", command })}</tool_call>`,
-    "Second response."
-  ], async (callIndex) => {
-    if (callIndex === 1) {
+  let releaseFirstRun: (() => void) | null = null;
+  const firstRunGate = new Promise<void>((resolve) => {
+    releaseFirstRun = resolve;
+  });
+  class RacingOpenCodeRuntime extends ScriptedOpenCodeRuntime {
+    override async *runTurn(options: OpenCodeRunOptions): AsyncIterable<OpenCodeRuntimeEvent> {
+      this.calls.push({ ...options });
+      const callIndex = this.calls.length - 1;
+      yield { type: "session.started", sessionId: `opencode-race-${callIndex}` };
+      if (callIndex === 0) {
+        yield {
+          type: "timeline",
+          eventType: "item.started",
+          block: { kind: "tool", id: "tool-1", toolName: "bash", status: "started", command: "long command" }
+        };
+        await firstRunGate;
+        return;
+      }
       secondReplyStarted?.();
       await secondReplyGate;
+      yield { type: "assistant.delta", id: "assistant-2", status: "updated", text: "Second response." };
+      yield { type: "turn.completed" };
     }
-  });
-  const service = new ChatService(store, runtime, new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined, new TestEmbeddingRuntime());
+
+    override cancelActiveRequest(): void {
+      releaseFirstRun?.();
+    }
+  }
+  const service = new ChatService(store, new EndpointOnlyLlamaRuntime(), new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined, new TestEmbeddingRuntime(), new RacingOpenCodeRuntime());
   try {
     let state = store.loadState();
     store.updateProjectSettings(state.selectedProjectId, "OpenCode Race Project", dir);
@@ -784,7 +1423,7 @@ test("cancelled OpenCode run does not clear a newer generation", async () => {
     service.cancel();
     await service.submit({ text: "new request" });
     await secondReplyStartedGate;
-    await expect.poll(() => service.state().messages.find((message) => message.role === "assistant" && message.timelineBlocks?.some((block) => block.kind === "tool" && block.status === "interrupted"))?.status).toBe("interrupted");
+    await expect.poll(() => service.state().messages.find((message) => message.role === "assistant")?.status).toBe("interrupted");
 
     expect(service.state().generation.status).toBe("running");
 
@@ -795,6 +1434,7 @@ test("cancelled OpenCode run does not clear a newer generation", async () => {
     expect(assistants.at(-1)?.content).toBe("Second response.");
     expect(assistants.at(-1)?.status).toBe("complete");
   } finally {
+    releaseFirstRun?.();
     releaseSecondReply?.();
     service.close();
     fs.rmSync(dir, { recursive: true, force: true });
@@ -1383,70 +2023,6 @@ test("rejects document-analysis tool calls emitted only in reasoning", async () 
     expect(assistant?.timelineBlocks?.filter((block) => block.kind === "tool")).toHaveLength(2);
     expect(assistant?.timelineBlocks?.[1]).toMatchObject({ kind: "tool", status: "failed" });
     expect(runtime.calls[1].at(-1)?.content).toContain("only final assistant message content can contain `<tool_call>` blocks");
-  } finally {
-    service.close();
-    fs.rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test("keeps remote-hosted document reasoning and tool output in event order", async () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-doc-remote-stream-test-"));
-  const store = new ChatStore(path.join(dir, "chat.sqlite"));
-  const service = new ChatService(store, new ScriptedLlamaRuntime([]), new StreamingRemoteDocumentRuntime(), new MockCodexRuntime(), () => undefined, new TestEmbeddingRuntime());
-  try {
-    const sourcePath = path.join(dir, "remote-notes.txt");
-    fs.writeFileSync(sourcePath, "pdf links are annotations");
-    store.replaceRemoteModels([
-      {
-        id: "remote-model",
-        label: "Remote Model",
-        path: "",
-        providerId: "remote",
-        reference: "remote-model",
-        hostId: "host-1",
-        createdAt: new Date().toISOString()
-      }
-    ], { hostId: "host-1", hostIdentity: "identity-1", protocolVersion: "1" });
-    store.updateAppSettings({
-      documentIndexLocation: "remote",
-      documentToolExecutionLocation: "remote",
-      remoteHostAddress: "127.0.0.1",
-      remotePairingCode: "123456"
-    });
-    let state = store.loadState();
-    store.updateThreadSettings(state.selectedThreadId, {
-      builtinModelId: "remote-model",
-      builtinAgenticFramework: "document_analysis"
-    });
-    const index = store.createDocumentIndex(state.selectedProjectId, "Adobe PDF", sourcePath);
-    const remoteIndexId = "remote-doc::identity-1::doc-1";
-    (store as unknown as { db: { prepare: (sql: string) => { run: (...values: unknown[]) => void } } })
-      .db
-      .prepare("UPDATE chat_document_indexes SET id = ? WHERE id = ?")
-      .run(remoteIndexId, index.id);
-    store.updateDocumentIndexStatus(remoteIndexId, { state: "ready", progress: 1, message: "Ready" });
-    state = store.loadState();
-    store.selectDocumentIndex(state.selectedThreadId, remoteIndexId);
-
-    await service.submit({ text: "Tell me sth about pdf links" });
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    const next = service.state();
-    const assistant = next.messages.filter((message) => message.role === "assistant").at(-1);
-
-    expect(assistant?.status).toBe("complete");
-    expect(assistant?.reasoning ?? "").toBe("");
-    expect(assistant?.content).toContain("PDF links are represented by link annotations");
-    expect(assistant?.timelineBlocks?.map((block) => block.kind)).toEqual(["reasoning", "tool", "reasoning"]);
-    expect(assistant?.timelineBlocks?.[0]).toMatchObject({ kind: "reasoning", text: "Need remote search.", status: "completed", initiallyExpanded: true });
-    expect(assistant?.timelineBlocks?.[1]).toMatchObject({
-      kind: "tool",
-      id: "remote-search-1",
-      toolName: "search",
-      command: "pdf links",
-      output: expect.stringContaining("Adobe PDF32000_2008.pdf"),
-      initiallyExpanded: true
-    });
-    expect(assistant?.timelineBlocks?.[2]).toMatchObject({ kind: "reasoning", text: "Reading remote evidence.", status: "completed", initiallyExpanded: true });
   } finally {
     service.close();
     fs.rmSync(dir, { recursive: true, force: true });

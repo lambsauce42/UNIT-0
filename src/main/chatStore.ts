@@ -53,6 +53,7 @@ type ChatThreadRow = ChatProjectRow & {
   plan_mode_enabled: number | null;
   document_index_id: string | null;
   codex_last_session_id: string | null;
+  open_code_session_id: string | null;
   remote_session_id: string | null;
   remote_slot_id: number | null;
   remote_settings_signature: string | null;
@@ -169,8 +170,6 @@ const DEFAULT_APP_SETTINGS: ChatAppSettings = {
   actionButtons: [],
   expandedProjectIds: [],
   autoExpandCodexDisclosures: true,
-  documentIndexLocation: "local",
-  documentToolExecutionLocation: "local",
   tokenizerModelPath: "",
   remoteHostAddress: "",
   remoteHostPort: 14555,
@@ -301,6 +300,7 @@ export class ChatStore {
                 COALESCE(plan_mode_enabled, 0) AS plan_mode_enabled,
                 COALESCE(document_index_id, '') AS document_index_id,
                 COALESCE(codex_last_session_id, '') AS codex_last_session_id,
+                COALESCE(open_code_session_id, '') AS open_code_session_id,
                 COALESCE(remote_session_id, '') AS remote_session_id,
                 COALESCE(remote_slot_id, 0) AS remote_slot_id,
                 COALESCE(remote_settings_signature, '') AS remote_settings_signature,
@@ -387,6 +387,7 @@ export class ChatStore {
       planModeEnabled: false,
       documentIndexId: "",
       codexLastSessionId: "",
+      openCodeSessionId: "",
       remoteSessionId: "",
       remoteSlotId: 0,
       remoteSettingsSignature: "",
@@ -464,6 +465,7 @@ export class ChatStore {
       planModeEnabled: templateThread?.planModeEnabled ?? false,
       documentIndexId: "",
       codexLastSessionId: "",
+      openCodeSessionId: "",
       remoteSessionId: "",
       remoteSlotId: 0,
       remoteSettingsSignature: "",
@@ -480,8 +482,8 @@ export class ChatStore {
         .prepare(`INSERT INTO chat_threads
           (id, project_id, title, provider_mode, selected_settings_preset_id, builtin_model_id, runtime_settings_json, builtin_agentic_framework,
            document_analysis_embedding_model_path, codex_model_id, codex_reasoning_effort, permission_mode, codex_approval_mode, plan_mode_enabled,
-           document_index_id, codex_last_session_id, remote_session_id, remote_slot_id, remote_settings_signature, remote_host_identity, created_at, updated_at, sort_order)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+           document_index_id, codex_last_session_id, open_code_session_id, remote_session_id, remote_slot_id, remote_settings_signature, remote_host_identity, created_at, updated_at, sort_order)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
         .run(
           thread.id,
           thread.projectId,
@@ -499,6 +501,7 @@ export class ChatStore {
           thread.planModeEnabled ? 1 : 0,
           thread.documentIndexId,
           thread.codexLastSessionId,
+          thread.openCodeSessionId,
           thread.remoteSessionId,
           thread.remoteSlotId,
           thread.remoteSettingsSignature,
@@ -694,6 +697,15 @@ export class ChatStore {
       remoteHostId: host.hostId,
       remoteHostIdentity: host.hostIdentity,
       remoteProtocolVersion: host.protocolVersion
+    });
+  }
+
+  clearRemoteModels(): void {
+    this.setSetting("remote_models_json", "[]");
+    this.updateAppSettings({
+      remoteHostId: "",
+      remoteHostIdentity: "",
+      remoteProtocolVersion: ""
     });
   }
 
@@ -905,7 +917,7 @@ export class ChatStore {
 
   updateThreadSettings(
     threadId: string,
-    settings: Partial<Omit<Pick<ChatThread, "providerMode" | "selectedSettingsPresetId" | "builtinModelId" | "builtinAgenticFramework" | "documentAnalysisEmbeddingModelPath" | "codexModelId" | "codexReasoningEffort" | "permissionMode" | "codexApprovalMode" | "planModeEnabled" | "documentIndexId" | "codexLastSessionId" | "remoteSessionId" | "remoteSlotId" | "remoteSettingsSignature" | "remoteHostIdentity">, never>> & { runtimeSettings?: Partial<ChatRuntimeSettings> }
+    settings: Partial<Omit<Pick<ChatThread, "providerMode" | "selectedSettingsPresetId" | "builtinModelId" | "builtinAgenticFramework" | "documentAnalysisEmbeddingModelPath" | "codexModelId" | "codexReasoningEffort" | "permissionMode" | "codexApprovalMode" | "planModeEnabled" | "documentIndexId" | "codexLastSessionId" | "openCodeSessionId" | "remoteSessionId" | "remoteSlotId" | "remoteSettingsSignature" | "remoteHostIdentity">, never>> & { runtimeSettings?: Partial<ChatRuntimeSettings> }
   ): void {
     const row = this.db.prepare(
       `SELECT id, project_id, provider_mode, builtin_model_id, runtime_settings_json, builtin_agentic_framework,
@@ -969,6 +981,7 @@ export class ChatStore {
       plan_mode_enabled: row.plan_mode_enabled,
       document_index_id: null,
       codex_last_session_id: null,
+      open_code_session_id: null,
       remote_session_id: null,
       remote_slot_id: null,
       remote_settings_signature: null,
@@ -991,6 +1004,7 @@ export class ChatStore {
     }) ? DEFAULT_SETTINGS_PRESET_ID : undefined);
     const documentIndexId = settings.documentIndexId === undefined ? undefined : settings.documentIndexId.trim();
     const codexLastSessionId = settings.codexLastSessionId === undefined ? undefined : settings.codexLastSessionId.trim();
+    const openCodeSessionId = settings.openCodeSessionId === undefined ? undefined : settings.openCodeSessionId.trim();
     const remoteSessionId = settings.remoteSessionId === undefined ? undefined : settings.remoteSessionId.trim();
     const remoteSlotId = settings.remoteSlotId === undefined ? undefined : nonNegativeInteger(settings.remoteSlotId, 0);
     const remoteSettingsSignature = settings.remoteSettingsSignature === undefined ? undefined : settings.remoteSettingsSignature.trim();
@@ -1014,6 +1028,7 @@ export class ChatStore {
                plan_mode_enabled = COALESCE(?, plan_mode_enabled),
                document_index_id = COALESCE(?, document_index_id),
                codex_last_session_id = COALESCE(?, codex_last_session_id),
+               open_code_session_id = COALESCE(?, open_code_session_id),
                remote_session_id = COALESCE(?, remote_session_id),
                remote_slot_id = COALESCE(?, remote_slot_id),
                remote_settings_signature = COALESCE(?, remote_settings_signature),
@@ -1021,7 +1036,7 @@ export class ChatStore {
                updated_at = ?
            WHERE id = ?`
         )
-        .run(providerMode ?? null, selectedSettingsPresetIdUpdate ?? null, builtinModelId ?? null, runtimeSettings ?? null, builtinAgenticFramework ?? null, documentAnalysisEmbeddingModelPath ?? null, codexModelId ?? null, codexReasoningEffort ?? null, permissionMode ?? null, codexApprovalMode ?? null, planModeEnabled ?? null, documentIndexId ?? null, codexLastSessionId ?? null, remoteSessionId ?? null, remoteSlotId ?? null, remoteSettingsSignature ?? null, remoteHostIdentity ?? null, now, row.id);
+        .run(providerMode ?? null, selectedSettingsPresetIdUpdate ?? null, builtinModelId ?? null, runtimeSettings ?? null, builtinAgenticFramework ?? null, documentAnalysisEmbeddingModelPath ?? null, codexModelId ?? null, codexReasoningEffort ?? null, permissionMode ?? null, codexApprovalMode ?? null, planModeEnabled ?? null, documentIndexId ?? null, codexLastSessionId ?? null, openCodeSessionId ?? null, remoteSessionId ?? null, remoteSlotId ?? null, remoteSettingsSignature ?? null, remoteHostIdentity ?? null, now, row.id);
       this.db.prepare("UPDATE chat_projects SET updated_at = ? WHERE id = ?").run(now, row.project_id);
       this.db.exec("COMMIT");
     } catch (error) {
@@ -1462,7 +1477,7 @@ export class ChatStore {
       const expansion = expansionById.get(result.resultId);
       const startOrdinal = Math.max(0, result.ordinalStart - Math.max(0, expansion?.before ?? 0));
       const endOrdinal = result.ordinalEnd + Math.max(0, expansion?.after ?? 0);
-      const group = rows.filter((row) => row.ordinalStart >= startOrdinal && row.ordinalStart <= endOrdinal);
+      const group = rows.filter((row) => row.sourcePath === result.sourcePath && row.ordinalStart >= startOrdinal && row.ordinalStart <= endOrdinal);
       if (group.length === 0 || usedTokens >= budgetTokens) {
         continue;
       }
@@ -1640,6 +1655,27 @@ export class ChatStore {
       this.db
         .prepare("UPDATE chat_messages SET reasoning = ?, updated_at = ? WHERE id = ?")
         .run(`${row.reasoning}${reasoningDelta}`, now, messageId);
+      this.touchThreadInTransaction(row.thread_id, now);
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  replaceMessageReasoning(messageId: string, reasoning: string): void {
+    const row = this.db.prepare("SELECT thread_id FROM chat_messages WHERE id = ?").get(messageId) as
+      | { thread_id: string }
+      | undefined;
+    if (!row) {
+      throw new Error(`Chat message does not exist: ${messageId}`);
+    }
+    const now = timestamp();
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db
+        .prepare("UPDATE chat_messages SET reasoning = ?, updated_at = ? WHERE id = ?")
+        .run(reasoning, now, messageId);
       this.touchThreadInTransaction(row.thread_id, now);
       this.db.exec("COMMIT");
     } catch (error) {
@@ -1840,6 +1876,7 @@ export class ChatStore {
     ensureThreadColumn("plan_mode_enabled", "plan_mode_enabled INTEGER NOT NULL DEFAULT 0");
     ensureThreadColumn("document_index_id", "document_index_id TEXT NOT NULL DEFAULT ''");
     ensureThreadColumn("codex_last_session_id", "codex_last_session_id TEXT NOT NULL DEFAULT ''");
+    ensureThreadColumn("open_code_session_id", "open_code_session_id TEXT NOT NULL DEFAULT ''");
     ensureThreadColumn("remote_session_id", "remote_session_id TEXT NOT NULL DEFAULT ''");
     ensureThreadColumn("remote_slot_id", "remote_slot_id INTEGER NOT NULL DEFAULT 0");
     ensureThreadColumn("remote_settings_signature", "remote_settings_signature TEXT NOT NULL DEFAULT ''");
@@ -1901,9 +1938,9 @@ export class ChatStore {
         `INSERT INTO chat_threads
           (id, project_id, title, provider_mode, selected_settings_preset_id, builtin_model_id, runtime_settings_json, builtin_agentic_framework,
            document_analysis_embedding_model_path, codex_model_id, codex_reasoning_effort, permission_mode, codex_approval_mode, plan_mode_enabled,
-           document_index_id, codex_last_session_id, remote_session_id, remote_slot_id, remote_settings_signature, remote_host_identity,
+           document_index_id, codex_last_session_id, open_code_session_id, remote_session_id, remote_slot_id, remote_settings_signature, remote_host_identity,
            active_context_start_message_index, context_revision, context_markers_json, created_at, updated_at, sort_order)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       );
       imported.threads.forEach((thread, index) => {
         insertThread.run(
@@ -1923,6 +1960,7 @@ export class ChatStore {
           thread.planModeEnabled ? 1 : 0,
           thread.documentIndexId,
           thread.codexLastSessionId,
+          thread.openCodeSessionId ?? "",
           thread.remoteSessionId,
           thread.remoteSlotId,
           thread.remoteSettingsSignature,
@@ -2354,6 +2392,7 @@ function legacyThreadSettings(value: unknown): Omit<ChatThread, "id" | "projectI
     planModeEnabled: Boolean(codex.plan_mode_enabled),
     documentIndexId: legacyText(builtin.document_index_id),
     codexLastSessionId: legacyText(codex.last_session_id),
+    openCodeSessionId: "",
     remoteSessionId: legacyText(builtin.runtime_backend) === "remote_llama_host" ? legacyText(builtin.runtime_session_id) : "",
     remoteSlotId: legacyText(builtin.runtime_backend) === "remote_llama_host" ? legacyNonNegativeInteger(builtin.runtime_slot_id, 0) : 0,
     remoteSettingsSignature: legacyText(builtin.runtime_backend) === "remote_llama_host" ? legacyText(builtin.runtime_settings_signature) : "",
@@ -2520,6 +2559,7 @@ function threadFromRow(row: ChatThreadRow): ChatThread {
     planModeEnabled: row.plan_mode_enabled === 1,
     documentIndexId: row.document_index_id ?? "",
     codexLastSessionId: row.codex_last_session_id ?? "",
+    openCodeSessionId: row.open_code_session_id ?? "",
     remoteSessionId: row.remote_session_id ?? "",
     remoteSlotId: nonNegativeInteger(row.remote_slot_id, 0),
     remoteSettingsSignature: row.remote_settings_signature ?? "",
@@ -2565,6 +2605,8 @@ function normalizeRemoteModel(value: Partial<ChatModel>): ChatModel {
     path: typeof value.path === "string" ? value.path : "",
     providerId: "remote",
     reference: typeof value.reference === "string" ? value.reference.trim() : "",
+    promptFormat: typeof value.promptFormat === "string" ? value.promptFormat.trim() : "",
+    contextTokens: positiveInteger(value.contextTokens, 0) || undefined,
     sourceLabel: typeof value.sourceLabel === "string" && value.sourceLabel.trim() ? value.sourceLabel.trim() : "Remote Built-in",
     hostId: typeof value.hostId === "string" ? value.hostId.trim() : "",
     createdAt: typeof value.createdAt === "string" ? value.createdAt : timestamp()
@@ -2589,8 +2631,6 @@ function normalizeRuntimeSettings(value: Partial<ChatRuntimeSettings>): ChatRunt
 }
 
 function normalizeAppSettings(value: Partial<ChatAppSettings>): ChatAppSettings {
-  const documentIndexLocation = value.documentIndexLocation === "remote" ? "remote" : "local";
-  const requestedDocumentToolLocation = value.documentToolExecutionLocation === "remote" ? "remote" : "local";
   return {
     usageIndicatorPlacement: value.usageIndicatorPlacement === "composer" ? "composer" : "footer",
     usageIndicatorOrder: Array.isArray(value.usageIndicatorOrder) && value.usageIndicatorOrder.every((item) => typeof item === "string")
@@ -2606,8 +2646,6 @@ function normalizeAppSettings(value: Partial<ChatAppSettings>): ChatAppSettings 
     autoExpandCodexDisclosures: typeof value.autoExpandCodexDisclosures === "boolean"
       ? value.autoExpandCodexDisclosures
       : DEFAULT_APP_SETTINGS.autoExpandCodexDisclosures,
-    documentIndexLocation,
-    documentToolExecutionLocation: documentIndexLocation === "local" && requestedDocumentToolLocation === "remote" ? "local" : requestedDocumentToolLocation,
     tokenizerModelPath: typeof value.tokenizerModelPath === "string" ? value.tokenizerModelPath : "",
     remoteHostAddress: typeof value.remoteHostAddress === "string" ? value.remoteHostAddress : "",
     remoteHostPort: positiveInteger(value.remoteHostPort, DEFAULT_APP_SETTINGS.remoteHostPort),

@@ -1,0 +1,10 @@
+{
+  "name": "unit0-remote-inference-server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js --config config.example.json",
+    "desktop": "electron desktop-main.js --config config.example.json"
+  }
+}

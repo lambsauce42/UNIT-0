@@ -65,6 +65,7 @@ import type {
   TabHostSnapshot,
   TabHostState,
   UnitState,
+  UpdateUnitSettingsPayload,
   UpdateLayoutRatiosPayload,
   UpdateAppletSessionStatePayload,
   UpdateTabDragPayload,
@@ -74,6 +75,8 @@ import type {
   WorkspaceTab,
   SelectDirectoryPayload,
   SelectFilesPayload,
+  ShelveAppletInstancePayload,
+  UnshelveAppletInstancePayload,
   WriteFilePayload
 } from "../shared/types.js";
 import { WORKSPACE_TAB_SIZE } from "../shared/tabMetrics.js";
@@ -134,6 +137,7 @@ class TabRegistry {
   readonly appletSessions: Record<string, AppletSession>;
   readonly workspaces: Record<string, Workspace>;
   readonly tabs: Record<string, WorkspaceTab>;
+  settings: UnitState["settings"];
   readonly hosts: Record<number, TabHostState> = {};
   readonly stripBounds = new Map<number, RegisterStripBoundsPayload>();
   primaryWindowId = 0;
@@ -147,6 +151,7 @@ class TabRegistry {
     this.appletSessions = model.appletSessions;
     this.workspaces = model.workspaces;
     this.tabs = model.tabs;
+    this.settings = model.settings;
     this.primaryHostSnapshot = model.primaryHost;
   }
 
@@ -157,8 +162,14 @@ class TabRegistry {
       tabs: this.tabs,
       hosts: this.hosts,
       primaryWindowId: this.primaryWindowId,
-      dragSession: this.dragSession
+      dragSession: this.dragSession,
+      settings: this.settings
     });
+  }
+
+  updateSettings(payload: UpdateUnitSettingsPayload): UnitState["settings"] {
+    this.settings = this.store.updateSettings(payload.settings);
+    return structuredClone(this.settings);
   }
 
   registerWindow(windowId: number, options: { primary?: boolean; tabId?: string } = {}): void {
@@ -450,6 +461,22 @@ class TabRegistry {
       delete this.appletSessions[result.deletedSessionId];
     }
     return result.deletedSessionId;
+  }
+
+  shelveAppletInstance(payload: ShelveAppletInstancePayload): void {
+    const workspace = this.workspaces[payload.workspaceId];
+    if (!workspace || this.dragSession) {
+      throw new Error(`Cannot move applet instance ${payload.appletInstanceId} to sidebar`);
+    }
+    this.workspaces[payload.workspaceId] = this.store.shelveAppletInstance(payload.workspaceId, payload.appletInstanceId);
+  }
+
+  unshelveAppletInstance(payload: UnshelveAppletInstancePayload): void {
+    const workspace = this.workspaces[payload.workspaceId];
+    if (!workspace || this.dragSession) {
+      throw new Error(`Cannot return applet instance ${payload.appletInstanceId} to tiles`);
+    }
+    this.workspaces[payload.workspaceId] = this.store.unshelveAppletInstance(payload.workspaceId, payload.appletInstanceId);
   }
 
   changeAppletInstanceKind(payload: ChangeAppletInstanceKindPayload): { sessionId: string; previousKind: AppletKind } {
@@ -1485,6 +1512,11 @@ app.whenReady().then(() => {
   browserViewManager = new BrowserViewManager((windowId) => windows.get(windowId));
   Menu.setApplicationMenu(null);
   ipcMain.handle("unit:bootstrap", (event) => payloadFor(BrowserWindow.fromWebContents(event.sender)?.id ?? 0));
+  ipcMain.handle("unit:updateSettings", (_event, payload: UpdateUnitSettingsPayload) => {
+    const settings = registry.updateSettings(payload);
+    broadcastState();
+    return settings;
+  });
   ipcMain.handle("tabs:bootstrap", (event) => payloadFor(BrowserWindow.fromWebContents(event.sender)?.id ?? 0));
   ipcMain.handle("tabs:activate", (_event, payload: { windowId: number; tabId: string }) => {
     registry.activate(payload.windowId, payload.tabId);
@@ -1603,6 +1635,14 @@ app.whenReady().then(() => {
       deletedSessionId,
       after: workspaceAppletCloseSummary(registry.workspaces[payload.workspaceId])
     });
+    broadcastState();
+  });
+  ipcMain.handle("applets:shelveAppletInstance", (_event, payload: ShelveAppletInstancePayload) => {
+    registry.shelveAppletInstance(payload);
+    broadcastState();
+  });
+  ipcMain.handle("applets:unshelveAppletInstance", (_event, payload: UnshelveAppletInstancePayload) => {
+    registry.unshelveAppletInstance(payload);
     broadcastState();
   });
   ipcMain.handle("applets:changeAppletInstanceKind", (_event, payload: ChangeAppletInstanceKindPayload) => {

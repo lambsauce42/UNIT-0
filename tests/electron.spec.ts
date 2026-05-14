@@ -1,5 +1,7 @@
 import { _electron as electron, type ElectronApplication, type Page, expect, test } from "@playwright/test";
 import fs from "node:fs";
+import http from "node:http";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -21,9 +23,114 @@ async function launchApp(dataDir = makeDataDir()): Promise<ElectronApplication> 
   });
 }
 
+async function reservePort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const server = net.createServer();
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      if (!address || typeof address === "string") {
+        server.close(() => reject(new Error("Could not reserve a test port.")));
+        return;
+      }
+      const port = address.port;
+      server.close(() => resolve(port));
+    });
+  });
+}
+
+async function waitForRemoteServer(port: number): Promise<void> {
+  await expect(async () => {
+    const response = await fetch(`http://127.0.0.1:${port}/v1/status`);
+    expect(response.ok).toBe(true);
+    const status = await response.json() as { models?: unknown[] };
+    expect(status.models?.length).toBeGreaterThan(0);
+  }).toPass({ timeout: 10_000 });
+}
+
+async function startFakeLlamaServer(): Promise<{ port: number; requests: Array<{ path: string; body: string }>; close: () => Promise<void> }> {
+  const requests: Array<{ path: string; body: string }> = [];
+  const server = http.createServer((request, response) => {
+    const url = new URL(request.url || "/", "http://127.0.0.1");
+    if (request.method === "GET" && url.pathname === "/health") {
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ status: "ok" }));
+      return;
+    }
+    if (request.method === "GET" && url.pathname === "/v1/models") {
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ data: [{ id: "fake-llama-gguf" }] }));
+      return;
+    }
+    if (request.method === "POST" && (url.pathname === "/completion" || url.pathname === "/v1/chat/completions")) {
+      let body = "";
+      request.setEncoding("utf8");
+      request.on("data", (chunk) => { body += chunk; });
+      request.on("end", () => {
+        requests.push({ path: url.pathname, body });
+        response.writeHead(200, { "Content-Type": "text/event-stream" });
+        if (url.pathname === "/completion") {
+          for (const content of [
+            "<|channel|>analysis<|message|>Likely wants conversation.",
+            " Just respond.\nKeep spacing.<|end|><|start|>assistant",
+            "<|channel|>final<|message|>\n\n  Hello",
+            " from",
+            " remote",
+            " GPT-OSS.\n```ts\n",
+            "  const value = \"kept\";\n",
+            "```\nDone",
+            "<|return|>"
+          ]) {
+            response.write(`data: ${JSON.stringify({ content })}\n\n`);
+          }
+        } else {
+          response.write(`data: ${JSON.stringify({ choices: [{ delta: { content: "llama-server protocol response." } }] })}\n\n`);
+        }
+        response.end("data: [DONE]\n\n");
+      });
+      return;
+    }
+    response.writeHead(404);
+    response.end();
+  });
+  const port = await new Promise<number>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      if (!address || typeof address === "string") {
+        server.close(() => reject(new Error("Could not reserve fake llama-server port.")));
+        return;
+      }
+      resolve(address.port);
+    });
+  });
+  return {
+    port,
+    requests,
+    close: () => new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
+  };
+}
+
 async function firstWindow(app: ElectronApplication): Promise<Page> {
   const page = await app.firstWindow();
   await page.waitForSelector("main.app-shell");
+  return page;
+}
+
+async function launchRemoteServerApp(configPath: string): Promise<ElectronApplication> {
+  return electron.launch({
+    args: [path.join(process.cwd(), "remote-inference-server", "desktop-main.js"), "--config", configPath],
+    env: {
+      ...process.env,
+      NODE_ENV: "test",
+      UNIT0_E2E_WINDOW_MODE: process.env.UNIT0_E2E_WINDOW_MODE ?? "hidden"
+    }
+  });
+}
+
+async function firstRemoteServerWindow(app: ElectronApplication): Promise<Page> {
+  const page = await app.firstWindow();
+  await page.waitForSelector("text=Remote Inference Server");
   return page;
 }
 
@@ -338,6 +445,350 @@ test("renders global chat state and persists local model selection", async () =>
   page = await firstWindow(app);
   await expect(page.getByLabel("Local chat model")).toHaveValue(modelState.models[0].id);
   await app.close();
+});
+
+test("chat OpenCode mode runs through real local model harness", async () => {
+  test.setTimeout(300_000);
+  const modelPath = process.env.UNIT0_E2E_OPENCODE_LOCAL_MODEL || "C:\\Users\\Max\\Models\\gpt-oss-20b-GGUF\\gpt-oss-20b-mxfp4.gguf";
+  const gpuLayers = Number(process.env.UNIT0_E2E_GGUF_GPU_LAYERS ?? "0");
+  test.skip(!fs.existsSync(modelPath), `OpenCode local model not found: ${modelPath}`);
+  const dataDir = makeDataDir();
+  const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), "unit-0-opencode-e2e-project-"));
+  const app = await launchApp(dataDir);
+  try {
+    const page = await firstWindow(app);
+    const e2eResult = await page.evaluate(async ({ modelPath: localModelPath, projectDir: localProjectDir, gpuLayers: localGpuLayers }) => {
+      let state = await window.unitApi.chat.bootstrap();
+      await window.unitApi.chat.updateProjectSettings({
+        projectId: state.selectedProjectId,
+        title: "OpenCode E2E",
+        directory: localProjectDir
+      });
+      state = await window.unitApi.chat.addLocalModel({ path: localModelPath });
+      state = await window.unitApi.chat.updateThreadSettings({
+        threadId: state.selectedThreadId,
+        providerMode: "builtin",
+        builtinAgenticFramework: "opencode",
+        builtinModelId: state.selectedModelId,
+        permissionMode: "default_permissions",
+        runtimeSettings: {
+          nCtx: 16384,
+          nGpuLayers: localGpuLayers,
+          maxTokens: 128,
+          temperature: 0.2,
+          systemPrompt: "Keep the answer short."
+        }
+      });
+      const submit = window.unitApi.chat.submit({ text: "Use analysis for one short reason, then reply with exactly: opencode-ok" });
+      const frames: Array<{ content: string; reasoning: string; timelineKinds: string[]; status: string; generationStatus: string }> = [];
+      const startedAt = Date.now();
+      while (Date.now() - startedAt < 240_000) {
+        const snapshot = await window.unitApi.chat.bootstrap();
+        const assistant = snapshot.messages.filter((message) => message.role === "assistant").at(-1);
+        if (assistant) {
+          frames.push({
+            content: assistant.content ?? "",
+            reasoning: assistant.reasoning ?? "",
+            timelineKinds: assistant.timelineBlocks?.map((block) => block.kind) ?? [],
+            status: assistant.status,
+            generationStatus: snapshot.generation.status
+          });
+        }
+        if (snapshot.generation.status === "idle" && assistant?.status === "complete") {
+          break;
+        }
+        if (snapshot.generation.status === "error" || assistant?.status === "error") {
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      await submit;
+      return { finalState: await window.unitApi.chat.bootstrap(), frames };
+    }, { modelPath, projectDir, gpuLayers });
+    const finalState = e2eResult.finalState;
+    expect(finalState.generation.status).not.toBe("error");
+
+    let finalAssistantReasoning = "";
+    await expect(async () => {
+      const state = await page.evaluate(() => window.unitApi.chat.bootstrap());
+      const assistant = state.messages.filter((message) => message.role === "assistant").at(-1);
+      expect(state.generation.status).toBe("idle");
+      expect(assistant?.status).toBe("complete");
+      expect(assistant?.content?.trim().length).toBeGreaterThan(0);
+      expect(assistant?.reasoning?.trim().length).toBeGreaterThan(0);
+      finalAssistantReasoning = assistant?.reasoning?.trim() ?? "";
+      expect(assistant?.timelineBlocks?.some((block) => block.kind === "status" && block.code === "opencode_failed")).not.toBe(true);
+      expect(assistant?.content ?? "").not.toContain("ConfigInvalidError");
+      expect(assistant?.content ?? "").not.toContain("<|");
+      expect(assistant?.reasoning ?? "").not.toContain("<|");
+    }).toPass({ timeout: 240_000 });
+    const firstReasoningFrame = e2eResult.frames.findIndex((frame) => frame.reasoning.trim().length > 0 || frame.timelineKinds.includes("reasoning"));
+    const firstAnswerFrame = e2eResult.frames.findIndex((frame) => frame.content.trim().length > 0 || frame.timelineKinds.includes("assistant_message"));
+    expect(firstReasoningFrame).toBeGreaterThanOrEqual(0);
+    expect(firstAnswerFrame).toBeGreaterThan(firstReasoningFrame);
+    for (const frame of e2eResult.frames) {
+      expect(frame.content).not.toContain("<|return|>");
+      expect(frame.reasoning).not.toContain("<|return|>");
+    }
+    const answerFrames = e2eResult.frames.map((frame) => frame.content).filter(Boolean);
+    for (let index = 1; index < answerFrames.length; index += 1) {
+      expect(answerFrames[index]).toContain(answerFrames[index - 1]);
+    }
+    const rendered = page.getByTestId("chat-message-assistant").last();
+    await expect(rendered.locator("details.reasoning-shell")).toHaveCount(1);
+    const body = rendered.locator(".assistant-content-block");
+    await expect(body).not.toContainText("<|return|>");
+    await expect(body).not.toContainText("We need");
+    await expect(body).not.toContainText("User says");
+    const bodyText = await body.innerText();
+    const reasoningProbe = finalAssistantReasoning.slice(0, Math.min(80, finalAssistantReasoning.length));
+    expect(reasoningProbe.length).toBeGreaterThan(0);
+    expect(bodyText).not.toContain(reasoningProbe);
+  } finally {
+    await app.close();
+    fs.rmSync(projectDir, { recursive: true, force: true });
+  }
+});
+
+test("connects to separate remote inference server and runs GPT-OSS through llama-server protocol", async () => {
+  test.setTimeout(45_000);
+  const dataDir = makeDataDir();
+  const port = await reservePort();
+  const llama = await startFakeLlamaServer();
+  const configPath = path.join(dataDir, "remote-inference-config.json");
+  fs.writeFileSync(configPath, JSON.stringify({
+    host: "127.0.0.1",
+    port,
+    pairingCode: "ABCD-1234",
+    hostIdentity: "e2e-gpu-host",
+    models: []
+  }));
+  const serverApp = await launchRemoteServerApp(configPath);
+  let app: ElectronApplication | null = null;
+  try {
+    const serverPage = await firstRemoteServerWindow(serverApp);
+    await serverPage.getByRole("button", { name: "Add Model" }).click();
+    await serverPage.locator("#model-id").fill("gpt-oss-e2e");
+    await serverPage.locator("#model-label").fill("GPT-OSS E2E");
+    await serverPage.locator("#model-reference").fill("gpt-oss");
+    await serverPage.locator("#model-backend").selectOption("llama-server");
+    await serverPage.locator("#model-launch-mode").selectOption("external");
+    await serverPage.locator("#model-url").fill(`http://127.0.0.1:${llama.port}`);
+    await serverPage.getByRole("button", { name: "Start Server" }).click();
+    await expect(serverPage.locator("#running")).toHaveText("Running");
+    await waitForRemoteServer(port);
+
+    app = await launchApp(dataDir);
+    const page = await firstWindow(app);
+
+    const connected = await page.evaluate(async (remotePort) => {
+      return window.unitApi.chat.updateAppSettings({
+        settings: {
+          remoteHostAddress: "127.0.0.1",
+          remoteHostPort: remotePort,
+          remotePairingCode: "ABCD-1234"
+        }
+      });
+    }, port);
+    const remoteModel = connected.models.find((model) => model.id === "gpt-oss-e2e");
+    expect(remoteModel).toMatchObject({ label: "GPT-OSS E2E", providerId: "remote", reference: "gpt-oss" });
+    expect(connected.appSettings.remoteHostIdentity).toBe("e2e-gpu-host");
+
+    await page.evaluate(async () => {
+      await window.unitApi.chat.selectModel({ modelId: "gpt-oss-e2e" });
+      await window.unitApi.chat.submit({ text: "Use the remote GPT-OSS model." });
+    });
+    await expect(async () => {
+      const state = await page.evaluate(() => window.unitApi.chat.bootstrap());
+      const assistant = state.messages.filter((message) => message.role === "assistant").at(-1);
+      expect(assistant?.status).toBe("complete");
+      expect(assistant?.content).toBe("\n\n  Hello from remote GPT-OSS.\n```ts\n  const value = \"kept\";\n```\nDone");
+      expect(assistant?.reasoning).toBe("Likely wants conversation. Just respond.\nKeep spacing.");
+      expect(assistant?.content).not.toContain("<|channel|>");
+      expect(assistant?.content).not.toContain("<|return|>");
+      expect(assistant?.metadata?.remoteMetrics).toMatchObject({ model_id: "gpt-oss-e2e", backend: "llama-server" });
+    }).toPass({ timeout: 10_000 });
+    const rendered = page.getByTestId("chat-message-assistant").last();
+    const body = rendered.locator(".assistant-content-block");
+    await expect(body).toContainText("Hello from remote GPT-OSS.");
+    await expect(body.locator(".chat-code-figure")).toHaveCount(1);
+    await expect(body.locator(".chat-code-copy-button")).toHaveCount(1);
+    const code = body.locator(".chat-code-block code");
+    await expect(code).toHaveAttribute("data-language", "ts");
+    await expect(code).toContainText("const value = \"kept\";");
+    await expect(code).toHaveText("  const value = \"kept\";\n");
+    await expect(body).toContainText("Done");
+    await expect(body).not.toContainText("```");
+    expect(llama.requests.some((request) => request.path === "/completion" && request.body.includes("Use the remote GPT-OSS model."))).toBe(true);
+
+    const status = await fetch(`http://127.0.0.1:${port}/v1/status`).then((response) => response.json()) as { logs?: Array<{ message?: string }> };
+    expect(status.logs?.some((entry) => entry.message === "Model prewarmed")).toBe(true);
+    expect(status.logs?.some((entry) => entry.message === "Serving inference request")).toBe(true);
+    await expect(serverPage.locator("#client-count")).not.toHaveText("0");
+    await expect(serverPage.locator("#logs")).toContainText("Serving inference request");
+  } finally {
+    if (app) {
+      await app.close();
+    }
+    await serverApp.close();
+    await llama.close();
+  }
+});
+
+test("remote server desktop keeps unsaved llama launch edits during status refresh", async () => {
+  const dataDir = makeDataDir();
+  const port = await reservePort();
+  const configPath = path.join(dataDir, "remote-inference-config.json");
+  fs.writeFileSync(configPath, JSON.stringify({
+    host: "127.0.0.1",
+    port,
+    pairingCode: "ABCD-1234",
+    hostIdentity: "e2e-gpu-host",
+    models: [{
+      id: "gpt-oss-e2e",
+      label: "GPT-OSS E2E",
+      reference: "gpt-oss",
+      sourceLabel: "Remote Inference",
+      backend: "llama-server",
+      launchMode: "external",
+      url: "http://127.0.0.1:8080"
+    }]
+  }));
+  const serverApp = await launchRemoteServerApp(configPath);
+  try {
+    const serverPage = await firstRemoteServerWindow(serverApp);
+    await expect(serverPage.locator("#model-launch-mode")).toHaveValue("external");
+    await serverPage.locator("#model-launch-mode").selectOption("managed");
+    await serverPage.locator("#model-path").fill(path.join(dataDir, "model.gguf"));
+    await expect(serverPage.locator("#model-launch-mode")).toHaveValue("managed");
+    await serverPage.waitForTimeout(1500);
+    await expect(serverPage.locator("#model-launch-mode")).toHaveValue("managed");
+    await serverPage.getByRole("button", { name: "Save Config" }).click();
+    await expect.poll(() => JSON.parse(fs.readFileSync(configPath, "utf8")).models[0].launchMode).toBe("managed");
+  } finally {
+    await serverApp.close();
+  }
+});
+
+test("remote server desktop configures a managed GGUF llama-server model", async () => {
+  const dataDir = makeDataDir();
+  const port = await reservePort();
+  const runtimePort = await reservePort();
+  const configPath = path.join(dataDir, "remote-inference-config.json");
+  const modelPath = path.join(dataDir, "gpt-oss-test.gguf");
+  const binaryPath = path.join(dataDir, process.platform === "win32" ? "llama-server.exe" : "llama-server");
+  fs.writeFileSync(modelPath, "not a real model");
+  fs.writeFileSync(binaryPath, "not a real binary");
+  fs.writeFileSync(configPath, JSON.stringify({
+    host: "127.0.0.1",
+    port,
+    pairingCode: "ABCD-1234",
+    hostIdentity: "e2e-gpu-host",
+    models: []
+  }));
+  const serverApp = await launchRemoteServerApp(configPath);
+  try {
+    const serverPage = await firstRemoteServerWindow(serverApp);
+    await serverPage.getByRole("button", { name: "Add Model" }).click();
+    await serverPage.locator("#model-id").fill("managed-gpt-oss");
+    await serverPage.locator("#model-label").fill("Managed GPT-OSS");
+    await serverPage.locator("#model-reference").fill("gpt-oss");
+    await serverPage.locator("#model-backend").selectOption("llama-server");
+    await serverPage.locator("#model-launch-mode").selectOption("managed");
+    await expect(serverPage.locator("#model-path")).toBeEnabled();
+    await expect(serverPage.locator("#binary-path")).toBeEnabled();
+    await serverPage.locator("#model-path").fill(modelPath);
+    await serverPage.locator("#binary-path").fill(binaryPath);
+    await serverPage.locator("#runtime-host").fill("127.0.0.1");
+    await serverPage.locator("#runtime-port").fill(String(runtimePort));
+    await serverPage.locator("#model-n-ctx").fill("4096");
+    await serverPage.locator("#model-n-gpu-layers").fill("0");
+    await serverPage.locator("#model-parallel-slots").fill("2");
+    await serverPage.locator("#model-prewarm").selectOption("false");
+    await serverPage.locator("#model-prompt-format").selectOption("gpt-oss");
+    await serverPage.getByRole("button", { name: "Save Config" }).click();
+    await expect.poll(() => JSON.parse(fs.readFileSync(configPath, "utf8")).models[0]).toMatchObject({
+      id: "managed-gpt-oss",
+      backend: "llama-server",
+      launchMode: "managed",
+      modelPath,
+      binaryPath,
+      runtimeHost: "127.0.0.1",
+      runtimePort,
+      nCtx: 4096,
+      nGpuLayers: 0,
+      parallelSlots: 2,
+      prewarmOnStart: false,
+      promptFormat: "gpt-oss"
+    });
+  } finally {
+    await serverApp.close();
+  }
+});
+
+test("remote server desktop can run a real managed GGUF when configured by env", async () => {
+  test.skip(!process.env.UNIT0_E2E_GGUF_MODEL, "Set UNIT0_E2E_GGUF_MODEL to run this real GGUF test.");
+  test.setTimeout(300_000);
+  const dataDir = makeDataDir();
+  const port = await reservePort();
+  const runtimePort = await reservePort();
+  const configPath = path.join(dataDir, "remote-inference-config.json");
+  const modelPath = process.env.UNIT0_E2E_GGUF_MODEL!;
+  const binaryPath = process.env.UNIT0_E2E_LLAMA_SERVER_BIN || path.join(process.cwd(), "runtime", "llama.cpp", process.platform === "win32" ? "llama-server.exe" : "llama-server");
+  fs.writeFileSync(configPath, JSON.stringify({
+    host: "127.0.0.1",
+    port,
+    pairingCode: "ABCD-1234",
+    hostIdentity: "real-gguf-host",
+    models: []
+  }));
+  const serverApp = await launchRemoteServerApp(configPath);
+  let app: ElectronApplication | null = null;
+  try {
+    const serverPage = await firstRemoteServerWindow(serverApp);
+    await serverPage.getByRole("button", { name: "Add Model" }).click();
+    await serverPage.locator("#model-id").fill("real-gguf-e2e");
+    await serverPage.locator("#model-label").fill("Real GGUF E2E");
+    await serverPage.locator("#model-reference").fill(process.env.UNIT0_E2E_GGUF_REFERENCE || "gpt-oss");
+    await serverPage.locator("#model-backend").selectOption("llama-server");
+    await serverPage.locator("#model-launch-mode").selectOption("managed");
+    await serverPage.locator("#model-path").fill(modelPath);
+    await serverPage.locator("#binary-path").fill(binaryPath);
+    await serverPage.locator("#runtime-port").fill(String(runtimePort));
+    await serverPage.locator("#model-n-ctx").fill("512");
+    await serverPage.locator("#model-n-gpu-layers").fill(process.env.UNIT0_E2E_GGUF_GPU_LAYERS || "0");
+    await serverPage.locator("#model-prewarm").selectOption("true");
+    await serverPage.getByRole("button", { name: "Start Server" }).click();
+    await expect(serverPage.locator("#running")).toHaveText("Running", { timeout: 240_000 });
+    await waitForRemoteServer(port);
+
+    app = await launchApp(dataDir);
+    const page = await firstWindow(app);
+    const connected = await page.evaluate(async (remotePort) => window.unitApi.chat.updateAppSettings({
+      settings: {
+        remoteHostAddress: "127.0.0.1",
+        remoteHostPort: remotePort,
+        remotePairingCode: "ABCD-1234"
+      }
+    }), port);
+    expect(connected.models.find((model) => model.id === "real-gguf-e2e")).toMatchObject({ providerId: "remote" });
+    await page.evaluate(async () => {
+      await window.unitApi.chat.selectModel({ modelId: "real-gguf-e2e" });
+      await window.unitApi.chat.submit({ text: "Reply with the word remote." });
+    });
+    await expect(async () => {
+      const state = await page.evaluate(() => window.unitApi.chat.bootstrap());
+      const assistant = state.messages.filter((message) => message.role === "assistant").at(-1);
+      expect(assistant?.status).toBe("complete");
+      expect(assistant?.content?.trim().length).toBeGreaterThan(0);
+      expect(assistant?.metadata?.remoteMetrics).toMatchObject({ model_id: "real-gguf-e2e", backend: "llama-server" });
+    }).toPass({ timeout: 120_000 });
+  } finally {
+    if (app) {
+      await app.close();
+    }
+    await serverApp.close();
+  }
 });
 
 test("chat creates and selects threads through the applet API", async () => {
@@ -1632,6 +2083,84 @@ test("applies a template to an existing workspace, supports reassignment, and pe
   await expect(page.getByTestId("workspace-shelf")).toBeVisible();
   state = await appState(page);
   expect(state.workspaces.atlas.shelfAppletIds.sort()).toEqual(["atlas-chat", "atlas-sandbox"]);
+  await app.close();
+});
+
+test("moves applets to the sidebar and starts applets there from the rail", async () => {
+  const app = await launchApp();
+  const page = await firstWindow(app);
+  await page.getByTestId("workspace-tab-atlas").click();
+
+  await page.getByTestId("applet-terminal").getByLabel("Terminal move to sidebar").click();
+  await expect(page.getByTestId("layout-leaf-atlas-terminal")).toHaveCount(0);
+  await expect(page.getByTestId("workspace-sidebar-panel")).toBeHidden();
+  await expect(page.getByTestId("sidebar-applet-atlas-terminal")).toBeVisible();
+  await expect
+    .poll(async () => {
+      const state = await appState(page);
+      return state.workspaces.atlas.shelfAppletIds;
+    })
+    .toEqual(["atlas-terminal"]);
+
+  await page.getByTestId("sidebar-applet-atlas-terminal").click();
+  await expect(page.getByTestId("workspace-sidebar-panel")).toBeVisible();
+  await expect(async () => {
+    const sidebarRatio = await page.evaluate(() => {
+      const surface = document.querySelector<HTMLElement>("[data-testid='workspace-surface']");
+      const panel = document.querySelector<HTMLElement>("[data-testid='workspace-sidebar-panel']");
+      const rail = document.querySelector<HTMLElement>("[data-testid='workspace-shelf']");
+      const resizer = document.querySelector<HTMLElement>(".workspace-sidebar-resizer");
+      if (!surface || !panel || !rail || !resizer) {
+        return 0;
+      }
+      return (panel.offsetWidth + rail.offsetWidth + resizer.offsetWidth) / surface.offsetWidth;
+    });
+    expect(sidebarRatio).toBeGreaterThan(0.23);
+    expect(sidebarRatio).toBeLessThan(0.27);
+  }).toPass();
+  await page.getByTestId("sidebar-applet-atlas-terminal").click();
+  await expect(page.getByTestId("workspace-sidebar-panel")).toBeHidden();
+  await page.getByTestId("sidebar-applet-atlas-terminal").click();
+  await expect(page.getByTestId("workspace-sidebar-panel")).toBeVisible();
+  await page.getByLabel("Collapse sidebar").click();
+  await expect(page.getByTestId("workspace-sidebar-panel")).toBeHidden();
+
+  const initialAppletCount = await page.evaluate(async () => {
+    const state = await window.unitApi.tabs.bootstrap().then((payload) => payload.state);
+    return state.workspaces.atlas.applets.length;
+  });
+  await page.getByLabel("Add sidebar applet").click();
+  await page.getByRole("menuitem", { name: "Browser" }).click();
+
+  await expect
+    .poll(async () => {
+      const state = await appState(page);
+      return {
+        appletCount: state.workspaces.atlas.applets.length,
+        shelfCount: state.workspaces.atlas.shelfAppletIds.length
+      };
+    })
+    .toEqual({ appletCount: initialAppletCount + 1, shelfCount: 2 });
+  await expect(page.getByTestId("workspace-sidebar-panel")).toBeHidden();
+  const state = await appState(page);
+  const createdSidebarAppletId = state.workspaces.atlas.shelfAppletIds.find((appletId) => appletId !== "atlas-terminal");
+  expect(createdSidebarAppletId).toBeTruthy();
+  await expect(page.getByTestId(`layout-leaf-${createdSidebarAppletId}`)).toHaveCount(0);
+  await expect(page.getByTestId(`sidebar-applet-${createdSidebarAppletId}`)).toBeVisible();
+  await page.getByTestId(`sidebar-applet-${createdSidebarAppletId}`).click();
+  await page.getByLabel("Browser return to tiles").click();
+  await expect(page.getByTestId(`layout-leaf-${createdSidebarAppletId}`)).toBeVisible();
+  const integratedRatio = await page.evaluate((appletId) => {
+    const stage = document.querySelector<HTMLElement>(".workspace-main-stage");
+    const leaf = document.querySelector<HTMLElement>(`[data-testid='layout-leaf-${appletId}']`);
+    if (!stage || !leaf) {
+      return 0;
+    }
+    return leaf.offsetWidth / stage.offsetWidth;
+  }, createdSidebarAppletId);
+  expect(integratedRatio).toBeGreaterThan(0.22);
+  expect(integratedRatio).toBeLessThan(0.28);
+
   await app.close();
 });
 

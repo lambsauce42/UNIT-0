@@ -9,6 +9,7 @@ import type {
   AppletSession,
   AppletSessionState,
   TabHostSnapshot,
+  UnitSettings,
   UpdateAppletSessionStatePayload,
   Workspace,
   WorkspaceLayoutLeaf,
@@ -24,6 +25,7 @@ export type WorkspaceStateModel = {
   workspaces: Record<string, Workspace>;
   tabs: Record<string, WorkspaceTab>;
   primaryHost: TabHostSnapshot;
+  settings: UnitSettings;
 };
 
 export type CreateAppletOptions = {
@@ -31,6 +33,7 @@ export type CreateAppletOptions = {
   kind: AppletKind;
   targetLeafId?: string;
   splitDirection?: "row" | "column";
+  sidebar?: boolean;
 };
 
 export type AppletMutationResult = {
@@ -60,6 +63,8 @@ export type MoveAppletOptions = {
   placement: "first" | "second";
 };
 
+const MAX_SIDEBAR_APPLETS = 5;
+
 export type UpdateLayoutRatiosOptions = {
   workspaceId: string;
   ratios: Record<string, number>;
@@ -81,6 +86,11 @@ const DEFAULT_APPLET_SESSIONS: Record<string, AppletSession> = {
   "session-browser": { id: "session-browser", kind: "browser", title: "Browser", state: {} },
   "session-chat": { id: "session-chat", kind: "chat", title: "Chat", state: {} },
   "session-sandbox": { id: "session-sandbox", kind: "sandbox", title: "Sandbox", state: {} }
+};
+
+const DEFAULT_UNIT_SETTINGS: UnitSettings = {
+  tileResizeMode: "adjacent",
+  expandedSidebarWidthRatio: 0.25
 };
 
 type SeedWorkspace = Omit<Workspace, "applets" | "shelfAppletIds"> & {
@@ -269,7 +279,13 @@ export class WorkspaceStateStore {
       ])
     );
     const primaryHost = this.loadPrimaryHost(tabs);
-    return { appletSessions, workspaces, tabs, primaryHost };
+    return { appletSessions, workspaces, tabs, primaryHost, settings: this.loadSettings() };
+  }
+
+  updateSettings(settings: Partial<UnitSettings>): UnitSettings {
+    const nextSettings = normalizeUnitSettings({ ...this.loadSettings(), ...settings });
+    this.setMetadata("settings_json", JSON.stringify(nextSettings));
+    return nextSettings;
   }
 
   savePrimaryHost(host: TabHostSnapshot): void {
@@ -435,12 +451,19 @@ export class WorkspaceStateStore {
       id: `${workspace.id}-${options.kind}-${randomUUID()}`,
       sessionId: session.id
     };
-    const nextLayout = insertAppletLeaf(workspace.layout, instance.id, options.targetLeafId, splitDirection);
+    if (options.sidebar && workspace.shelfAppletIds.length >= MAX_SIDEBAR_APPLETS) {
+      throw new Error(`Workspace ${workspace.id} sidebar is full`);
+    }
+    const nextLayout = options.sidebar
+      ? workspace.layout
+      : insertAppletLeaf(workspace.layout, instance.id, options.targetLeafId, splitDirection);
     const nextWorkspace = {
       ...workspace,
       applets: [...workspace.applets, instance],
-      layout: nextLayout
+      layout: nextLayout,
+      shelfAppletIds: options.sidebar ? [...workspace.shelfAppletIds, instance.id] : workspace.shelfAppletIds
     };
+    validateWorkspacePlacement(nextWorkspace);
 
     this.db.exec("BEGIN IMMEDIATE");
     try {
@@ -451,6 +474,9 @@ export class WorkspaceStateStore {
         .prepare("INSERT INTO applet_instances (id, workspace_id, session_id, area, sort_order) VALUES (?, ?, ?, ?, ?)")
         .run(instance.id, workspace.id, instance.sessionId, session.kind, this.nextAppletSortOrder(workspace.id));
       this.saveWorkspaceLayoutInTransaction(workspace.id, nextLayout);
+      if (options.sidebar) {
+        this.saveWorkspaceShelfInTransaction(workspace.id, nextWorkspace.shelfAppletIds);
+      }
       this.db.exec("COMMIT");
     } catch (error) {
       this.db.exec("ROLLBACK");
@@ -511,6 +537,78 @@ export class WorkspaceStateStore {
       delete appletSessions[deletedSessionId];
     }
     return { workspace: nextWorkspace, appletSessions, deletedSessionId };
+  }
+
+  shelveAppletInstance(workspaceId: string, appletInstanceId: string): Workspace {
+    const model = this.load();
+    const workspace = model.workspaces[workspaceId];
+    if (!workspace) {
+      throw new Error(`Workspace ${workspaceId} does not exist`);
+    }
+    if (!workspace.applets.some((item) => item.id === appletInstanceId)) {
+      throw new Error(`Applet instance ${appletInstanceId} does not exist in workspace ${workspaceId}`);
+    }
+    if (workspace.shelfAppletIds.includes(appletInstanceId)) {
+      return workspace;
+    }
+    if (workspace.shelfAppletIds.length >= MAX_SIDEBAR_APPLETS) {
+      throw new Error(`Workspace ${workspaceId} sidebar is full`);
+    }
+    const isMounted = workspace.layout ? collectLayoutAppletIds(workspace.layout).has(appletInstanceId) : false;
+    if (!isMounted) {
+      throw new Error(`Applet instance ${appletInstanceId} is not mounted in workspace ${workspaceId}`);
+    }
+    const nextLayout = removeAppletLeaf(workspace.layout, appletInstanceId);
+    const nextWorkspace = {
+      ...workspace,
+      layout: nextLayout,
+      shelfAppletIds: [...workspace.shelfAppletIds, appletInstanceId]
+    };
+    validateWorkspacePlacement(nextWorkspace);
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.saveWorkspaceLayoutInTransaction(workspaceId, nextLayout);
+      this.saveWorkspaceShelfInTransaction(workspaceId, nextWorkspace.shelfAppletIds);
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+    return nextWorkspace;
+  }
+
+  unshelveAppletInstance(workspaceId: string, appletInstanceId: string): Workspace {
+    const model = this.load();
+    const workspace = model.workspaces[workspaceId];
+    if (!workspace) {
+      throw new Error(`Workspace ${workspaceId} does not exist`);
+    }
+    if (!workspace.shelfAppletIds.includes(appletInstanceId)) {
+      throw new Error(`Applet instance ${appletInstanceId} is not in workspace ${workspaceId} sidebar`);
+    }
+    const nextLayout = insertAppletLeafWithRatio(
+      workspace.layout,
+      appletInstanceId,
+      undefined,
+      "row",
+      1 - model.settings.expandedSidebarWidthRatio
+    );
+    const nextWorkspace = {
+      ...workspace,
+      layout: nextLayout,
+      shelfAppletIds: workspace.shelfAppletIds.filter((item) => item !== appletInstanceId)
+    };
+    validateWorkspacePlacement(nextWorkspace);
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.saveWorkspaceLayoutInTransaction(workspaceId, nextLayout);
+      this.saveWorkspaceShelfInTransaction(workspaceId, nextWorkspace.shelfAppletIds);
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+    return nextWorkspace;
   }
 
   changeAppletInstanceKind(options: ChangeAppletKindOptions): AppletMutationResult {
@@ -801,6 +899,9 @@ export class WorkspaceStateStore {
       ON CONFLICT(key) DO NOTHING;
     `);
     this.addColumnIfMissing("applet_sessions", "state_json", "TEXT NOT NULL DEFAULT '{}'");
+    this.db
+      .prepare("INSERT INTO unit_metadata (key, value) VALUES ('settings_json', ?) ON CONFLICT(key) DO NOTHING")
+      .run(JSON.stringify(DEFAULT_UNIT_SETTINGS));
     this.backfillMissingWorkspaceLayouts();
   }
 
@@ -926,6 +1027,30 @@ export class WorkspaceStateStore {
     }
   }
 
+  private loadSettings(): UnitSettings {
+    const row = this.db.prepare("SELECT value FROM unit_metadata WHERE key = 'settings_json'").get() as
+      | { value: string }
+      | undefined;
+    if (!row) {
+      return DEFAULT_UNIT_SETTINGS;
+    }
+    try {
+      return normalizeUnitSettings(JSON.parse(row.value) as unknown);
+    } catch {
+      return DEFAULT_UNIT_SETTINGS;
+    }
+  }
+
+  private setMetadata(key: string, value: string): void {
+    this.db
+      .prepare(
+        `INSERT INTO unit_metadata (key, value)
+         VALUES (?, ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value`
+      )
+      .run(key, value);
+  }
+
   private saveWorkspaceLayoutInTransaction(workspaceId: string, layout: WorkspaceLayoutNode | null): void {
     this.db
       .prepare(
@@ -1034,17 +1159,45 @@ function normalizeAppletSessionState(state: AppletSessionState): AppletSessionSt
   return nextState;
 }
 
+function normalizeUnitSettings(value: unknown): UnitSettings {
+  if (!value || typeof value !== "object") {
+    return DEFAULT_UNIT_SETTINGS;
+  }
+  const item = value as Partial<UnitSettings>;
+  return {
+    tileResizeMode: item.tileResizeMode === "cascade" ? "cascade" : "adjacent",
+    expandedSidebarWidthRatio: clampSidebarWidthRatio(item.expandedSidebarWidthRatio)
+  };
+}
+
+function clampSidebarWidthRatio(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value)
+    ? Math.max(0.18, Math.min(0.45, value))
+    : DEFAULT_UNIT_SETTINGS.expandedSidebarWidthRatio;
+}
+
 function insertAppletLeaf(
   layout: WorkspaceLayoutNode | null,
   appletInstanceId: string,
   targetLeafId: string | undefined,
   splitDirection: "row" | "column"
 ): WorkspaceLayoutNode {
+  return insertAppletLeafWithRatio(layout, appletInstanceId, targetLeafId, splitDirection, 0.5);
+}
+
+function insertAppletLeafWithRatio(
+  layout: WorkspaceLayoutNode | null,
+  appletInstanceId: string,
+  targetLeafId: string | undefined,
+  splitDirection: "row" | "column",
+  ratio: number
+): WorkspaceLayoutNode {
   const leafNode: WorkspaceLayoutNode = {
     id: `leaf-${appletInstanceId}`,
     type: "leaf",
     appletInstanceId
   };
+  const splitRatio = Math.max(0.05, Math.min(0.95, ratio));
   if (!layout) {
     if (targetLeafId) {
       throw new Error(`Cannot split missing layout leaf ${targetLeafId}`);
@@ -1056,7 +1209,7 @@ function insertAppletLeaf(
       id: `split-root-${appletInstanceId}`,
       type: "split",
       direction: splitDirection,
-      ratio: 0.5,
+      ratio: splitRatio,
       first: layout,
       second: leafNode
     };
@@ -1065,7 +1218,7 @@ function insertAppletLeaf(
     id: `split-${targetLeaf.id}-${appletInstanceId}`,
     type: "split",
     direction: splitDirection,
-    ratio: 0.5,
+    ratio: splitRatio,
     first: targetLeaf,
     second: leafNode
   }));
@@ -1357,8 +1510,19 @@ function collectLayoutAppletIds(layout: WorkspaceLayoutNode): Set<string> {
 }
 
 function validateWorkspaceLayoutForWorkspace(layout: WorkspaceLayoutNode, workspace: Workspace): void {
+  validateWorkspacePlacement(workspace, layout);
+}
+
+function validateWorkspacePlacement(workspace: Workspace, layout: WorkspaceLayoutNode | null = workspace.layout): void {
   const mountedAppletIds = new Set(workspace.applets.map((instance) => instance.id));
   const shelfAppletIds = validateWorkspaceShelf(workspace);
+  if (!layout) {
+    if (shelfAppletIds.size !== mountedAppletIds.size) {
+      const missing = [...mountedAppletIds].filter((appletId) => !shelfAppletIds.has(appletId));
+      throw new Error(`Workspace ${workspace.id} layout does not mount applet instance(s): ${missing.join(", ")}`);
+    }
+    return;
+  }
   const nodeIds = new Set<string>();
   const leafAppletIds = new Set<string>();
   const visit = (node: WorkspaceLayoutNode) => {
@@ -1401,6 +1565,9 @@ function validateWorkspaceLayoutForWorkspace(layout: WorkspaceLayoutNode, worksp
 function validateWorkspaceShelf(workspace: Workspace): Set<string> {
   const mountedAppletIds = new Set(workspace.applets.map((instance) => instance.id));
   const shelfAppletIds = new Set<string>();
+  if (workspace.shelfAppletIds.length > MAX_SIDEBAR_APPLETS) {
+    throw new Error(`Workspace ${workspace.id} sidebar can hold at most ${MAX_SIDEBAR_APPLETS} applets`);
+  }
   for (const appletId of workspace.shelfAppletIds) {
     if (!mountedAppletIds.has(appletId)) {
       throw new Error(`Workspace ${workspace.id} shelf references missing applet instance ${appletId}`);

@@ -20,8 +20,6 @@ const settings: ChatAppSettings = {
   actionButtons: [],
   expandedProjectIds: [],
   autoExpandCodexDisclosures: true,
-  documentIndexLocation: "local",
-  documentToolExecutionLocation: "local",
   tokenizerModelPath: "",
   remoteHostAddress: "127.0.0.1",
   remoteHostPort: 14555,
@@ -56,9 +54,9 @@ test("validates signed remote discovery and model catalog responses", async () =
       ? JSON.stringify({
         host_identity: "identity-1",
         protocol_version: "1",
-        capabilities: ["model_catalog", "chat_stream", "document_catalog", "document_upload", "document_cancel", "document_search", "document_analysis_budget", "document_analysis_stream"]
+        capabilities: ["model_catalog", "chat_stream", "runtime_status", "runtime_logs", "model_prewarm", "context_prepare"]
       })
-      : JSON.stringify({ models: [{ id: "remote::identity-1::abc", label: "Remote Model", reference: "Qwen", source_label: "Remote Built-in" }] });
+      : JSON.stringify({ models: [{ id: "remote::identity-1::abc", label: "Remote Model", reference: "local-alias", prompt_format: "gpt-oss", context_tokens: 2048, source_label: "Remote Inference" }] });
     return signedJsonResponse(url.pathname, nonce, body);
   };
   const runtime = new RemoteHostRuntime(fetchImpl as typeof fetch);
@@ -66,7 +64,7 @@ test("validates signed remote discovery and model catalog responses", async () =
   const discovered = await runtime.discover({ ...settings, remoteHostAddress: "http://127.0.0.1:14555/v1/discover", remoteHostPort: 1 });
 
   expect(discovered.hostIdentity).toBe("identity-1");
-  expect(discovered.models[0]).toMatchObject({ id: "remote::identity-1::abc", providerId: "remote", hostId: "host-1" });
+  expect(discovered.models[0]).toMatchObject({ id: "remote::identity-1::abc", providerId: "remote", hostId: "host-1", reference: "local-alias", promptFormat: "gpt-oss", contextTokens: 2048 });
   expect(requestedUrls[0]).toBe("http://127.0.0.1:14555/v1/discover");
 });
 
@@ -76,33 +74,58 @@ test("rejects unsigned remote JSON responses", async () => {
   await expect(runtime.discover(settings)).rejects.toThrow(/host identity|signature/);
 });
 
-test("validates signed remote chat streams and requires completion", async () => {
+test("validates signed remote chat streams and sends only inference context", async () => {
+  let requestedBody: Record<string, unknown> = {};
   const fetchImpl = async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = new URL(String(input));
+    requestedBody = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
     const nonce = new Headers(init?.headers).get("X-Unit0-Auth-Nonce") ?? "";
     const headers = streamHeaders(nonce, url.pathname);
-    const first = { type: "chunk", content: "he", reasoning: "" };
-    const second = { type: "chunk", content: "llo", reasoning: "" };
+    const first = { type: "chunk", content: "\n\n```ts\n", reasoning: "\n  Needs " };
+    const second = { type: "chunk", content: "  const value = 42;\n", reasoning: "spaces.\n" };
+    const third = { type: "chunk", content: "```\nAfter", reasoning: "  indent" };
     const complete = { type: "complete", metrics: {} };
-    const lines = [signEvent(nonce, 1, first), signEvent(nonce, 2, second), signEvent(nonce, 3, complete)]
+    const lines = [signEvent(nonce, 1, first), signEvent(nonce, 2, second), signEvent(nonce, 3, third), signEvent(nonce, 4, complete)]
       .map((event) => JSON.stringify(event))
       .join("\n");
     return new Response(lines, { status: 200, headers });
   };
   const runtime = new RemoteHostRuntime(fetchImpl as typeof fetch);
   let content = "";
+  let reasoning = "";
 
   await runtime.streamChat({
     settings,
-    model: { id: "remote-model", label: "Remote", path: "", providerId: "remote", createdAt: "" },
-    runtimeSettings,
+    model: { id: "remote-model", label: "Remote", path: "", providerId: "remote", contextTokens: 1024, createdAt: "" },
+    runtimeSettings: { ...runtimeSettings, nCtx: 4096, maxTokens: 2048, trimReserveTokens: 1000, trimAmountTokens: 2000 },
     messages: [{ id: "m1", threadId: "t1", role: "user", content: "hi", attachments: [], status: "complete", createdAt: "", updatedAt: "" }],
+    builtinAgenticFramework: "document_analysis",
+    documentTitle: "Local Notes",
+    contextKey: "ctx-1",
     onToken: (token) => {
       content += token;
+    },
+    onReasoning: (token) => {
+      reasoning += token;
     }
   });
 
-  expect(content).toBe("hello");
+  expect(content).toBe("\n\n```ts\n  const value = 42;\n```\nAfter");
+  expect(reasoning).toBe("\n  Needs spaces.\n  indent");
+  expect(requestedBody).toMatchObject({
+    model_id: "remote-model",
+    builtin_agentic_framework: "document_analysis",
+    document_title: "Local Notes",
+    context_key: "ctx-1"
+  });
+  expect(requestedBody.settings).toMatchObject({
+    n_ctx: 1024,
+    max_tokens: 1024,
+    trim_trigger_remaining_tokens: 250,
+    trim_target_cleared_tokens: 500
+  });
+  expect(requestedBody.messages).toEqual([{ role: "user", content: "hi", reasoning: "" }]);
+  expect(requestedBody).not.toHaveProperty("document_index_id");
 });
 
 test("rejects remote stream events with invalid signatures", async () => {
@@ -123,108 +146,37 @@ test("rejects remote stream events with invalid signatures", async () => {
   })).rejects.toThrow(/stream event signature/);
 });
 
-test("streams remote document analysis from the dedicated endpoint", async () => {
-  let requestedPath = "";
-  let requestedBody: Record<string, unknown> = {};
-  const fetchImpl = async (input: RequestInfo | URL, init?: RequestInit) => {
-    const url = new URL(String(input));
-    requestedPath = url.pathname;
-    requestedBody = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
-    const nonce = new Headers(init?.headers).get("X-Unit0-Auth-Nonce") ?? "";
-    const chunk = { type: "chunk", content: "answer", reasoning: "" };
-    const events = { type: "agent_events", events: [{ type: "tool", id: "search", tool: "search", output: "r1" }], session_state: {} };
-    const complete = { type: "complete", content: "", reasoning: "" };
-    const lines = [signEvent(nonce, 1, chunk), signEvent(nonce, 2, events), signEvent(nonce, 3, complete)]
-      .map((event) => JSON.stringify(event))
-      .join("\n");
-    return new Response(lines, { status: 200, headers: streamHeaders(nonce, url.pathname) });
-  };
-  const runtime = new RemoteHostRuntime(fetchImpl as typeof fetch);
-  let content = "";
-  const agentEvents: unknown[] = [];
-
-  await runtime.streamDocumentAnalysis({
-    settings,
-    model: { id: "remote-model", label: "Remote", path: "", providerId: "remote", createdAt: "" },
-    runtimeSettings,
-    messages: [],
-    documentIndexId: "remote-doc::identity-1::doc-1",
-    onToken: (token) => {
-      content += token;
-    },
-    onAgentEvents: (events) => agentEvents.push(...events)
-  });
-
-  expect(requestedPath).toBe("/v1/document-analysis");
-  expect(requestedBody.document_index_id).toBe("doc-1");
-  expect(content).toBe("answer");
-  expect(agentEvents).toHaveLength(1);
-});
-
-test("uses dedicated remote document status, cancel, and evidence budget endpoints", async () => {
+test("prewarms and prepares reusable context with signed JSON endpoints", async () => {
   const requestedPaths: string[] = [];
   const requestedBodies: Record<string, unknown>[] = [];
   const fetchImpl = async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = new URL(String(input));
     requestedPaths.push(url.pathname);
-    if (init?.body) {
-      requestedBodies.push(JSON.parse(String(init.body)) as Record<string, unknown>);
-    }
+    requestedBodies.push(JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>);
     const nonce = new Headers(init?.headers).get("X-Unit0-Auth-Nonce") ?? "";
-    const body = url.pathname.endsWith("/cancel")
-      ? JSON.stringify({ cancelled: true })
-      : url.pathname === "/v1/document-analysis/evidence-budget"
-        ? JSON.stringify({ budget_tokens: 1234 })
-        : JSON.stringify({
-          document: {
-            id: "doc-1",
-            title: "Remote Doc",
-            source_titles: ["a.pdf"],
-            state: "ready",
-            progress: 1,
-            message: "Ready"
-          }
-        });
-    return signedJsonResponse(url.pathname, nonce, body);
+    return signedJsonResponse(url.pathname, nonce, JSON.stringify({ ok: true }));
   };
   const runtime = new RemoteHostRuntime(fetchImpl as typeof fetch);
 
-  const status = await runtime.documentIndexStatus({
+  await runtime.prewarm({
     settings,
-    projectId: "project-1",
-    documentIndexId: "remote-doc::identity-1::doc-1"
+    model: { id: "remote-model", label: "Remote", path: "", providerId: "remote", createdAt: "" },
+    runtimeSettings
   });
-  const cancelled = await runtime.cancelDocumentIndex({
-    settings,
-    documentIndexId: "remote-doc::identity-1::doc-1"
-  });
-  const budget = await runtime.documentAnalysisEvidenceBudget({
+  await runtime.prepareContext({
     settings,
     model: { id: "remote-model", label: "Remote", path: "", providerId: "remote", createdAt: "" },
     runtimeSettings: { ...runtimeSettings, systemPrompt: DEFAULT_SYSTEM_PROMPT },
-    messages: [],
-    documentTitle: "Remote Doc"
-  });
-  const customBudget = await runtime.documentAnalysisEvidenceBudget({
-    settings,
-    model: { id: "remote-model", label: "Remote", path: "", providerId: "remote", createdAt: "" },
-    runtimeSettings,
-    messages: [],
-    documentTitle: "Remote Doc"
+    messages: [{ id: "m1", threadId: "t1", role: "assistant", content: "answer", reasoning: "thinking", attachments: [], status: "complete", createdAt: "", updatedAt: "" }],
+    contextKey: "ctx-1",
+    builtinAgenticFramework: "chat"
   });
 
-  expect(status).toMatchObject({ id: "remote-doc::identity-1::doc-1", projectId: "project-1", state: "ready" });
-  expect(cancelled).toBe(true);
-  expect(budget).toBe(1234);
-  expect(customBudget).toBe(1234);
-  expect((requestedBodies.at(-2)?.settings as Record<string, unknown>).system_prompt_customized).toBe(false);
-  expect((requestedBodies.at(-1)?.settings as Record<string, unknown>).system_prompt_customized).toBe(true);
-  expect(requestedPaths).toEqual([
-    "/v1/documents/doc-1",
-    "/v1/documents/doc-1/cancel",
-    "/v1/document-analysis/evidence-budget",
-    "/v1/document-analysis/evidence-budget"
-  ]);
+  expect(requestedPaths).toEqual(["/v1/prewarm", "/v1/context/prepare"]);
+  expect(requestedBodies[0].settings).toMatchObject({ n_ctx: runtimeSettings.nCtx });
+  expect((requestedBodies[0].settings as Record<string, unknown>).system_prompt_customized).toBe(true);
+  expect((requestedBodies[1].settings as Record<string, unknown>).system_prompt_customized).toBe(false);
+  expect(requestedBodies[1].messages).toEqual([{ role: "assistant", content: "answer", reasoning: "thinking" }]);
 });
 
 function signedJsonResponse(requestPath: string, requestNonce: string, body: string) {

@@ -34,12 +34,12 @@ import { codexItemToTimelineBlock, type CodexRuntime, type CodexThreadEvent, typ
 import { LocalEmbeddingRuntime, type DocumentEmbeddingRuntime } from "./embeddingRuntime.js";
 import { ChatStore, DEFAULT_CODEX_MODELS, type ChatDocumentSearchEntry } from "./chatStore.js";
 import { LocalLlamaRuntime } from "./localLlamaRuntime.js";
+import { RealOpenCodeRuntime, type OpenCodeRuntime, type OpenCodeRuntimeEvent } from "./openCodeRuntime.js";
 import { RemoteHostRuntime, type RemoteStreamMetrics } from "./remoteHostRuntime.js";
 
 const execFileAsync = promisify(execFile);
 const requireFromMain = createRequire(__filename);
 const CODEX_ATTACHMENT_TEMP_PREFIX = "unit0-codex-attachments-";
-type RemoteDocumentSearchResult = { document_id?: string; entries?: unknown[] };
 type CodexTextTimelineBlock = Extract<ChatTimelineBlock, { kind: "assistant_message" | "reasoning" }>;
 
 function mergeStreamingTimelineBlock(
@@ -165,6 +165,120 @@ function upsertCodexTextTimelineBlock(
   }
 }
 
+function completeOpenCodeReasoningBlocks(blocks: ChatTimelineBlock[]): void {
+  for (let index = 0; index < blocks.length; index += 1) {
+    const block = blocks[index];
+    if (block.kind === "reasoning" && block.status !== "completed") {
+      blocks[index] = { ...block, status: "completed" };
+    }
+  }
+}
+
+function completeOpenCodeAssistantBlocks(blocks: ChatTimelineBlock[]): void {
+  for (let index = 0; index < blocks.length; index += 1) {
+    const block = blocks[index];
+    if (block.kind === "assistant_message" && block.status !== "completed") {
+      blocks[index] = { ...block, status: "completed" };
+    }
+  }
+}
+
+function lastMapKey(map: Map<string, string>): string | undefined {
+  let last: string | undefined;
+  for (const key of map.keys()) {
+    last = key;
+  }
+  return last;
+}
+
+function removeDuplicateOpenCodeTextBlocks(blocks: ChatTimelineBlock[], kind: "assistant_message" | "reasoning"): void {
+  let sawFirst = false;
+  for (let index = 0; index < blocks.length; index += 1) {
+    if (blocks[index].kind !== kind) {
+      continue;
+    }
+    if (sawFirst) {
+      blocks.splice(index, 1);
+      index -= 1;
+      continue;
+    }
+    sawFirst = true;
+  }
+}
+
+function moveOpenCodeReasoningBeforeAssistant(blocks: ChatTimelineBlock[]): void {
+  let assistantIndex = blocks.findIndex((block) => block.kind === "assistant_message");
+  if (assistantIndex < 0) {
+    return;
+  }
+  for (let index = assistantIndex + 1; index < blocks.length; index += 1) {
+    if (blocks[index].kind !== "reasoning") {
+      continue;
+    }
+    const [reasoningBlock] = blocks.splice(index, 1);
+    blocks.splice(assistantIndex, 0, reasoningBlock);
+    assistantIndex += 1;
+  }
+}
+
+function reconcileOpenCodeFinalSnapshotTimelineBlocks(
+  blocks: ChatTimelineBlock[],
+  content: string,
+  reasoning: string,
+  assistantTextById: Map<string, string>,
+  reasoningTextById: Map<string, string>
+): void {
+  if (reasoning.length > 0) {
+    const reasoningIndex = blocks.findIndex((block) => block.kind === "reasoning");
+    const priorReasoning = reasoningIndex >= 0 ? blocks[reasoningIndex] : null;
+    const reasoningBlock: Extract<ChatTimelineBlock, { kind: "reasoning" }> = {
+      kind: "reasoning",
+      id: priorReasoning?.id ?? lastMapKey(reasoningTextById) ?? "opencode-final-reasoning",
+      status: "completed",
+      text: reasoning,
+      initiallyExpanded: priorReasoning?.kind === "reasoning" ? priorReasoning.initiallyExpanded : true
+    };
+    if (reasoningIndex >= 0) {
+      blocks[reasoningIndex] = reasoningBlock;
+    } else {
+      const assistantIndex = blocks.findIndex((block) => block.kind === "assistant_message");
+      blocks.splice(assistantIndex >= 0 ? assistantIndex : blocks.length, 0, reasoningBlock);
+    }
+  } else {
+    for (let index = blocks.length - 1; index >= 0; index -= 1) {
+      if (blocks[index].kind === "reasoning") {
+        blocks.splice(index, 1);
+      }
+    }
+  }
+
+  if (content.length > 0) {
+    const assistantIndex = blocks.findIndex((block) => block.kind === "assistant_message");
+    const assistantBlock: Extract<ChatTimelineBlock, { kind: "assistant_message" }> = {
+      kind: "assistant_message",
+      id: assistantIndex >= 0 ? blocks[assistantIndex].id : lastMapKey(assistantTextById) ?? "opencode-final-assistant",
+      status: "completed",
+      text: content
+    };
+    if (assistantIndex >= 0) {
+      blocks[assistantIndex] = assistantBlock;
+    } else {
+      const reasoningIndex = blocks.findIndex((block) => block.kind === "reasoning");
+      blocks.splice(reasoningIndex >= 0 ? reasoningIndex + 1 : blocks.length, 0, assistantBlock);
+    }
+  } else {
+    for (let index = blocks.length - 1; index >= 0; index -= 1) {
+      if (blocks[index].kind === "assistant_message") {
+        blocks.splice(index, 1);
+      }
+    }
+  }
+
+  removeDuplicateOpenCodeTextBlocks(blocks, "reasoning");
+  removeDuplicateOpenCodeTextBlocks(blocks, "assistant_message");
+  moveOpenCodeReasoningBeforeAssistant(blocks);
+}
+
 function mergeCodexReasoningSections(
   prior: Extract<ChatTimelineBlock, { kind: "reasoning" }> | null,
   item: Extract<CodexThreadItem, { type: "reasoning" }>,
@@ -280,7 +394,6 @@ export class ChatService {
   private codexAccount: ChatCodexAccountState = { status: "unknown" };
   private queuedSubmissions: ChatQueuedSubmission[] = [];
   private queuedSubmissionPayloads = new Map<string, { text: string; attachments: ChatAttachment[] }>();
-  private openCodeAbortController: AbortController | null = null;
   private activeLocalRunId = 0;
   private nextLocalRunId = 0;
   private cancelledLocalRunIds = new Set<number>();
@@ -295,8 +408,11 @@ export class ChatService {
     private readonly remoteRuntime: RemoteHostRuntime,
     private readonly codexRuntime: CodexRuntime,
     private readonly broadcast: () => void,
-    private readonly embeddingRuntime: DocumentEmbeddingRuntime = new LocalEmbeddingRuntime()
-  ) {}
+    private readonly embeddingRuntime: DocumentEmbeddingRuntime = new LocalEmbeddingRuntime(),
+    private readonly openCodeRuntime: OpenCodeRuntime = new RealOpenCodeRuntime()
+  ) {
+    void this.refreshRemoteModels();
+  }
 
   state(): ChatState {
     return {
@@ -327,7 +443,7 @@ export class ChatService {
         ? thread.builtinModelId
         : thread.builtinModelId || state.selectedModelId;
       const model = state.models.find((item) => item.id === selectedModelId);
-      if (!model || model.providerId === "remote") {
+      if (!model) {
         return;
       }
       const documentIndex = thread.builtinAgenticFramework === "document_analysis" && thread.documentIndexId
@@ -335,6 +451,14 @@ export class ChatService {
         : null;
       const documentTitle = documentIndex?.title ?? "";
       if (runId !== this.warmupRunId || this.generationIsRunning()) {
+        return;
+      }
+      if (model.providerId === "remote") {
+        await this.remoteRuntime.prewarm({
+          settings: state.appSettings,
+          model,
+          runtimeSettings: thread.runtimeSettings
+        });
         return;
       }
       await this.runtime.warmChatSession({
@@ -475,13 +599,6 @@ export class ChatService {
   }
 
   selectModel(modelId: string): ChatState {
-    const state = this.store.loadState();
-    const thread = state.threads.find((item) => item.id === state.selectedThreadId);
-    if (thread?.providerMode === "builtin" && thread.builtinAgenticFramework === "opencode" && isRemoteModelId(state.models, modelId)) {
-      this.setError("OpenCode requires a local built-in model.");
-      this.broadcast();
-      return this.state();
-    }
     this.store.selectModel(modelId);
     this.clearError();
     this.broadcast();
@@ -497,9 +614,10 @@ export class ChatService {
     return this.state();
   }
 
-  updateAppSettings(settings: Partial<ChatState["appSettings"]>): ChatState {
+  async updateAppSettings(settings: Partial<ChatState["appSettings"]>): Promise<ChatState> {
     this.store.updateAppSettings(settings);
     this.clearError();
+    await this.refreshRemoteModels({ reportErrors: true });
     this.broadcast();
     return this.state();
   }
@@ -515,7 +633,7 @@ export class ChatService {
     const nextProviderMode = payload.providerMode ?? thread?.providerMode;
     const nextFramework = payload.builtinAgenticFramework ?? thread?.builtinAgenticFramework;
     const nextModelId = (payload.builtinModelId ?? thread?.builtinModelId ?? "").trim();
-    if (nextProviderMode === "builtin" && nextFramework === "opencode" && !isLocalModelId(state.models, nextModelId)) {
+    if (nextProviderMode === "builtin" && nextFramework === "opencode" && !isLocalBuiltinModelId(state.models, nextModelId)) {
       this.setError("OpenCode requires a local built-in model.");
       this.broadcast();
       return this.state();
@@ -534,6 +652,7 @@ export class ChatService {
       planModeEnabled: payload.planModeEnabled,
       documentIndexId: payload.documentIndexId,
       codexLastSessionId: payload.codexLastSessionId,
+      openCodeSessionId: payload.openCodeSessionId,
       remoteSessionId: payload.remoteSessionId,
       remoteSlotId: payload.remoteSlotId,
       remoteSettingsSignature: payload.remoteSettingsSignature,
@@ -553,7 +672,7 @@ export class ChatService {
       this.broadcast();
       return this.state();
     }
-    if (preset?.providerMode === "builtin" && preset.builtinAgenticFramework === "opencode" && !isLocalModelId(state.models, preset.builtinModelId)) {
+    if (preset?.providerMode === "builtin" && preset.builtinAgenticFramework === "opencode" && !isLocalBuiltinModelId(state.models, preset.builtinModelId)) {
       this.setError("OpenCode requires a local built-in model.");
       this.broadcast();
       return this.state();
@@ -567,7 +686,7 @@ export class ChatService {
 
   saveSettingsPreset(payload: ChatSaveSettingsPresetPayload): ChatState {
     const providerMode = payload.providerMode ?? "builtin";
-    if (providerMode === "builtin" && payload.builtinAgenticFramework === "opencode" && !isLocalModelId(this.store.loadState().models, payload.builtinModelId ?? "")) {
+    if (providerMode === "builtin" && payload.builtinAgenticFramework === "opencode" && !isLocalBuiltinModelId(this.store.loadState().models, payload.builtinModelId ?? "")) {
       this.setError("OpenCode requires a local built-in model.");
       this.broadcast();
       return this.state();
@@ -617,9 +736,10 @@ export class ChatService {
     return this.state();
   }
 
-  private async refreshRemoteModels(): Promise<void> {
+  private async refreshRemoteModels(options: { reportErrors?: boolean } = {}): Promise<void> {
     const appSettings = this.store.loadState().appSettings;
     if (!appSettings.remoteHostAddress.trim() || !appSettings.remotePairingCode.trim()) {
+      this.store.clearRemoteModels();
       return;
     }
     try {
@@ -630,8 +750,11 @@ export class ChatService {
         protocolVersion: remote.protocolVersion
       });
       this.clearError();
-    } catch {
-      return;
+    } catch (error) {
+      this.store.clearRemoteModels();
+      if (options.reportErrors) {
+        this.setError(errorMessage(error));
+      }
     } finally {
       this.broadcast();
     }
@@ -741,12 +864,12 @@ export class ChatService {
       this.setError("Selected chat thread could not be loaded.");
       return this.state();
     }
-    if (selectedThread.providerMode === "builtin" && selectedThread.builtinAgenticFramework === "opencode" && !isLocalModelId(state.models, selectedThread.builtinModelId)) {
+    if (selectedThread.providerMode === "builtin" && selectedThread.builtinAgenticFramework === "opencode" && !isLocalBuiltinModelId(state.models, selectedThread.builtinModelId)) {
       this.setError("OpenCode requires a local built-in model.");
       return this.state();
     }
     if (selectedThread.providerMode === "builtin" && !selectedModel) {
-      this.setError("Add and select a local GGUF model before sending.");
+      this.setError("Add and select a built-in model before sending.");
       return this.state();
     }
     if (selectedThread.providerMode === "codex") {
@@ -790,13 +913,13 @@ export class ChatService {
     this.runtime.cancelActiveRequest();
     this.remoteRuntime.cancelActiveRequest();
     this.codexRuntime.cancelActiveRequest();
+    this.openCodeRuntime.cancelActiveRequest();
     if (this.activeOpenCodeRunId) {
       this.cancelledOpenCodeRunIds.add(this.activeOpenCodeRunId);
     }
     if (this.activeLocalRunId) {
       this.cancelledLocalRunIds.add(this.activeLocalRunId);
     }
-    this.openCodeAbortController?.abort();
     this.store.updateMessageStatus(this.generation.assistantMessageId, "interrupted");
     this.generation = { status: "idle" };
     this.broadcast();
@@ -812,6 +935,7 @@ export class ChatService {
     this.embeddingRuntime.close();
     this.remoteRuntime.cancelActiveRequest();
     this.codexRuntime.close();
+    this.openCodeRuntime.close();
     this.store.close();
   }
 
@@ -858,12 +982,28 @@ export class ChatService {
       return;
     }
     if (thread?.builtinAgenticFramework === "opencode") {
-      await this.runOpenCodeGeneration({
-        thread,
-        messages,
-        assistantMessageId: options.assistantMessageId,
-        model: options.model
-      });
+      const runId = ++this.nextOpenCodeRunId;
+      this.activeOpenCodeRunId = runId;
+      try {
+        await this.runOpenCodeGeneration({
+          thread,
+          messages,
+          assistantMessageId: options.assistantMessageId,
+          model: options.model,
+          runCancelled: () => this.cancelledOpenCodeRunIds.has(runId)
+            || (this.generation.status === "running" && this.generation.assistantMessageId !== options.assistantMessageId)
+            || (this.generation.status !== "running" && this.activeOpenCodeRunId !== runId),
+          ownsActiveGeneration: () => this.generation.status === "running" && this.generation.assistantMessageId === options.assistantMessageId
+        });
+      } finally {
+        if (this.activeOpenCodeRunId === runId) {
+          this.activeOpenCodeRunId = 0;
+        }
+        this.cancelledOpenCodeRunIds.delete(runId);
+        if (!(this.generation.status === "running" && this.generation.assistantMessageId !== options.assistantMessageId)) {
+          this.cancelRequested = false;
+        }
+      }
       return;
     }
     if (options.model.providerId === "remote") {
@@ -935,7 +1075,10 @@ export class ChatService {
       if (!options.thread) {
         throw new Error("Selected chat thread could not be loaded.");
       }
-      const resume = remoteResumeState(options.thread, options.model, state.appSettings);
+      const resume = remoteResumeState(options.thread, options.model, state.appSettings, { framework: "chat" });
+      const runCancelled = () => this.cancelRequested
+        || this.generation.status !== "running"
+        || this.generation.assistantMessageId !== options.assistantMessageId;
       const metrics = await this.remoteRuntime.streamChat({
         settings: state.appSettings,
         model: options.model,
@@ -944,19 +1087,31 @@ export class ChatService {
         remoteSessionId: resume.remoteSessionId,
         runtimeSlotId: resume.remoteSlotId,
         runtimeSettingsSignature: resume.remoteSettingsSignature,
+        builtinAgenticFramework: "chat",
+        contextKey: options.thread ? localRuntimeCacheKey(options.thread, options.model, "chat") : undefined,
         onToken: (token) => {
+          if (runCancelled()) {
+            return;
+          }
           this.store.appendToMessage(options.assistantMessageId, token);
           this.broadcast();
         },
         onReasoning: (token) => {
+          if (runCancelled()) {
+            return;
+          }
           this.store.appendToMessageReasoning(options.assistantMessageId, token);
           this.broadcast();
         }
       });
-      this.store.updateThreadSettings(options.thread.id, remoteMetricsToThreadSettings(options.thread, options.model, state.appSettings, metrics));
-      this.store.mergeMessageMetadata(options.assistantMessageId, { remoteMetrics: metrics.metrics });
-      this.store.updateMessageStatus(options.assistantMessageId, this.cancelRequested ? "interrupted" : "complete");
-      this.generation = { status: "idle" };
+      if (runCancelled()) {
+        this.store.updateMessageStatus(options.assistantMessageId, "interrupted");
+      } else {
+        this.store.updateThreadSettings(options.thread.id, remoteMetricsToThreadSettings(options.thread, options.model, state.appSettings, metrics, { framework: "chat" }));
+        this.store.mergeMessageMetadata(options.assistantMessageId, { remoteMetrics: metrics.metrics });
+        this.store.updateMessageStatus(options.assistantMessageId, "complete");
+        this.generation = { status: "idle" };
+      }
     } catch (error) {
       const message = errorMessage(error);
       this.store.updateMessageStatus(options.assistantMessageId, this.cancelRequested ? "interrupted" : "error");
@@ -991,27 +1146,13 @@ export class ChatService {
       if (documentIndex.state !== "ready") {
         throw new Error("Selected document index is not ready yet.");
       }
-      const appSettings = this.store.loadState().appSettings;
-      if (options.model.providerId === "remote" && documentIndex.id.startsWith("remote-doc::") && appSettings.documentToolExecutionLocation === "remote") {
-        await this.runRemoteHostedDocumentAnalysisGeneration({ ...options, documentIndex });
-        this.store.updateMessageStatus(options.assistantMessageId, options.runCancelled() ? "interrupted" : "complete");
-        if (options.ownsActiveGeneration()) {
-          this.generation = { status: "idle" };
-        }
-        return;
-      }
       const documentRuntimeSettings = documentAnalysisRuntimeSettings(options.thread.runtimeSettings, documentIndex.title);
       const workingMessages = [...options.messages];
       const timelineBlocks: ChatTimelineBlock[] = [];
-      const useRemoteDocumentTools = documentIndex.id.startsWith("remote-doc::") || appSettings.documentToolExecutionLocation === "remote";
-      if (useRemoteDocumentTools && !documentIndex.id.startsWith("remote-doc::")) {
-        throw new Error("Remote document tool execution requires a remote document index.");
-      }
       let latestResults: ChatDocumentSearchEntry[] = [];
-      let latestRemoteResult: RemoteDocumentSearchResult | null = null;
       let malformedAttempts = 0;
       for (let toolCallCount = 0; toolCallCount <= 8; toolCallCount += 1) {
-        const shouldStreamFinalCandidate = latestResults.length > 0 || Boolean(latestRemoteResult);
+        const shouldStreamFinalCandidate = latestResults.length > 0;
         const reasoningBlockId = `document-reasoning-${randomUUID()}`;
         let latestReasoningText = "";
         const updateReasoningTimeline = (text: string, status: string) => {
@@ -1036,6 +1177,7 @@ export class ChatService {
           this.broadcast();
         };
         const assistantContentBeforePass = this.assistantMessageContent(options.assistantMessageId);
+        const currentThread = this.store.loadState().threads.find((item) => item.id === options.thread.id) ?? options.thread;
         const pass = await this.runDocumentModelPass({
           model: options.model,
           settings: shouldStreamFinalCandidate
@@ -1044,7 +1186,12 @@ export class ChatService {
           messages: workingMessages,
           builtinAgenticFramework: "document_analysis",
           documentTitle: documentIndex.title,
-          cacheKey: localRuntimeCacheKey(options.thread, options.model, "document_analysis", documentIndex.title),
+          cacheKey: localRuntimeCacheKey(currentThread, options.model, "document_analysis", documentIndex.title),
+          remoteResume: remoteResumeState(currentThread, options.model, this.store.loadState().appSettings, {
+            framework: "document_analysis",
+            documentIndexId: documentIndex.id,
+            documentTitle: documentIndex.title
+          }),
           shouldCancel: options.runCancelled,
           streamToAssistant: {
             assistantMessageId: options.assistantMessageId,
@@ -1053,6 +1200,14 @@ export class ChatService {
             onReasoning: (text) => updateReasoningTimeline(text, "updated")
           }
         });
+        if (pass.remoteMetrics && !options.runCancelled()) {
+          this.store.updateThreadSettings(options.thread.id, remoteMetricsToThreadSettings(currentThread, options.model, this.store.loadState().appSettings, pass.remoteMetrics, {
+            framework: "document_analysis",
+            documentIndexId: documentIndex.id,
+            documentTitle: documentIndex.title
+          }));
+          this.store.mergeMessageMetadata(options.assistantMessageId, { remoteMetrics: pass.remoteMetrics.metrics });
+        }
         if (options.runCancelled()) {
           break;
         }
@@ -1086,7 +1241,7 @@ export class ChatService {
             throw new Error(errorText);
           }
           workingMessages.push(syntheticChatMessage("assistant", pass.content));
-          workingMessages.push(syntheticChatMessage("user", documentAnalysisToolRetryMessage(errorText, latestResults.length > 0 || Boolean(latestRemoteResult))));
+          workingMessages.push(syntheticChatMessage("user", documentAnalysisToolRetryMessage(errorText, latestResults.length > 0)));
           continue;
         }
         if (toolCallCount >= 8) {
@@ -1095,61 +1250,27 @@ export class ChatService {
         malformedAttempts = 0;
         const toolBlockId = `document-tool-${randomUUID()}`;
         if (parsed.tool === "search") {
-          if (useRemoteDocumentTools) {
-            const budgetTokens = await this.documentEvidenceBudgetForRemoteTools(options.model, options.thread, workingMessages, documentIndex.title);
-            if (budgetTokens <= 0) {
-              throw new Error("Document analysis ran out of safe evidence budget. Start a new thread, reset local context, or use a larger context window.");
-            }
-            latestRemoteResult = await this.remoteRuntime.searchDocumentIndex({
-              settings: appSettings,
-              documentIndexId: documentIndex.id,
-              query: parsed.query,
-              topK: parsed.topK,
-              budgetTokens
-            });
-            latestResults = remoteSearchEntriesToChat(latestRemoteResult);
-          } else {
-            const budgetTokens = documentEvidenceBudget(documentRuntimeSettings, workingMessages, documentIndex.title);
-            if (budgetTokens <= 0) {
-              throw new Error("Document analysis ran out of safe evidence budget. Start a new thread, reset local context, or use a larger context window.");
-            }
-            const embeddingModelPath = documentIndex.embeddingModelPath.trim() || options.thread.documentAnalysisEmbeddingModelPath.trim();
-            if (!embeddingModelPath) {
-              throw new Error("Document analysis requires an embedding GGUF path before searching an index.");
-            }
-            const queryEmbedding = await this.embeddingRuntime.embedQuery({
-              modelPath: embeddingModelPath,
-              text: parsed.query,
-              nCtx: documentAnalysisEmbeddingContextSize(),
-              nGpuLayers: -1
-            });
-            latestResults = this.store.searchDocumentIndexByVector(documentIndex.id, queryEmbedding, parsed.topK, budgetTokens);
+          const budgetTokens = documentEvidenceBudget(documentRuntimeSettings, workingMessages, documentIndex.title);
+          if (budgetTokens <= 0) {
+            throw new Error("Document analysis ran out of safe evidence budget. Start a new thread, reset local context, or use a larger context window.");
           }
+          const embeddingModelPath = documentIndex.embeddingModelPath.trim() || options.thread.documentAnalysisEmbeddingModelPath.trim();
+          if (!embeddingModelPath) {
+            throw new Error("Document analysis requires an embedding GGUF path before searching an index.");
+          }
+          const queryEmbedding = await this.embeddingRuntime.embedQuery({
+            modelPath: embeddingModelPath,
+            text: parsed.query,
+            nCtx: documentAnalysisEmbeddingContextSize(),
+            nGpuLayers: -1
+          });
+          latestResults = this.store.searchDocumentIndexByVector(documentIndex.id, queryEmbedding, parsed.topK, budgetTokens);
         } else if (parsed.tool === "modify_results") {
-          if (useRemoteDocumentTools) {
-            if (!latestRemoteResult) {
-              throw new Error("Document search results must exist before modify_results can run.");
-            }
-            const budgetTokens = await this.documentEvidenceBudgetForRemoteTools(options.model, options.thread, workingMessages, documentIndex.title);
-            if (budgetTokens <= 0) {
-              throw new Error("Document analysis ran out of safe evidence budget. Start a new thread, reset local context, or use a larger context window.");
-            }
-            latestRemoteResult = await this.remoteRuntime.modifyDocumentSearchResults({
-              settings: appSettings,
-              documentIndexId: documentIndex.id,
-              result: latestRemoteResult,
-              dropResultIds: parsed.dropResultIds,
-              expand: parsed.expand,
-              budgetTokens
-            });
-            latestResults = remoteSearchEntriesToChat(latestRemoteResult);
-          } else {
-            const budgetTokens = documentEvidenceBudget(documentRuntimeSettings, workingMessages, documentIndex.title);
-            if (budgetTokens <= 0) {
-              throw new Error("Document analysis ran out of safe evidence budget. Start a new thread, reset local context, or use a larger context window.");
-            }
-            latestResults = this.store.modifyDocumentSearchResults(documentIndex.id, latestResults, parsed.dropResultIds, parsed.expand, budgetTokens);
+          const budgetTokens = documentEvidenceBudget(documentRuntimeSettings, workingMessages, documentIndex.title);
+          if (budgetTokens <= 0) {
+            throw new Error("Document analysis ran out of safe evidence budget. Start a new thread, reset local context, or use a larger context window.");
           }
+          latestResults = this.store.modifyDocumentSearchResults(documentIndex.id, latestResults, parsed.dropResultIds, parsed.expand, budgetTokens);
         } else {
           throw new Error("Unsupported document-analysis tool call.");
         }
@@ -1198,6 +1319,7 @@ export class ChatService {
     builtinAgenticFramework?: ChatState["threads"][number]["builtinAgenticFramework"];
     documentTitle?: string;
     cacheKey?: string;
+    remoteResume?: ReturnType<typeof remoteResumeState>;
     shouldCancel?: () => boolean;
     streamToAssistant: {
       assistantMessageId: string;
@@ -1205,7 +1327,7 @@ export class ChatService {
       onContentStart?: () => void;
       onReasoning?: (text: string) => void;
     };
-  }): Promise<{ content: string; reasoning: string; streamedContentLength: number; streamedReasoningLength: number }> {
+  }): Promise<{ content: string; reasoning: string; streamedContentLength: number; streamedReasoningLength: number; remoteMetrics?: RemoteStreamMetrics }> {
     const contentParts: string[] = [];
     const reasoningParts: string[] = [];
     let streamedContentLength = 0;
@@ -1256,12 +1378,19 @@ export class ChatService {
       options.streamToAssistant.onReasoning(reasoningParts.join(""));
     };
     if (options.model.providerId === "remote") {
+      let remoteMetrics: RemoteStreamMetrics | undefined;
       try {
-        await this.remoteRuntime.streamChat({
+        remoteMetrics = await this.remoteRuntime.streamChat({
           settings: this.store.loadState().appSettings,
           model: options.model,
           runtimeSettings: options.settings,
           messages: options.messages,
+          remoteSessionId: options.remoteResume?.remoteSessionId,
+          runtimeSlotId: options.remoteResume?.remoteSlotId,
+          runtimeSettingsSignature: options.remoteResume?.remoteSettingsSignature,
+          builtinAgenticFramework: options.builtinAgenticFramework ?? "chat",
+          documentTitle: options.documentTitle ?? "",
+          contextKey: options.cacheKey,
           onToken: appendContentToken,
           onReasoning: appendReasoningToken
         });
@@ -1274,7 +1403,7 @@ export class ChatService {
       } else {
         streamBuffer?.flush();
       }
-      return { content: contentParts.join(""), reasoning: reasoningParts.join(""), streamedContentLength, streamedReasoningLength };
+      return { content: contentParts.join(""), reasoning: reasoningParts.join(""), streamedContentLength, streamedReasoningLength, remoteMetrics };
     }
     try {
       await this.runtime.streamChat({
@@ -1304,177 +1433,60 @@ export class ChatService {
     messages: ChatState["messages"];
     assistantMessageId: string;
     model: ChatModel;
+    runCancelled: () => boolean;
+    ownsActiveGeneration: () => boolean;
   }): Promise<void> {
-    const runId = ++this.nextOpenCodeRunId;
-    this.activeOpenCodeRunId = runId;
-    const runCancelled = () => this.cancelledOpenCodeRunIds.has(runId);
-    const ownsActiveGeneration = () => this.generation.status === "running" && this.generation.assistantMessageId === options.assistantMessageId;
     let finishedActiveGeneration = false;
+    const timelineBlocks: ChatTimelineBlock[] = [];
+    const assistantTextById = new Map<string, string>();
+    const reasoningTextById = new Map<string, string>();
     try {
-      if (options.model.providerId === "remote") {
-        throw new Error("OpenCode requires a local built-in model.");
-      }
       const project = this.store.loadState().projects.find((item) => item.id === options.thread.projectId);
       if (!project?.directory) {
         throw new Error("Select a project directory before using OpenCode.");
       }
-      const workingMessages = [...options.messages];
-      const timelineBlocks: ChatTimelineBlock[] = [];
-      for (let toolCallCount = 0; toolCallCount <= 12; toolCallCount += 1) {
-        const reasoningBlockId = `opencode-reasoning-${randomUUID()}`;
-        let latestReasoningText = "";
-        const updateReasoningTimeline = (text: string, status: string) => {
-          if (!text.trim()) {
-            return;
-          }
-          latestReasoningText = text;
-          const block: ChatTimelineBlock = {
-            kind: "reasoning",
-            id: reasoningBlockId,
-            status,
-            text,
-            initiallyExpanded: true
-          };
-          const existingIndex = timelineBlocks.findIndex((item) => item.id === reasoningBlockId);
-          if (existingIndex >= 0) {
-            timelineBlocks[existingIndex] = block;
-          } else {
-            timelineBlocks.push(block);
-          }
-          this.store.updateMessageTimelineBlocks(options.assistantMessageId, timelineBlocks);
-          this.broadcast();
-        };
-        const assistantContentBeforePass = this.assistantMessageContent(options.assistantMessageId);
-        const pass = await this.runDocumentModelPass({
-          model: options.model,
-          settings: openCodeModelSettings(options.model, options.thread.runtimeSettings),
-          messages: workingMessages,
-          builtinAgenticFramework: "opencode",
-          cacheKey: localRuntimeCacheKey(options.thread, options.model, "opencode"),
-          shouldCancel: runCancelled,
-          streamToAssistant: {
-            assistantMessageId: options.assistantMessageId,
-            content: "final_candidate",
-            onContentStart: () => updateReasoningTimeline(latestReasoningText, "completed"),
-            onReasoning: (text) => updateReasoningTimeline(text, "updated")
-          }
-        });
-        if (runCancelled()) {
-          break;
-        }
-        updateReasoningTimeline(pass.reasoning, "completed");
-        const parsed = parseOpenCodeToolCallResponse(pass.content, pass.reasoning);
-        if (parsed.status === "final") {
-          const contentRemainder = pass.content.slice(pass.streamedContentLength);
-          if (contentRemainder) {
-            this.store.appendToMessage(options.assistantMessageId, contentRemainder);
-          }
-          break;
-        }
-        if (parsed.status !== "tool_call") {
-          if (pass.streamedContentLength > 0) {
-            this.store.replaceMessageContent(options.assistantMessageId, assistantContentBeforePass);
-          }
-          const errorText = parsed.status === "malformed" ? parsed.error : "Empty OpenCode response.";
-          timelineBlocks.push({
-            kind: "tool",
-            id: `opencode-tool-failed-${randomUUID()}`,
-            toolName: "Failed Tool Call",
-            status: "failed",
-            summary: errorText,
-            output: openCodeToolCallDiagnosticDetails(pass.content, pass.reasoning),
-            initiallyExpanded: false
-          });
-          this.store.updateMessageTimelineBlocks(options.assistantMessageId, timelineBlocks);
-          throw new Error(errorText);
-        }
-        if (toolCallCount >= 12) {
-          throw new Error("OpenCode exceeded the tool-call limit for one response. Narrow the request and try again.");
-        }
-        const toolBlockId = `opencode-tool-${randomUUID()}`;
-        timelineBlocks.push({
-          kind: "tool",
-          id: toolBlockId,
-          toolName: "shell",
-          status: "started",
-          summary: parsed.command,
-          command: parsed.command,
-          directory: project.directory,
-          initiallyExpanded: true
-        });
-        this.store.updateMessageTimelineBlocks(options.assistantMessageId, timelineBlocks);
-        this.broadcast();
-        if (runCancelled()) {
-          break;
-        }
-        const abortController = new AbortController();
-        this.openCodeAbortController = abortController;
-        const toolResult = await runOpenCodeShellCommand(parsed.command, project.directory, abortController.signal);
-        if (this.openCodeAbortController === abortController) {
-          this.openCodeAbortController = null;
-        }
-        const toolIndex = timelineBlocks.findIndex((item) => item.id === toolBlockId);
-        if (runCancelled()) {
-          if (toolIndex >= 0) {
-            timelineBlocks[toolIndex] = {
-              kind: "tool",
-              id: toolBlockId,
-              toolName: "shell",
-              status: "interrupted",
-              summary: parsed.command,
-              command: parsed.command,
-              directory: project.directory,
-              output: "Command cancelled.",
-              initiallyExpanded: true
-            };
-            this.store.updateMessageTimelineBlocks(options.assistantMessageId, timelineBlocks);
-          }
-          break;
-        }
-        if (toolIndex >= 0) {
-          timelineBlocks[toolIndex] = {
-            kind: "tool",
-            id: toolBlockId,
-            toolName: "shell",
-            status: toolResult.exitCode === 0 ? "completed" : "failed",
-            summary: parsed.command,
-            command: parsed.command,
-            directory: project.directory,
-            output: formatOpenCodeShellOutput(toolResult),
-            initiallyExpanded: true
-          };
-        }
-        this.store.updateMessageTimelineBlocks(options.assistantMessageId, timelineBlocks);
-        this.broadcast();
-        workingMessages.push(syntheticChatMessage("assistant", pass.content, pass.reasoning));
-        workingMessages.push(syntheticChatMessage("user", `Tool result:\n${formatOpenCodeShellOutput(toolResult)}\n${openCodeToolResultGuidance(toolResult.exitCode)}`));
+      const lastUserMessage = [...options.messages].reverse().find((message) => message.role === "user");
+      if (!lastUserMessage) {
+        throw new Error("OpenCode requires a user message.");
       }
-      this.store.updateMessageStatus(options.assistantMessageId, runCancelled() ? "interrupted" : "complete");
-      if (ownsActiveGeneration()) {
+      if (lastUserMessage.attachments.length > 0) {
+        throw new Error("OpenCode threads do not support Unit-0 attachments yet.");
+      }
+      const endpoint = await this.runtime.openAiEndpoint({
+        model: options.model,
+        settings: openCodeModelSettings(options.model, options.thread.runtimeSettings)
+      });
+      for await (const event of this.openCodeRuntime.runTurn({
+        cwd: project.directory,
+        prompt: lastUserMessage.content,
+        sessionId: options.thread.openCodeSessionId,
+        modelLabel: options.model.label,
+        nativeGptOss: isNativeGptOssModel(options.model),
+        endpoint,
+        settings: openCodeModelSettings(options.model, options.thread.runtimeSettings),
+        permissionMode: options.thread.permissionMode
+      })) {
+        if (options.runCancelled()) {
+          break;
+        }
+        this.applyOpenCodeEvent(options.assistantMessageId, options.thread.id, event, timelineBlocks, assistantTextById, reasoningTextById);
+      }
+      this.store.updateMessageStatus(options.assistantMessageId, options.runCancelled() ? "interrupted" : "complete");
+      if (options.ownsActiveGeneration()) {
         this.generation = { status: "idle" };
         finishedActiveGeneration = true;
       }
     } catch (error) {
       const message = errorMessage(error);
-      this.store.updateMessageStatus(options.assistantMessageId, runCancelled() ? "interrupted" : "error");
-      if (!runCancelled()) {
+      this.store.updateMessageStatus(options.assistantMessageId, options.runCancelled() ? "interrupted" : "error");
+      if (!options.runCancelled()) {
         this.appendAssistantErrorBlock(options.assistantMessageId, message, "opencode_failed");
       }
-      if (ownsActiveGeneration()) {
-        this.generation = runCancelled() ? { status: "idle" } : { status: "error", error: message };
+      if (options.ownsActiveGeneration()) {
+        this.generation = options.runCancelled() ? { status: "idle" } : { status: "error", error: message };
         finishedActiveGeneration = true;
       }
     } finally {
-      const wasCancelled = runCancelled();
-      if (this.activeOpenCodeRunId === runId) {
-        this.openCodeAbortController?.abort();
-        this.openCodeAbortController = null;
-        this.activeOpenCodeRunId = 0;
-      }
-      this.cancelledOpenCodeRunIds.delete(runId);
-      if (!wasCancelled) {
-        this.cancelRequested = false;
-      }
       this.broadcast();
       if (finishedActiveGeneration) {
         void this.drainNextQueuedSubmission();
@@ -1486,114 +1498,73 @@ export class ChatService {
     return this.store.loadState().messages.find((message) => message.id === messageId)?.content ?? "";
   }
 
-  private async runRemoteHostedDocumentAnalysisGeneration(options: {
-    thread: ChatState["threads"][number];
-    messages: ChatState["messages"];
-    assistantMessageId: string;
-    model: ChatModel;
-    documentIndex: NonNullable<ReturnType<ChatStore["documentIndex"]>>;
-    runCancelled: () => boolean;
-    ownsActiveGeneration: () => boolean;
-  }): Promise<void> {
-    const timelineBlocks: ChatTimelineBlock[] = [];
-    let currentReasoningBlockId = "";
-    let currentReasoningText = "";
-    const state = this.store.loadState();
-    const resume = remoteResumeState(options.thread, options.model, state.appSettings, options.documentIndex.id);
-    const updateReasoningTimeline = (text: string, status: string) => {
-      if (!text.trim()) {
-        return;
-      }
-      if (!currentReasoningBlockId) {
-        currentReasoningBlockId = `remote-document-reasoning-${randomUUID()}`;
-        currentReasoningText = "";
-      }
-      currentReasoningText += text;
-      const block: ChatTimelineBlock = {
-        kind: "reasoning",
-        id: currentReasoningBlockId,
-        status,
-        text: currentReasoningText,
-        initiallyExpanded: true
-      };
-      const existingIndex = timelineBlocks.findIndex((item) => item.id === currentReasoningBlockId);
-      if (existingIndex >= 0) {
-        timelineBlocks[existingIndex] = block;
-      } else {
-        timelineBlocks.push(block);
-      }
-      this.store.updateMessageTimelineBlocks(options.assistantMessageId, timelineBlocks);
+  private applyOpenCodeEvent(
+    assistantMessageId: string,
+    threadId: string,
+    event: OpenCodeRuntimeEvent,
+    timelineBlocks: ChatTimelineBlock[],
+    assistantTextById: Map<string, string>,
+    reasoningTextById: Map<string, string>
+  ): void {
+    if (event.type === "session.started") {
+      this.store.updateThreadSettings(threadId, { openCodeSessionId: event.sessionId });
       this.broadcast();
-    };
-    const metrics = await this.remoteRuntime.streamDocumentAnalysis({
-      settings: state.appSettings,
-      model: options.model,
-      runtimeSettings: options.thread.runtimeSettings,
-      messages: options.messages,
-      documentIndexId: options.documentIndex.id,
-      remoteSessionId: resume.remoteSessionId,
-      runtimeSlotId: resume.remoteSlotId,
-      runtimeSettingsSignature: resume.remoteSettingsSignature,
-      onToken: (token) => {
-        if (options.runCancelled()) {
-          return;
-        }
-        this.store.appendToMessage(options.assistantMessageId, token);
-        this.broadcast();
-      },
-      onReasoning: (token) => {
-        if (options.runCancelled()) {
-          return;
-        }
-        updateReasoningTimeline(token, "updated");
-      },
-      onAgentEvents: (events) => {
-        if (options.runCancelled()) {
-          return;
-        }
-        if (currentReasoningBlockId) {
-          const reasoningBlock = timelineBlocks.find((item) => item.id === currentReasoningBlockId);
-          if (reasoningBlock?.kind === "reasoning") {
-            reasoningBlock.status = "completed";
-          }
-          currentReasoningBlockId = "";
-          currentReasoningText = "";
-        }
-        for (const event of events) {
-          applyRemoteAgentEventToTimelineBlocks(timelineBlocks, event);
-        }
-        this.store.updateMessageTimelineBlocks(options.assistantMessageId, timelineBlocks);
-        this.broadcast();
-      }
-    });
-    if (options.runCancelled()) {
       return;
     }
-    if (currentReasoningBlockId) {
-      const reasoningBlock = timelineBlocks.find((item) => item.id === currentReasoningBlockId);
-      if (reasoningBlock?.kind === "reasoning") {
-        reasoningBlock.status = "completed";
-        this.store.updateMessageTimelineBlocks(options.assistantMessageId, timelineBlocks);
+    if (event.type === "assistant.delta") {
+      if (event.text) {
+        completeOpenCodeReasoningBlocks(timelineBlocks);
+        this.store.appendToMessage(assistantMessageId, event.text);
+        assistantTextById.set(event.id, `${assistantTextById.get(event.id) ?? ""}${event.text}`);
+        upsertCodexTextTimelineBlock(timelineBlocks, "item.updated", {
+          id: event.id,
+          type: "agent_message",
+          text: event.text
+        });
+        this.store.updateMessageTimelineBlocks(assistantMessageId, timelineBlocks);
+        this.broadcast();
       }
+      return;
     }
-    this.store.updateThreadSettings(options.thread.id, remoteMetricsToThreadSettings(options.thread, options.model, state.appSettings, metrics, options.documentIndex.id));
-    this.store.mergeMessageMetadata(options.assistantMessageId, { remoteMetrics: metrics.metrics });
-  }
-
-  private async documentEvidenceBudgetForRemoteTools(
-    model: ChatModel,
-    thread: ChatState["threads"][number],
-    messages: ChatState["messages"],
-    documentTitle: string
-  ): Promise<number> {
-    const budget = await this.remoteRuntime.documentAnalysisEvidenceBudget({
-      settings: this.store.loadState().appSettings,
-      model,
-      runtimeSettings: thread.runtimeSettings,
-      messages,
-      documentTitle
-    });
-    return Math.max(0, budget);
+    if (event.type === "reasoning.delta") {
+      if (event.text) {
+        this.store.appendToMessageReasoning(assistantMessageId, event.text);
+        reasoningTextById.set(event.id, `${reasoningTextById.get(event.id) ?? ""}${event.text}`);
+        upsertCodexTextTimelineBlock(timelineBlocks, "item.updated", {
+          id: event.id,
+          type: "reasoning",
+          text: event.text
+        });
+        moveOpenCodeReasoningBeforeAssistant(timelineBlocks);
+        this.store.updateMessageTimelineBlocks(assistantMessageId, timelineBlocks);
+        this.broadcast();
+      }
+      return;
+    }
+    if (event.type === "turn.completed") {
+      completeOpenCodeReasoningBlocks(timelineBlocks);
+      completeOpenCodeAssistantBlocks(timelineBlocks);
+      this.store.updateMessageTimelineBlocks(assistantMessageId, timelineBlocks);
+      this.broadcast();
+      return;
+    }
+    if (event.type === "timeline") {
+      upsertCodexTimelineBlock(timelineBlocks, event.eventType, event.block);
+      this.store.updateMessageTimelineBlocks(assistantMessageId, timelineBlocks);
+      this.broadcast();
+      return;
+    }
+    if (event.type === "final.snapshot") {
+      this.store.replaceMessageContent(assistantMessageId, event.content);
+      this.store.replaceMessageReasoning(assistantMessageId, event.reasoning);
+      reconcileOpenCodeFinalSnapshotTimelineBlocks(timelineBlocks, event.content, event.reasoning, assistantTextById, reasoningTextById);
+      this.store.updateMessageTimelineBlocks(assistantMessageId, timelineBlocks);
+      this.broadcast();
+      return;
+    }
+    if (event.type === "error") {
+      throw new Error(event.details ? `${event.message}\n${event.details}` : event.message);
+    }
   }
 
   private async runCodexGeneration(options: { threadId: string; assistantMessageId: string }): Promise<void> {
@@ -1892,30 +1863,6 @@ export class ChatService {
       this.broadcast();
       return this.state();
     }
-    if (state.appSettings.documentIndexLocation === "remote") {
-      const selectedModel = state.models.find((model) => model.id === (selectedThread.builtinModelId || state.selectedModelId));
-      if (!selectedModel || selectedModel.providerId !== "remote") {
-        this.setError("Remote document indexing requires a selected remote built-in model.");
-        this.broadcast();
-        return this.state();
-      }
-      try {
-        const remoteIndex = await this.remoteRuntime.createDocumentIndex({
-          settings: state.appSettings,
-          projectId: payload.projectId,
-          title: payload.title,
-          sourcePaths: payload.sourcePath.split(/\r?\n/g).map((item) => item.trim()).filter(Boolean),
-          remoteModelId: selectedModel.id
-        });
-        this.store.upsertDocumentIndex(remoteIndex);
-        this.store.selectDocumentIndex(selectedThread.id, remoteIndex.id);
-        this.clearError();
-      } catch (error) {
-        this.setError(errorMessage(error));
-      }
-      this.broadcast();
-      return this.state();
-    }
     const embeddingModelPath = effectiveDocumentAnalysisEmbeddingModelPath(state, selectedThread);
     if (!embeddingModelPath) {
       this.setError("Document analysis requires an embedding GGUF path before creating an index.");
@@ -1956,8 +1903,8 @@ export class ChatService {
       this.broadcast();
       return this.state();
     }
-    if (state.appSettings.documentIndexLocation === "remote" || documentIndex.id.startsWith("remote-doc::")) {
-      this.setError("Remote document indexes cannot be edited by the local document indexer.");
+    if (documentIndex.id.startsWith("remote-doc::")) {
+      this.setError("Remote document indexes are no longer supported. Create a local document index for this project.");
       this.broadcast();
       return this.state();
     }
@@ -2087,7 +2034,14 @@ export class ChatService {
     this.store.updateMessageTimelineBlock(payload.messageId, payload.blockId, (block) => {
       if (block.kind === "approval") {
         if (payload.action === "approve" || payload.action === "deny") {
-          this.codexRuntime.answerApproval(payload.blockId, payload.action === "approve" ? "accept" : "decline");
+          if (block.requestMethod === "opencode") {
+            void this.openCodeRuntime.answerApproval(payload.blockId, payload.action).catch((error) => {
+              this.setError(errorMessage(error));
+              this.broadcast();
+            });
+          } else {
+            this.codexRuntime.answerApproval(payload.blockId, payload.action === "approve" ? "accept" : "decline");
+          }
         }
         return {
           ...block,
@@ -2196,13 +2150,12 @@ function localToCodexBlockReason(): string {
   return "Local to Codex is not yet supported in the same thread. You cannot send messages with Codex models in a thread that already used built-in/local models.";
 }
 
-function isRemoteModelId(models: ChatModel[], modelId: string): boolean {
-  return models.find((model) => model.id === modelId)?.providerId === "remote";
+function isBuiltinModelId(models: ChatModel[], modelId: string): boolean {
+  return Boolean(models.find((item) => item.id === modelId));
 }
 
-function isLocalModelId(models: ChatModel[], modelId: string): boolean {
-  const model = models.find((item) => item.id === modelId);
-  return Boolean(model && model.providerId !== "remote");
+function isLocalBuiltinModelId(models: ChatModel[], modelId: string): boolean {
+  return Boolean(models.find((item) => item.id === modelId && item.providerId !== "remote"));
 }
 
 function plannedLocalContextStart(messages: ChatState["messages"], currentStart: number, settings: ChatState["runtimeSettings"]): number {
@@ -2435,36 +2388,17 @@ function formatDocumentSearchResults(evidence: ChatDocumentSearchEntry[]): strin
   ].join("\n")).join("\n\n");
 }
 
-function remoteSearchEntriesToChat(result: RemoteDocumentSearchResult): ChatDocumentSearchEntry[] {
-  const entries = Array.isArray(result.entries) ? result.entries : [];
-  return entries
-    .filter((entry): entry is Record<string, unknown> => Boolean(entry && typeof entry === "object" && !Array.isArray(entry)))
-    .map((entry, index) => ({
-      chunkId: String(entry.chunk_id ?? entry.id ?? `remote-chunk-${index + 1}`),
-      resultId: String(entry.result_id ?? `r${index + 1}`),
-      sourceId: String(entry.source_id ?? entry.sourceId ?? entry.document_id ?? result.document_id ?? ""),
-      sourceTitle: String(entry.source_title ?? entry.sourceTitle ?? "Remote document"),
-      sourcePath: String(entry.source_path ?? entry.sourcePath ?? ""),
-      sectionLabel: String(entry.section_label ?? entry.sectionLabel ?? ""),
-      candidateCount: boundedInteger(entry.candidate_count ?? entry.candidateCount, 1, 0, 999999),
-      truncated: Boolean(entry.truncated),
-      pageStart: boundedInteger(entry.page_start ?? entry.pageStart, 1, 1, 999999),
-      pageEnd: boundedInteger(entry.page_end ?? entry.pageEnd, Number(entry.page_start ?? entry.pageStart ?? 1) || 1, 1, 999999),
-      text: String(entry.text ?? ""),
-      tokenCount: boundedInteger(entry.token_count ?? entry.tokenCount, estimatedTextTokens(String(entry.text ?? "")), 1, 999999),
-      score: Number(entry.score ?? 0),
-      ordinalStart: boundedInteger(entry.ordinal_start ?? entry.ordinalStart, index, 0, 999999),
-      ordinalEnd: boundedInteger(entry.ordinal_end ?? entry.ordinalEnd, index, 0, 999999)
-    }))
-    .filter((entry) => entry.text.trim());
-}
-
-function remoteResumeState(thread: ChatState["threads"][number], model: ChatModel, appSettings: ChatState["appSettings"], documentIndexId = ""): {
+function remoteResumeState(
+  thread: ChatState["threads"][number],
+  model: ChatModel,
+  appSettings: ChatState["appSettings"],
+  context: { framework: ChatBuiltinAgenticFramework; documentIndexId?: string; documentTitle?: string }
+): {
   remoteSessionId: string;
   remoteSlotId: number;
   remoteSettingsSignature: string;
 } {
-  const signature = builtinRuntimeSettingsSignature(thread, model, appSettings, documentIndexId);
+  const signature = builtinRuntimeSettingsSignature(thread, model, appSettings, context);
   if (!thread.remoteSessionId || thread.remoteSettingsSignature !== signature || thread.remoteHostIdentity !== appSettings.remoteHostIdentity) {
     return { remoteSessionId: "", remoteSlotId: 0, remoteSettingsSignature: "" };
   }
@@ -2480,25 +2414,33 @@ function remoteMetricsToThreadSettings(
   model: ChatModel,
   appSettings: ChatState["appSettings"],
   metrics: RemoteStreamMetrics,
-  documentIndexId = ""
+  context: { framework: ChatBuiltinAgenticFramework; documentIndexId?: string; documentTitle?: string }
 ): Partial<ChatState["threads"][number]> {
   return {
     remoteSessionId: metrics.remoteSessionId,
     remoteSlotId: metrics.remoteSlotId,
     remoteHostIdentity: metrics.remoteHostIdentity,
-    remoteSettingsSignature: builtinRuntimeSettingsSignature(thread, model, appSettings, documentIndexId)
+    remoteSettingsSignature: builtinRuntimeSettingsSignature(thread, model, appSettings, context)
   };
 }
 
-function builtinRuntimeSettingsSignature(thread: ChatState["threads"][number], model: ChatModel, appSettings: ChatState["appSettings"], documentIndexId = ""): string {
+function builtinRuntimeSettingsSignature(
+  thread: ChatState["threads"][number],
+  model: ChatModel,
+  appSettings: ChatState["appSettings"],
+  context: { framework: ChatBuiltinAgenticFramework; documentIndexId?: string; documentTitle?: string }
+): string {
   const settings = thread.runtimeSettings;
   return JSON.stringify({
     backend: "remote_builtin",
     modelId: model.id,
     modelReference: model.reference ?? "",
+    modelPromptFormat: model.promptFormat ?? "",
     remoteHostId: appSettings.remoteHostId,
     remoteHostIdentity: appSettings.remoteHostIdentity,
-    documentIndexId,
+    framework: context.framework,
+    documentIndexId: context.framework === "document_analysis" ? context.documentIndexId ?? "" : "",
+    documentTitle: context.framework === "document_analysis" ? context.documentTitle ?? "" : "",
     contextRevision: thread.contextRevision,
     activeContextStartMessageIndex: thread.activeContextStartMessageIndex,
     nCtx: settings.nCtx,
@@ -2512,206 +2454,11 @@ function builtinRuntimeSettingsSignature(thread: ChatState["threads"][number], m
   });
 }
 
-function applyRemoteAgentEventToTimelineBlocks(timelineBlocks: ChatTimelineBlock[], value: unknown): void {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    return;
-  }
-  const event = value as Record<string, unknown>;
-  const type = String(event.type ?? event.kind ?? "").trim();
-  const eventId = String(event.id ?? event.event_id ?? "").trim();
-  if (type === "tool_output") {
-    const toolCallId = String(event.tool_call_id ?? "").trim();
-    const id = toolCallId || eventId || `remote-tool-output-${randomUUID()}`;
-    const output = String(event.content ?? event.output ?? event.result ?? "");
-    const existing = timelineBlocks.findIndex((item) => item.kind === "tool" && item.id === id);
-    const existingTool = existing >= 0 && timelineBlocks[existing].kind === "tool" ? timelineBlocks[existing] : null;
-    const outputText = event.stage === "delta" && existingTool?.output ? `${existingTool.output}${output}` : output;
-    const block: ChatTimelineBlock = {
-      kind: "tool",
-      id,
-      toolName: existingTool?.toolName ?? String(event.tool_name ?? event.tool ?? "tool_output"),
-      status: existingTool?.status === "failed" ? "failed" : "completed",
-      summary: existingTool?.summary,
-      command: existingTool?.command,
-      directory: existingTool?.directory,
-      output: outputText,
-      initiallyExpanded: true
-    };
-    if (existing >= 0) {
-      timelineBlocks[existing] = block;
-    } else {
-      timelineBlocks.push(block);
-    }
-    return;
-  }
-  if (type === "tool_call" || type.includes("search")) {
-    const toolCallId = String(event.tool_call_id ?? "").trim();
-    const id = toolCallId || eventId || `remote-tool-${randomUUID()}`;
-    const existing = timelineBlocks.findIndex((item) => item.kind === "tool" && item.id === id);
-    const existingTool = existing >= 0 && timelineBlocks[existing].kind === "tool" ? timelineBlocks[existing] : null;
-    const block: ChatTimelineBlock = {
-      kind: "tool",
-      id,
-      toolName: String(event.tool_name ?? event.tool ?? existingTool?.toolName ?? "remote_document_analysis"),
-      status: String(event.status ?? existingTool?.status ?? "completed"),
-      summary: String(event.summary ?? event.command ?? event.query ?? existingTool?.summary ?? ""),
-      command: typeof event.command === "string" ? event.command : typeof event.query === "string" ? event.query : existingTool?.command,
-      directory: typeof event.directory === "string" ? event.directory : existingTool?.directory,
-      output: existingTool?.output,
-      initiallyExpanded: true
-    };
-    if (existing >= 0) {
-      timelineBlocks[existing] = block;
-    } else {
-      timelineBlocks.push(block);
-    }
-    return;
-  }
-  if (type.includes("plan")) {
-    const id = eventId || `remote-plan-${randomUUID()}`;
-    upsertTimelineBlock(timelineBlocks, { kind: "plan", id, status: String(event.status ?? "updated"), markdown: String(event.markdown ?? event.summary ?? "") });
-    return;
-  }
-  if (type.includes("status")) {
-    const id = eventId || `remote-status-${randomUUID()}`;
-    upsertTimelineBlock(timelineBlocks, { kind: "status", id, level: String(event.level ?? "info"), message: String(event.message ?? event.summary ?? "") });
-  }
-}
-
-function upsertTimelineBlock(timelineBlocks: ChatTimelineBlock[], block: ChatTimelineBlock): void {
-  const existing = timelineBlocks.findIndex((item) => item.id === block.id);
-  if (existing >= 0) {
-    timelineBlocks[existing] = block;
-  } else {
-    timelineBlocks.push(block);
-  }
-}
-
 type ParsedDocumentToolCall =
   | { status: "final" | "empty" }
   | { status: "malformed"; error: string }
   | { status: "tool_call"; tool: "search"; query: string; topK: number }
   | { status: "tool_call"; tool: "modify_results"; query: ""; topK: number; dropResultIds: string[]; expand: Array<{ resultId: string; before: number; after: number }> };
-
-type ParsedOpenCodeToolCall =
-  | { status: "final" | "empty" }
-  | { status: "malformed"; error: string }
-  | { status: "tool_call"; command: string };
-
-type OpenCodeShellResult = {
-  exitCode: number;
-  stdout: string;
-  stderr: string;
-};
-
-function parseOpenCodeToolCallResponse(content: string, reasoning: string): ParsedOpenCodeToolCall {
-  const parsedContent = parseOpenCodeToolCall(content);
-  if (parsedContent.status === "empty" && reasoning.trim()) {
-    return { status: "malformed", error: "Missing final OpenCode tool call." };
-  }
-  return parsedContent;
-}
-
-function parseOpenCodeToolCall(text: string): ParsedOpenCodeToolCall {
-  const normalized = text.trim();
-  if (!normalized) {
-    return { status: "empty" };
-  }
-  const match = /^<tool_call>\s*([\s\S]*?)\s*<\/tool_call>$/u.exec(normalized);
-  if (!match) {
-    if (normalized.includes("<tool_call") || normalized.includes("</tool_call>")) {
-      return { status: "malformed", error: "Malformed OpenCode tool call." };
-    }
-    return { status: "final" };
-  }
-  return parseOpenCodePayloadText(match[1]);
-}
-
-function parseOpenCodePayloadText(text: string): ParsedOpenCodeToolCall {
-  try {
-    const payload = JSON.parse(text.trim()) as Record<string, unknown>;
-    const tool = String(payload.tool ?? "").trim();
-    if (tool !== "shell") {
-      return { status: "malformed", error: "OpenCode only supports the `shell` tool." };
-    }
-    const command = String(payload.command ?? "").trim();
-    if (!command) {
-      return { status: "malformed", error: "OpenCode shell command must be non-empty." };
-    }
-    return { status: "tool_call", command };
-  } catch {
-    return { status: "malformed", error: "OpenCode tool-call JSON could not be parsed." };
-  }
-}
-
-async function runOpenCodeShellCommand(command: string, cwd: string, signal: AbortSignal): Promise<OpenCodeShellResult> {
-  return new Promise((resolve) => {
-    let stdout = "";
-    let stderr = "";
-    const child = execFile(command, [], {
-      cwd,
-      shell: true,
-      windowsHide: true,
-      timeout: 120_000,
-      maxBuffer: 1024 * 1024
-    }, (error, callbackStdout, callbackStderr) => {
-      stdout += callbackStdout;
-      stderr += callbackStderr;
-      if (signal.aborted) {
-        resolve({ exitCode: 130, stdout, stderr: stderr || "Command cancelled." });
-        return;
-      }
-      if (!error) {
-        resolve({ exitCode: 0, stdout, stderr });
-        return;
-      }
-      const shellError = error as { code?: unknown };
-      resolve({
-        exitCode: typeof shellError.code === "number" ? shellError.code : 1,
-        stdout,
-        stderr: stderr || errorMessage(error)
-      });
-    });
-    if (signal.aborted) {
-      terminateProcessTree(child);
-      return;
-    }
-    signal.addEventListener("abort", () => terminateProcessTree(child), { once: true });
-  });
-}
-
-function terminateProcessTree(child: ChildProcess): void {
-  if (child.exitCode !== null || child.killed) {
-    return;
-  }
-  if (process.platform === "win32" && child.pid) {
-    execFile("taskkill", ["/pid", String(child.pid), "/t", "/f"], { windowsHide: true }, () => undefined);
-    return;
-  }
-  child.kill();
-}
-
-function formatOpenCodeShellOutput(result: OpenCodeShellResult): string {
-  return [
-    `exit code: ${result.exitCode}`,
-    result.stdout.trim() ? `stdout:\n${truncateDiagnosticText(result.stdout, 12000)}` : "stdout: (empty)",
-    result.stderr.trim() ? `stderr:\n${truncateDiagnosticText(result.stderr, 12000)}` : "stderr: (empty)"
-  ].join("\n\n");
-}
-
-function openCodeToolCallDiagnosticDetails(content: string, reasoning: string): string {
-  return [
-    `content:\n${truncateDiagnosticText(content) || "(empty)"}`,
-    `reasoning:\n${truncateDiagnosticText(reasoning) || "(empty)"}`
-  ].join("\n\n");
-}
-
-function openCodeToolResultGuidance(exitCode: number): string {
-  if (exitCode === 0) {
-    return "Use this tool output to decide whether to call another tool or answer the user.";
-  }
-  return "The shell command failed. Inspect the error, then either call another shell command to fix the root cause or explain the failure.";
-}
 
 function parseDocumentToolCallResponse(content: string, reasoning: string): ParsedDocumentToolCall {
   const parsedContent = parseDocumentToolCall(content);
@@ -2844,9 +2591,6 @@ function documentAnalysisModelSettings(
   threadSettings: ChatState["runtimeSettings"],
   documentSettings: ChatState["runtimeSettings"]
 ): ChatState["runtimeSettings"] {
-  if (model.providerId === "remote") {
-    return documentSettings;
-  }
   return isNativeGptOssModel(model) ? threadSettings : documentSettings;
 }
 
@@ -2869,7 +2613,7 @@ function openCodeModelSettings(model: ChatModel, settings: ChatState["runtimeSet
 }
 
 function isNativeGptOssModel(model: ChatModel): boolean {
-  return [model.label, model.path, model.reference].filter(Boolean).join(" ").toLowerCase().includes("gpt-oss");
+  return model.promptFormat === "gpt-oss" || [model.label, model.path, model.reference].filter(Boolean).join(" ").toLowerCase().includes("gpt-oss");
 }
 
 function documentAnalysisSystemPrompt(settings: ChatState["runtimeSettings"], documentTitle: string): string {

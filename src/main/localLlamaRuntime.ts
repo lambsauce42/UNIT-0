@@ -108,6 +108,11 @@ export type LocalLlamaRuntimeOptions = {
   spawnImpl?: typeof spawn;
 };
 
+export type LocalLlamaOpenAiEndpoint = {
+  baseUrl: string;
+  modelId: string;
+};
+
 type ServerKey = {
   modelPath: string;
   nCtx: number;
@@ -298,6 +303,17 @@ export class LocalLlamaRuntime {
       }
       await this.restoreSlotIfNeeded(server, options.cacheKey);
     });
+  }
+
+  async openAiEndpoint(options: {
+    model: ChatModel;
+    settings: ChatRuntimeSettings;
+  }): Promise<LocalLlamaOpenAiEndpoint> {
+    const server = await this.ensureServer(options.model, options.settings);
+    return {
+      baseUrl: server.baseUrl,
+      modelId: server.modelId
+    };
   }
 
   cancelActiveRequest(): void {
@@ -728,7 +744,7 @@ function localRuntimeMessages(settings: ChatRuntimeSettings, messages: ChatMessa
   return systemPrompt ? [{ role: "system", content: systemPrompt }, ...payload] : payload;
 }
 
-class GptOssChannelParser {
+export class GptOssChannelParser {
   private buffer = "";
   private activeChannel: "analysis" | "final" | "final_json" | "tool_json" | null = null;
   private activeToolRecipient = "";

@@ -27,6 +27,7 @@ import {
   Monitor,
   MoreHorizontal,
   PanelRight,
+  PanelRightDashed,
   PanelTop,
   Pencil,
   Paperclip,
@@ -44,6 +45,7 @@ import {
   FolderPlus,
   SquareTerminal,
   Square,
+  TableCellsMerge,
   Trash2,
   X,
   type LucideIcon
@@ -111,6 +113,7 @@ import type {
   RectLike,
   TabHostState,
   TemplateCellAssignment,
+  TileResizeMode,
   UnitState,
   Workspace,
   WorkspaceLayoutNode,
@@ -126,11 +129,13 @@ import {
   computeCanonicalLayout,
   projectResize,
   rebuildLayoutFromLeafRects,
+  resizeTargetRequiresStructuralResize,
   resizeTargetAt,
   resizeLeafRectsForTarget,
   type CanonicalLayoutGeometry,
   type EdgeGroup,
-  type ResizeTarget
+  type ResizeTarget,
+  type SplitDirection
 } from "../shared/layoutGeometry";
 import { WORKSPACE_TAB_SIZE } from "../shared/tabMetrics";
 import { planWorkspaceTemplate } from "../shared/templatePlanner";
@@ -257,6 +262,7 @@ type ResizeDragState = {
   target: ResizeTarget;
   geometry: CanonicalLayoutGeometry;
   layout: WorkspaceLayoutNode;
+  resizeMode: TileResizeMode;
 };
 
 type ResizeSnapGuide = {
@@ -267,6 +273,12 @@ type ResizeSnapGuide = {
 };
 
 const WORKSPACE_SURFACE_PADDING = 10;
+const SIDEBAR_RAIL_WIDTH = 40;
+const SIDEBAR_RESIZE_HANDLE_WIDTH = 8;
+const EXPANDED_SIDEBAR_FIXED_WIDTH = SIDEBAR_RAIL_WIDTH + SIDEBAR_RESIZE_HANDLE_WIDTH;
+const MIN_EXPANDED_SIDEBAR_WIDTH_RATIO = 0.18;
+const MAX_EXPANDED_SIDEBAR_WIDTH_RATIO = 0.45;
+const APPLET_ACTIONS_COLLAPSE_WIDTH = 340;
 const RESIZE_SNAP_RADIUS = 8;
 const TERMINAL_PTY_RESIZE_SETTLE_MS = 90;
 
@@ -370,12 +382,19 @@ export function App() {
           onClose={() => setTemplateDrawerOpen(false)}
         />
       ) : null}
-      {settingsOpen ? <SettingsDialog onClose={() => setSettingsOpen(false)} /> : null}
+      {settingsOpen ? <SettingsDialog state={payload.state} onClose={() => setSettingsOpen(false)} /> : null}
     </main>
   );
 }
 
-function SettingsDialog({ onClose }: { onClose: () => void }) {
+function SettingsDialog({ state, onClose }: { state: UnitState; onClose: () => void }) {
+  const [activeSection, setActiveSection] = useState<"tiling" | "about">("tiling");
+  const updateTileResizeMode = (tileResizeMode: TileResizeMode) => {
+    void window.unitApi.updateSettings({ settings: { tileResizeMode } }).catch((error) => {
+      console.error("Failed to update tiling settings", error);
+    });
+  };
+
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
@@ -397,17 +416,66 @@ function SettingsDialog({ onClose }: { onClose: () => void }) {
         </header>
         <div className="settings-body">
           <nav className="settings-tabs" aria-label="Settings sections">
-            <button className="active" type="button" aria-current="page">
+            <button
+              className={activeSection === "tiling" ? "active" : ""}
+              type="button"
+              aria-current={activeSection === "tiling" ? "page" : undefined}
+              onClick={() => setActiveSection("tiling")}
+            >
+              Tiling
+            </button>
+            <button
+              className={activeSection === "about" ? "active" : ""}
+              type="button"
+              aria-current={activeSection === "about" ? "page" : undefined}
+              onClick={() => setActiveSection("about")}
+            >
               About
             </button>
           </nav>
-          <section className="settings-panel" aria-label="About">
-            <div className="about-product">
-              <strong>UNIT-0</strong>
-              <span>Version 0.1.0</span>
-            </div>
-            <pre className="license-notices">{THIRD_PARTY_LICENSES}</pre>
-          </section>
+          {activeSection === "tiling" ? (
+            <section className="settings-panel settings-form-panel" aria-label="Tiling">
+              <div className="settings-section">
+                <h3>Resize Behavior</h3>
+                <div className="settings-radio-list" role="radiogroup" aria-label="Tile resize behavior">
+                  <label>
+                    <input
+                      type="radio"
+                      name="tile-resize-mode"
+                      value="adjacent"
+                      checked={state.settings.tileResizeMode === "adjacent"}
+                      onChange={() => updateTileResizeMode("adjacent")}
+                    />
+                    <span>
+                      <strong>Adjacent tiles</strong>
+                      <small>Resize only the tiles touching the dragged edge.</small>
+                    </span>
+                  </label>
+                  <label>
+                    <input
+                      type="radio"
+                      name="tile-resize-mode"
+                      value="cascade"
+                      checked={state.settings.tileResizeMode === "cascade"}
+                      onChange={() => updateTileResizeMode("cascade")}
+                    />
+                    <span>
+                      <strong>Cascading tiles</strong>
+                      <small>Share the resize proportionally through connected tiles in the drag direction.</small>
+                    </span>
+                  </label>
+                </div>
+              </div>
+            </section>
+          ) : (
+            <section className="settings-panel" aria-label="About">
+              <div className="about-product">
+                <strong>UNIT-0</strong>
+                <span>Version 0.1.0</span>
+              </div>
+              <pre className="license-notices">{THIRD_PARTY_LICENSES}</pre>
+            </section>
+          )}
         </div>
       </section>
     </div>
@@ -1410,7 +1478,7 @@ function TemplateDrawer({
               );
             })}
             <div className="template-overflow-preview">
-              <span>Overflow shelf</span>
+              <span>Sidebar</span>
               <div>
                 {selectedWorkspace?.applets
                   .filter((instance) => !assignedReuseIds(assignments).has(instance.id))
@@ -1453,6 +1521,7 @@ function TemplateDrawer({
 
 function WorkspaceSurface({ state, windowId, workspace }: { state: UnitState; windowId: number; workspace: Workspace }) {
   const surfaceRef = useRef<HTMLElement | null>(null);
+  const mainStageRef = useRef<HTMLDivElement | null>(null);
   const [appletDrag, setAppletDrag] = useState<AppletDragState | null>(null);
   const appletDragRef = useRef<AppletDragState | null>(null);
   const resizeDragRef = useRef<ResizeDragState | null>(null);
@@ -1466,7 +1535,16 @@ function WorkspaceSurface({ state, windowId, workspace }: { state: UnitState; wi
   const [resizeDrag, setResizeDrag] = useState<ResizeDragState | null>(null);
   const [resizeSnapGuides, setResizeSnapGuides] = useState<ResizeSnapGuide[]>([]);
   const [switchSourceInstanceId, setSwitchSourceInstanceId] = useState<string | null>(null);
-  const [shelfOpen, setShelfOpen] = useState(false);
+  const [expandedSidebarAppletId, setExpandedSidebarAppletId] = useState<string | null>(null);
+  const [sidebarAddMenuOpen, setSidebarAddMenuOpen] = useState(false);
+  const sidebarResizeRef = useRef<{
+    pointerId: number;
+    surfaceRight: number;
+    surfaceWidth: number;
+    pendingClientX: number;
+    rafId: number | null;
+  } | null>(null);
+  const layoutMeasureRafRef = useRef<number | null>(null);
   const appletsById = useMemo(
     () =>
       new Map(
@@ -1493,6 +1571,11 @@ function WorkspaceSurface({ state, windowId, workspace }: { state: UnitState; wi
   const ratioOverrideKey = JSON.stringify(ratioOverrides);
   const workspaceAppletIdList = useMemo(() => workspace.applets.map((instance) => instance.id), [workspace.applets]);
   const workspaceShelfAppletIds = useMemo(() => new Set(workspace.shelfAppletIds), [workspace.shelfAppletIds]);
+  const sidebarAppletIds = workspace.shelfAppletIds.slice(0, 5);
+  const sidebarFull = workspace.shelfAppletIds.length >= 5;
+  const expandedSidebarApplet = expandedSidebarAppletId ? appletByInstanceId.get(expandedSidebarAppletId) : null;
+  const sidebarExpanded = Boolean(expandedSidebarAppletId && expandedSidebarApplet?.session);
+  const sidebarWidthRatio = state.settings.expandedSidebarWidthRatio;
   const visibleWorkspaceAppletIdList = useMemo(
     () => workspace.applets.map((instance) => instance.id).filter((appletId) => !workspaceShelfAppletIds.has(appletId)),
     [workspace.applets, workspaceShelfAppletIds]
@@ -1516,9 +1599,13 @@ function WorkspaceSurface({ state, windowId, workspace }: { state: UnitState; wi
     });
   }
   const activeLayoutOverride = layoutOverrideMatchesWorkspace ? layoutOverride : null;
+  const visibleWorkspaceLayout = useMemo(
+    () => (workspace.layout ? stripShelvedAppletLeaves(workspace.layout, workspaceShelfAppletIds) : null),
+    [workspace.layout, workspaceShelfAppletIds]
+  );
   const effectiveLayout = useMemo(
-    () => activeLayoutOverride ?? (workspace.layout ? applyRatioOverrides(workspace.layout, ratioOverrides) : null),
-    [activeLayoutOverride, workspace.layout, ratioOverrideKey]
+    () => activeLayoutOverride ?? (visibleWorkspaceLayout ? applyRatioOverrides(visibleWorkspaceLayout, ratioOverrides) : null),
+    [activeLayoutOverride, visibleWorkspaceLayout, ratioOverrideKey]
   );
   const layoutSource = activeLayoutOverride ? "override" : "workspace";
   const effectiveLayoutAppletIds = useMemo(
@@ -1556,25 +1643,68 @@ function WorkspaceSurface({ state, windowId, workspace }: { state: UnitState; wi
     [completedGroups, layoutGeometry]
   );
   useLayoutEffect(() => {
-    const surface = surfaceRef.current;
-    if (!surface) {
+    const stage = mainStageRef.current;
+    if (!stage) {
       return;
     }
     const measure = () => {
-      setLayoutSize({
-        width: Math.max(0, Math.round(surface.clientWidth - WORKSPACE_SURFACE_PADDING * 2)),
-        height: Math.max(0, Math.round(surface.clientHeight - WORKSPACE_SURFACE_PADDING * 2))
+      const nextSize = {
+        width: Math.max(0, Math.round(stage.clientWidth - WORKSPACE_SURFACE_PADDING * 2)),
+        height: Math.max(0, Math.round(stage.clientHeight - WORKSPACE_SURFACE_PADDING * 2))
+      };
+      setLayoutSize((current) =>
+        current.width === nextSize.width && current.height === nextSize.height ? current : nextSize
+      );
+    };
+    const scheduleMeasure = () => {
+      if (layoutMeasureRafRef.current !== null) {
+        return;
+      }
+      layoutMeasureRafRef.current = window.requestAnimationFrame(() => {
+        layoutMeasureRafRef.current = null;
+        measure();
       });
     };
     measure();
-    const resizeObserver = new ResizeObserver(measure);
-    resizeObserver.observe(surface);
-    window.addEventListener("resize", measure);
+    const resizeObserver = new ResizeObserver(scheduleMeasure);
+    resizeObserver.observe(stage);
+    window.addEventListener("resize", scheduleMeasure);
     return () => {
+      if (layoutMeasureRafRef.current !== null) {
+        window.cancelAnimationFrame(layoutMeasureRafRef.current);
+        layoutMeasureRafRef.current = null;
+      }
       resizeObserver.disconnect();
-      window.removeEventListener("resize", measure);
+      window.removeEventListener("resize", scheduleMeasure);
     };
   }, []);
+  useEffect(() => {
+    if (expandedSidebarAppletId && !workspace.shelfAppletIds.includes(expandedSidebarAppletId)) {
+      setExpandedSidebarAppletId(null);
+    }
+  }, [expandedSidebarAppletId, workspace.shelfAppletIds]);
+  useEffect(() => {
+    if (!sidebarAddMenuOpen) {
+      return;
+    }
+    const closeMenu = (event: PointerEvent) => {
+      if (event.target instanceof Element && event.target.closest(".workspace-sidebar-rail")) {
+        return;
+      }
+      setSidebarAddMenuOpen(false);
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setSidebarAddMenuOpen(false);
+      }
+    };
+    document.addEventListener("pointerdown", closeMenu);
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("pointerdown", closeMenu);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [sidebarAddMenuOpen]);
   useEffect(() => {
     if (!resizeDragRef.current) {
       setRatioOverrides({});
@@ -1592,11 +1722,11 @@ function WorkspaceSurface({ state, windowId, workspace }: { state: UnitState; wi
     }
   }, [switchSourceInstanceId, workspace.applets]);
   const localTilingPoint = useCallback((clientX: number, clientY: number): { x: number; y: number } | null => {
-    const surface = surfaceRef.current;
-    if (!surface) {
+    const stage = mainStageRef.current;
+    if (!stage) {
       return null;
     }
-    const rect = surface.getBoundingClientRect();
+    const rect = stage.getBoundingClientRect();
     return {
       x: Math.round(clientX - rect.left - WORKSPACE_SURFACE_PADDING),
       y: Math.round(clientY - rect.top - WORKSPACE_SURFACE_PADDING)
@@ -1688,13 +1818,14 @@ function WorkspaceSurface({ state, windowId, workspace }: { state: UnitState; wi
         grabOffsetY: target.horizontal ? point.y - target.horizontal.center : 0,
         target,
         geometry: layoutGeometry,
-        layout: effectiveLayout
+        layout: effectiveLayout,
+        resizeMode: state.settings.tileResizeMode
       };
       resizeDragRef.current = nextDrag;
       setResizeDrag(nextDrag);
       setHoverResizeTarget(target);
     },
-    [effectiveLayout, layoutGeometry, localTilingPoint]
+    [effectiveLayout, layoutGeometry, localTilingPoint, state.settings.tileResizeMode]
   );
   useEffect(() => {
     const onPointerMove = (event: PointerEvent) => {
@@ -1712,20 +1843,33 @@ function WorkspaceSurface({ state, windowId, workspace }: { state: UnitState; wi
       };
       const snapTrace = traceResizeSnap(drag, rawDelta, event.altKey);
       const snapped = snapTrace.snapped;
-      const projected = projectResize(drag.geometry, drag.target, snapped);
-      const structural = requiresStructuralResize(drag.geometry, drag.target);
+      const projected = projectResize(drag.geometry, drag.target, snapped, MIN_APPLET_SIZE, drag.resizeMode);
+      const structural = resizeTargetRequiresStructuralResize(drag.geometry, drag.target, drag.resizeMode);
       if (structural) {
         const structuralDelta = clampStructuralResize(drag, projected.dx, projected.dy);
         setResizeSnapGuides(activeSnapGuides(drag.target, snapped.guides, structuralDelta.dx, structuralDelta.dy, snapped));
-        const resizedLeaves = resizeLeafRectsForTarget(drag.geometry, drag.target, structuralDelta.dx, structuralDelta.dy);
-        const nextLayout = rebuildLayoutFromLeafRects(drag.layout, resizedLeaves, drag.geometry.rect);
+        const resizedLeaves = resizeLeafRectsForTarget(
+          drag.geometry,
+          drag.target,
+          structuralDelta.dx,
+          structuralDelta.dy
+        );
+        const nextLayout = rebuildLayoutFromLeafRects(
+          drag.layout,
+          resizedLeaves,
+          drag.geometry.rect,
+          TILE_GUTTER_SIZE,
+          structuralResizePrimaryCutDirection(drag.target)
+        );
         setLayoutOverride(nextLayout);
         setRatioOverrides({});
         publishResizeLayout(nextLayout);
         return;
       }
       setResizeSnapGuides(activeSnapGuides(drag.target, snapped.guides, projected.dx, projected.dy, snapped));
-      const nextRatios = compensatedResizeRatios(drag, projected.ratios, projected.dx, projected.dy, layoutSize);
+      const nextRatios = drag.resizeMode === "cascade"
+        ? projected.ratios
+        : compensatedResizeRatios(drag, projected.ratios, projected.dx, projected.dy, layoutSize);
       setRatioOverrides((current) => ({ ...current, ...nextRatios }));
       setLayoutOverride(null);
       publishResizeRatios(nextRatios);
@@ -1755,7 +1899,7 @@ function WorkspaceSurface({ state, windowId, workspace }: { state: UnitState; wi
   }, [flushResizeRatios, layoutSize, localTilingPoint, publishResizeLayout, publishResizeRatios]);
   const dropTargetFor = useCallback(
     (clientX: number, clientY: number, draggedInstanceId: string): AppletDropTarget | null => {
-      const surface = surfaceRef.current;
+      const surface = mainStageRef.current;
       if (!surface) {
         return null;
       }
@@ -1857,6 +2001,47 @@ function WorkspaceSurface({ state, windowId, workspace }: { state: UnitState; wi
   const beginAppletSwitch = useCallback((instanceId: string) => {
     setSwitchSourceInstanceId((current) => (current === instanceId ? null : instanceId));
   }, []);
+  const moveAppletToSidebar = useCallback(
+    (instanceId: string) => {
+      if (sidebarFull) {
+        return;
+      }
+      void window.unitApi.applets
+        .shelveAppletInstance({ workspaceId: workspace.id, appletInstanceId: instanceId })
+        .catch((error) => console.error("Failed to move applet to sidebar", error));
+    },
+    [sidebarFull, workspace.id]
+  );
+  const createSidebarApplet = useCallback(
+    (kind: AppletKind) => {
+      if (sidebarFull) {
+        return;
+      }
+      void window.unitApi.applets
+        .createApplet({ workspaceId: workspace.id, kind, sidebar: true })
+        .then(() => {
+          setSidebarAddMenuOpen(false);
+        })
+        .catch((error) => console.error("Failed to create sidebar applet", error));
+    },
+    [sidebarFull, workspace.id]
+  );
+  const returnAppletToTiles = useCallback(
+    (instanceId: string) => {
+      void window.unitApi.applets
+        .unshelveAppletInstance({ workspaceId: workspace.id, appletInstanceId: instanceId })
+        .catch((error) => console.error("Failed to return applet to tiles", error));
+    },
+    [workspace.id]
+  );
+  const closeApplet = useCallback(
+    (instanceId: string) => {
+      void window.unitApi.applets
+        .closeAppletInstance({ workspaceId: workspace.id, appletInstanceId: instanceId })
+        .catch((error) => console.error("[unit0:applet-close] renderer close failed", error));
+    },
+    [workspace.id]
+  );
   const selectAppletSwitchTarget = useCallback(
     (targetInstanceId: string) => {
       if (!switchSourceInstanceId || !workspace.layout) {
@@ -1880,74 +2065,271 @@ function WorkspaceSurface({ state, windowId, workspace }: { state: UnitState; wi
   const DragIcon = draggedApplet?.session ? iconByKind[draggedApplet.session.kind] : SquareTerminal;
   const activeResizeTarget = resizeDrag?.target ?? hoverResizeTarget;
   const activeResizeGroups = resizeGroupsForTarget(activeResizeTarget, resizeEnabledGroups);
+  const expandedSidebarGridColumns = useCallback((ratio: number) => {
+    return `minmax(0, 1fr) ${SIDEBAR_RESIZE_HANDLE_WIDTH}px calc(${ratio * 100}% - ${EXPANDED_SIDEBAR_FIXED_WIDTH}px) ${SIDEBAR_RAIL_WIDTH}px`;
+  }, []);
+  const collapsedSidebarGridColumns = `minmax(0, 1fr) 0px calc(0% - 0px) ${SIDEBAR_RAIL_WIDTH}px`;
+  const sidebarRatioFromPointer = useCallback(
+    (
+      clientX: number,
+      drag: {
+        surfaceRight: number;
+        surfaceWidth: number;
+      }
+    ) => {
+      const rawWidth = drag.surfaceRight - clientX + SIDEBAR_RESIZE_HANDLE_WIDTH / 2;
+      const nextRatio = rawWidth / Math.max(1, drag.surfaceWidth);
+      return Math.max(MIN_EXPANDED_SIDEBAR_WIDTH_RATIO, Math.min(MAX_EXPANDED_SIDEBAR_WIDTH_RATIO, nextRatio));
+    },
+    []
+  );
+  const beginSidebarResize = useCallback(
+    (event: ReactPointerEvent<HTMLElement>) => {
+      if (!sidebarExpanded || event.button !== 0) {
+        return;
+      }
+      const surface = surfaceRef.current;
+      if (!surface) {
+        return;
+      }
+      event.preventDefault();
+      event.currentTarget.setPointerCapture(event.pointerId);
+      const rect = surface.getBoundingClientRect();
+      sidebarResizeRef.current = {
+        pointerId: event.pointerId,
+        surfaceRight: rect.right,
+        surfaceWidth: rect.width,
+        pendingClientX: event.clientX,
+        rafId: null
+      };
+      surface.classList.add("sidebar-resizing");
+    },
+    [sidebarExpanded]
+  );
+  useEffect(() => {
+    const onPointerMove = (event: PointerEvent) => {
+      const drag = sidebarResizeRef.current;
+      if (!drag || event.pointerId !== drag.pointerId) {
+        return;
+      }
+      drag.pendingClientX = event.clientX;
+      if (drag.rafId !== null) {
+        return;
+      }
+      drag.rafId = window.requestAnimationFrame(() => {
+        drag.rafId = null;
+        const surface = surfaceRef.current;
+        if (surface && sidebarResizeRef.current === drag) {
+          surface.style.gridTemplateColumns = expandedSidebarGridColumns(
+            sidebarRatioFromPointer(drag.pendingClientX, drag)
+          );
+        }
+      });
+    };
+    const finishDrag = (event: PointerEvent) => {
+      const drag = sidebarResizeRef.current;
+      if (!drag || event.pointerId !== drag.pointerId) {
+        return;
+      }
+      if (drag.rafId !== null) {
+        window.cancelAnimationFrame(drag.rafId);
+      }
+      const nextRatio = sidebarRatioFromPointer(event.clientX, drag);
+      sidebarResizeRef.current = null;
+      const surface = surfaceRef.current;
+      if (surface) {
+        surface.style.gridTemplateColumns = expandedSidebarGridColumns(nextRatio);
+        surface.classList.remove("sidebar-resizing");
+      }
+      void window.unitApi
+        .updateSettings({ settings: { expandedSidebarWidthRatio: nextRatio } })
+        .catch((error) => console.error("Failed to update sidebar width", error));
+    };
+    document.addEventListener("pointermove", onPointerMove);
+    document.addEventListener("pointerup", finishDrag);
+    document.addEventListener("pointercancel", finishDrag);
+    return () => {
+      document.removeEventListener("pointermove", onPointerMove);
+      document.removeEventListener("pointerup", finishDrag);
+      document.removeEventListener("pointercancel", finishDrag);
+      const drag = sidebarResizeRef.current;
+      if (drag && drag.rafId !== null) {
+        window.cancelAnimationFrame(drag.rafId);
+      }
+    };
+  }, [expandedSidebarGridColumns, sidebarRatioFromPointer]);
   return (
-    <section className="workspace-surface" data-testid="workspace-surface" ref={surfaceRef}>
-      {effectiveLayout && layoutGeometry ? (
-        <WorkspaceLayout
-          geometry={layoutGeometry}
-          appletsById={appletsById}
-          windowId={windowId}
-          workspaceId={workspace.id}
-          onBeginAppletDrag={beginAppletDrag}
-          onUpdateAppletDrag={updateAppletDrag}
-          onFinishAppletDrag={finishAppletDrag}
-          onCancelAppletDrag={cancelAppletDrag}
-          switchSourceInstanceId={switchSourceInstanceId}
-          onBeginAppletSwitch={beginAppletSwitch}
-          onSelectAppletSwitchTarget={selectAppletSwitchTarget}
-          onHoverResizeTarget={(clientX, clientY) => {
-            if (resizeDragRef.current) {
-              return;
-            }
-            const point = localTilingPoint(clientX, clientY);
-            const target = point ? resizeTargetAt(layoutGeometry, point) : null;
-            setHoverResizeTarget(target && resizeTargetMeetsMinimumSize(layoutGeometry, target) ? target : null);
-          }}
-          onLeaveResizeTarget={() => {
-            if (!resizeDragRef.current) {
-              setHoverResizeTarget(null);
-            }
-          }}
-          completedGroups={resizeEnabledGroups}
-          activeGroups={activeResizeGroups}
-          snapGuides={resizeSnapGuides}
-          onBeginResizeDrag={beginResizeDrag}
-        />
-      ) : (
-        <div className="workspace-empty" data-testid="workspace-empty">
-          <div className="empty-spawn-grid" aria-label="Create applet">
-            {appletCatalog.map((item) => {
-              const Icon = iconByKind[item.kind];
-              const label = item.kind === "wslTerminal" ? "New WSL terminal" : `New ${item.label.toLowerCase()}`;
-              return (
-                <button
-                  key={item.kind}
-                  className="empty-spawn-button"
-                  type="button"
-                  onClick={() => {
-                    void window.unitApi.applets.createApplet({ workspaceId: workspace.id, kind: item.kind });
-                  }}
-                >
-                  <Icon size={17} />
-                  <span>{label}</span>
-                </button>
-              );
-            })}
+    <section
+      className={sidebarExpanded ? "workspace-surface sidebar-expanded" : "workspace-surface"}
+      data-testid="workspace-surface"
+      ref={surfaceRef}
+      style={{
+        gridTemplateColumns: sidebarExpanded
+          ? expandedSidebarGridColumns(sidebarWidthRatio)
+          : collapsedSidebarGridColumns
+      }}
+    >
+      <div className="workspace-main-stage" ref={mainStageRef}>
+        {effectiveLayout && layoutGeometry ? (
+          <WorkspaceLayout
+            geometry={layoutGeometry}
+            appletsById={appletsById}
+            windowId={windowId}
+            workspaceId={workspace.id}
+            onBeginAppletDrag={beginAppletDrag}
+            onUpdateAppletDrag={updateAppletDrag}
+            onFinishAppletDrag={finishAppletDrag}
+            onCancelAppletDrag={cancelAppletDrag}
+            switchSourceInstanceId={switchSourceInstanceId}
+            onBeginAppletSwitch={beginAppletSwitch}
+            onSelectAppletSwitchTarget={selectAppletSwitchTarget}
+            onMoveAppletToSidebar={moveAppletToSidebar}
+            sidebarFull={sidebarFull}
+            onHoverResizeTarget={(clientX, clientY) => {
+              if (resizeDragRef.current) {
+                return;
+              }
+              const point = localTilingPoint(clientX, clientY);
+              const target = point ? resizeTargetAt(layoutGeometry, point) : null;
+              setHoverResizeTarget(target && resizeTargetMeetsMinimumSize(layoutGeometry, target) ? target : null);
+            }}
+            onLeaveResizeTarget={() => {
+              if (!resizeDragRef.current) {
+                setHoverResizeTarget(null);
+              }
+            }}
+            completedGroups={resizeEnabledGroups}
+            activeGroups={activeResizeGroups}
+            snapGuides={resizeSnapGuides}
+            onBeginResizeDrag={beginResizeDrag}
+          />
+        ) : (
+          <div className="workspace-empty" data-testid="workspace-empty">
+            <div className="empty-spawn-grid" aria-label="Create applet">
+              {appletCatalog.map((item) => {
+                const Icon = iconByKind[item.kind];
+                const label = item.kind === "wslTerminal" ? "New WSL terminal" : `New ${item.label.toLowerCase()}`;
+                return (
+                  <button
+                    key={item.kind}
+                    className="empty-spawn-button"
+                    type="button"
+                    onClick={() => {
+                      void window.unitApi.applets.createApplet({ workspaceId: workspace.id, kind: item.kind });
+                    }}
+                  >
+                    <Icon size={17} />
+                    <span>{label}</span>
+                  </button>
+                );
+              })}
+            </div>
           </div>
+        )}
+        {appletDrag?.target ? (
+          <div
+            className="applet-drop-indicator"
+            data-testid="applet-drop-indicator"
+            style={{
+              left: appletDrag.target.rect.left,
+              top: appletDrag.target.rect.top,
+              width: appletDrag.target.rect.width,
+              height: appletDrag.target.rect.height
+            }}
+          />
+        ) : null}
+      </div>
+      <button
+        className="workspace-sidebar-resizer"
+        type="button"
+        aria-label="Resize expanded sidebar"
+        aria-hidden={!sidebarExpanded}
+        tabIndex={sidebarExpanded ? 0 : -1}
+        onPointerDown={beginSidebarResize}
+      />
+      <aside className="workspace-sidebar-panel" data-testid="workspace-sidebar-panel" aria-hidden={!sidebarExpanded}>
+        {sidebarExpanded && expandedSidebarApplet?.session ? (
+          <>
+          <header className="workspace-sidebar-header">
+            <div className="applet-title">
+              {(() => {
+                const Icon = iconByKind[expandedSidebarApplet.session.kind];
+                return <Icon size={15} />;
+              })()}
+              <span>{expandedSidebarApplet.session.title}</span>
+            </div>
+            <div className="applet-actions">
+              <button className="icon-button" type="button" aria-label={`${expandedSidebarApplet.session.title} return to tiles`} onClick={() => returnAppletToTiles(expandedSidebarApplet.instance.id)}>
+                <TableCellsMerge size={15} />
+              </button>
+              <button
+                className="icon-button"
+                type="button"
+                aria-label="Collapse sidebar"
+                onClick={() => {
+                  setExpandedSidebarAppletId(null);
+                }}
+              >
+                <ArrowRight size={15} />
+              </button>
+              <button className="icon-button" type="button" aria-label={`${expandedSidebarApplet.session.title} close`} onClick={() => closeApplet(expandedSidebarApplet.instance.id)}>
+                <Trash2 size={15} />
+              </button>
+            </div>
+          </header>
+          <div className="workspace-sidebar-body">{renderAppletBody(expandedSidebarApplet.session, windowId)}</div>
+          </>
+        ) : null}
+      </aside>
+      <aside className="workspace-sidebar-rail" aria-label="Sidebar applets" data-testid="workspace-shelf">
+        <div className="workspace-sidebar-add">
+          <button
+            className={sidebarAddMenuOpen ? "active" : ""}
+            type="button"
+            title={sidebarFull ? "Sidebar is full" : "Add sidebar applet"}
+            aria-label="Add sidebar applet"
+            aria-haspopup="menu"
+            aria-expanded={sidebarAddMenuOpen}
+            disabled={sidebarFull}
+            onClick={() => setSidebarAddMenuOpen((open) => !open)}
+          >
+            <Plus size={16} />
+          </button>
+          {sidebarAddMenuOpen ? (
+            <div className="workspace-sidebar-add-menu" role="menu">
+              {appletCatalog.map((item) => {
+                const ItemIcon = iconByKind[item.kind];
+                return (
+                  <button key={item.kind} type="button" role="menuitem" onClick={() => createSidebarApplet(item.kind)}>
+                    <ItemIcon size={14} />
+                    <span>{item.label}</span>
+                  </button>
+                );
+              })}
+            </div>
+          ) : null}
         </div>
-      )}
-      {appletDrag?.target ? (
-        <div
-          className="applet-drop-indicator"
-          data-testid="applet-drop-indicator"
-          style={{
-            left: appletDrag.target.rect.left,
-            top: appletDrag.target.rect.top,
-            width: appletDrag.target.rect.width,
-            height: appletDrag.target.rect.height
-          }}
-        />
-      ) : null}
+        {sidebarAppletIds.map((appletId) => {
+          const applet = appletByInstanceId.get(appletId);
+          const Icon = applet?.session ? iconByKind[applet.session.kind] : Grid2X2;
+          return (
+            <button
+              key={appletId}
+              className={expandedSidebarAppletId === appletId ? "active" : ""}
+              type="button"
+              data-testid={`sidebar-applet-${appletId}`}
+              title={applet?.session?.title ?? appletId}
+              aria-label={applet?.session ? `Open ${applet.session.title} sidebar applet` : `Open ${appletId} sidebar applet`}
+              onClick={() => {
+                const nextAppletId = expandedSidebarAppletId === appletId ? null : appletId;
+                setExpandedSidebarAppletId(nextAppletId);
+              }}
+            >
+              <Icon size={16} />
+            </button>
+          );
+        })}
+      </aside>
       {appletDrag ? (
         <div
           className="applet-drag-ghost"
@@ -1958,28 +2340,6 @@ function WorkspaceSurface({ state, windowId, workspace }: { state: UnitState; wi
         >
           <DragIcon size={15} />
           <span>{appletDrag.title}</span>
-        </div>
-      ) : null}
-      {workspace.shelfAppletIds.length > 0 ? (
-        <div className={shelfOpen ? "workspace-shelf open" : "workspace-shelf"} data-testid="workspace-shelf">
-          <button className="workspace-shelf-toggle" type="button" onClick={() => setShelfOpen((open) => !open)}>
-            <Layers3 size={15} />
-            <span>{workspace.shelfAppletIds.length} shelved</span>
-          </button>
-          {shelfOpen ? (
-            <div className="workspace-shelf-items">
-              {workspace.shelfAppletIds.map((appletId) => {
-                const applet = appletByInstanceId.get(appletId);
-                const Icon = applet?.session ? iconByKind[applet.session.kind] : Grid2X2;
-                return (
-                  <div className="workspace-shelf-item" key={appletId}>
-                    <Icon size={14} />
-                    <span>{applet?.session?.title ?? appletId}</span>
-                  </div>
-                );
-              })}
-            </div>
-          ) : null}
         </div>
       ) : null}
     </section>
@@ -1998,6 +2358,8 @@ function WorkspaceLayout({
   switchSourceInstanceId,
   onBeginAppletSwitch,
   onSelectAppletSwitchTarget,
+  onMoveAppletToSidebar,
+  sidebarFull,
   onHoverResizeTarget,
   onLeaveResizeTarget,
   completedGroups,
@@ -2016,6 +2378,8 @@ function WorkspaceLayout({
   switchSourceInstanceId: string | null;
   onBeginAppletSwitch: (instanceId: string) => void;
   onSelectAppletSwitchTarget: (instanceId: string) => void;
+  onMoveAppletToSidebar: (instanceId: string) => void;
+  sidebarFull: boolean;
   onHoverResizeTarget: (clientX: number, clientY: number) => void;
   onLeaveResizeTarget: () => void;
   completedGroups: EdgeGroup[];
@@ -2076,6 +2440,8 @@ function WorkspaceLayout({
               switchSourceInstanceId={switchSourceInstanceId}
               onBeginAppletSwitch={onBeginAppletSwitch}
               onSelectAppletSwitchTarget={onSelectAppletSwitchTarget}
+              canMoveToSidebar={!sidebarFull}
+              onMoveToSidebar={onMoveAppletToSidebar}
             />
           </div>
         );
@@ -2211,6 +2577,21 @@ function collectLayoutAppletIds(node: WorkspaceLayoutNode): string[] {
     return [node.appletInstanceId];
   }
   return [...collectLayoutAppletIds(node.first), ...collectLayoutAppletIds(node.second)];
+}
+
+function stripShelvedAppletLeaves(
+  node: WorkspaceLayoutNode,
+  shelfAppletIds: Set<string>
+): WorkspaceLayoutNode | null {
+  if (node.type === "leaf") {
+    return shelfAppletIds.has(node.appletInstanceId) ? null : { ...node };
+  }
+  const first = stripShelvedAppletLeaves(node.first, shelfAppletIds);
+  const second = stripShelvedAppletLeaves(node.second, shelfAppletIds);
+  if (first && second) {
+    return { ...node, first, second };
+  }
+  return first ?? second;
 }
 
 function sameStringMembers(left: string[], right: string[]): boolean {
@@ -2397,42 +2778,6 @@ function compensatedResizeRatios(
   return nextRatios;
 }
 
-function requiresStructuralResize(geometry: CanonicalLayoutGeometry, target: ResizeTarget): boolean {
-  return [target.vertical, target.horizontal]
-    .filter((group): group is EdgeGroup => group !== null)
-    .some((group) => groupRequiresStructuralResize(geometry, group));
-}
-
-function groupRequiresStructuralResize(geometry: CanonicalLayoutGeometry, group: EdgeGroup): boolean {
-  const touchedBefore = new Set(group.edges.map((edge) => edge.beforeLeafId));
-  const touchedAfter = new Set(group.edges.map((edge) => edge.afterLeafId));
-  const splits = new Map(geometry.splits.map((split) => [split.id, split]));
-  for (const splitId of new Set(group.edges.map((edge) => edge.splitId))) {
-    const split = splits.get(splitId);
-    if (!split) {
-      continue;
-    }
-    const firstIds = new Set(split.firstLeafIds);
-    const secondIds = new Set(split.secondLeafIds);
-    if (!sameSet(firstIds, touchedBefore) || !sameSet(secondIds, touchedAfter)) {
-      return true;
-    }
-  }
-  return false;
-}
-
-function sameSet(left: Set<string>, right: Set<string>): boolean {
-  if (left.size !== right.size) {
-    return false;
-  }
-  for (const value of left) {
-    if (!right.has(value)) {
-      return false;
-    }
-  }
-  return true;
-}
-
 function clampStructuralResize(drag: ResizeDragState, dx: number, dy: number): { dx: number; dy: number } {
   let nextDx = dx;
   let nextDy = dy;
@@ -2487,7 +2832,13 @@ function validStructuralResize(drag: ResizeDragState, dx: number, dy: number): b
     ) {
       return false;
     }
-    const layout = rebuildLayoutFromLeafRects(drag.layout, leaves, drag.geometry.rect);
+    const layout = rebuildLayoutFromLeafRects(
+      drag.layout,
+      leaves,
+      drag.geometry.rect,
+      TILE_GUTTER_SIZE,
+      structuralResizePrimaryCutDirection(drag.target)
+    );
     const geometry = computeCanonicalLayout(layout, {
       width: drag.geometry.rect.right - drag.geometry.rect.left,
       height: drag.geometry.rect.bottom - drag.geometry.rect.top
@@ -2555,6 +2906,16 @@ function affectedResizeLeafIds(target: ResizeTarget): Set<string> {
 
 function affectedGroupLeafIds(group: EdgeGroup): Set<string> {
   return new Set(group.edges.flatMap((edge) => [edge.beforeLeafId, edge.afterLeafId]));
+}
+
+function structuralResizePrimaryCutDirection(target: ResizeTarget): SplitDirection | null {
+  if (target.vertical && !target.horizontal) {
+    return "column";
+  }
+  if (target.horizontal && !target.vertical) {
+    return "row";
+  }
+  return null;
 }
 
 function addBranchCompensation(
@@ -2801,7 +3162,9 @@ function AppletFrame({
   onCancelAppletDrag,
   switchSourceInstanceId,
   onBeginAppletSwitch,
-  onSelectAppletSwitchTarget
+  onSelectAppletSwitchTarget,
+  canMoveToSidebar,
+  onMoveToSidebar
 }: {
   session: AppletSession;
   instanceId: string;
@@ -2817,10 +3180,15 @@ function AppletFrame({
   switchSourceInstanceId: string | null;
   onBeginAppletSwitch: (instanceId: string) => void;
   onSelectAppletSwitchTarget: (instanceId: string) => void;
+  canMoveToSidebar: boolean;
+  onMoveToSidebar: (instanceId: string) => void;
 }) {
   const Icon = iconByKind[session.kind];
   const [addMenuOpen, setAddMenuOpen] = useState(false);
   const [changeMenuOpen, setChangeMenuOpen] = useState(false);
+  const [toolMenuOpen, setToolMenuOpen] = useState(false);
+  const [actionsCollapsed, setActionsCollapsed] = useState(false);
+  const headerRef = useRef<HTMLElement | null>(null);
   const dragRef = useRef<{
     pointerId: number;
     startX: number;
@@ -2852,17 +3220,34 @@ function AppletFrame({
       splitDirection
     });
   };
-  const toggleAppletMenu = (targetMenu: "add" | "change") => {
-    if ((targetMenu === "add" && addMenuOpen) || (targetMenu === "change" && changeMenuOpen)) {
+  const closeApplet = () => {
+    console.info("[unit0:applet-close] renderer close requested", {
+      workspaceId,
+      appletInstanceId: instanceId,
+      sessionId: session.id,
+      kind: session.kind
+    });
+    void window.unitApi.applets
+      .closeAppletInstance({ workspaceId, appletInstanceId: instanceId })
+      .catch((error) => console.error("[unit0:applet-close] renderer close failed", error));
+  };
+  const toggleAppletMenu = (targetMenu: "add" | "change" | "tools") => {
+    if (
+      (targetMenu === "add" && addMenuOpen) ||
+      (targetMenu === "change" && changeMenuOpen) ||
+      (targetMenu === "tools" && toolMenuOpen)
+    ) {
       setAddMenuOpen(false);
       setChangeMenuOpen(false);
+      setToolMenuOpen(false);
       return;
     }
     setAddMenuOpen(targetMenu === "add");
     setChangeMenuOpen(targetMenu === "change");
+    setToolMenuOpen(targetMenu === "tools");
   };
   useEffect(() => {
-    if (!addMenuOpen && !changeMenuOpen) {
+    if (!addMenuOpen && !changeMenuOpen && !toolMenuOpen) {
       return;
     }
     const closeMenu = (event: PointerEvent) => {
@@ -2871,11 +3256,13 @@ function AppletFrame({
       }
       setAddMenuOpen(false);
       setChangeMenuOpen(false);
+      setToolMenuOpen(false);
     };
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
         setAddMenuOpen(false);
         setChangeMenuOpen(false);
+        setToolMenuOpen(false);
       }
     };
     document.addEventListener("pointerdown", closeMenu);
@@ -2884,7 +3271,18 @@ function AppletFrame({
       document.removeEventListener("pointerdown", closeMenu);
       document.removeEventListener("keydown", onKeyDown);
     };
-  }, [addMenuOpen, changeMenuOpen, instanceId]);
+  }, [addMenuOpen, changeMenuOpen, toolMenuOpen, instanceId]);
+  useLayoutEffect(() => {
+    const header = headerRef.current;
+    if (!header) {
+      return;
+    }
+    const measure = () => setActionsCollapsed(header.clientWidth < APPLET_ACTIONS_COLLAPSE_WIDTH);
+    measure();
+    const resizeObserver = new ResizeObserver(measure);
+    resizeObserver.observe(header);
+    return () => resizeObserver.disconnect();
+  }, []);
   useEffect(() => {
     const onPointerMove = (event: PointerEvent) => {
       const drag = dragRef.current;
@@ -2967,6 +3365,7 @@ function AppletFrame({
     >
       {hideChrome ? null : (
       <header
+        ref={headerRef}
         className="applet-header"
         onPointerDown={(event) => {
             if (switchSourceInstanceId) {
@@ -2998,6 +3397,128 @@ function AppletFrame({
           <span>{session.title}</span>
         </div>
         <div className="applet-actions">
+          {actionsCollapsed ? (
+            <div className="applet-picker">
+              <button
+                className="icon-button"
+                type="button"
+                aria-haspopup="dialog"
+                aria-expanded={toolMenuOpen}
+                aria-label={`${session.title} tools`}
+                onClick={() => toggleAppletMenu("tools")}
+              >
+                <MoreHorizontal size={16} />
+              </button>
+              {toolMenuOpen ? (
+                <div className="applet-picker-menu applet-tools-menu" role="dialog" aria-label={`${session.title} tools`}>
+                  <button
+                    type="button"
+                    disabled={!canMoveToSidebar}
+                    onClick={() => {
+                      onMoveToSidebar(instanceId);
+                      setToolMenuOpen(false);
+                    }}
+                  >
+                    <PanelRightDashed size={14} />
+                    <span>Move to sidebar</span>
+                  </button>
+                  <button
+                    type="button"
+                    className={switchSourceInstanceId === instanceId ? "active" : undefined}
+                    onClick={() => {
+                      onBeginAppletSwitch(instanceId);
+                      setToolMenuOpen(false);
+                    }}
+                  >
+                    <Replace size={14} />
+                    <span>Switch places</span>
+                  </button>
+                  <button
+                    type="button"
+                    disabled={!canSplitRow}
+                    onClick={() => {
+                      createApplet("terminal", "row");
+                      setToolMenuOpen(false);
+                    }}
+                  >
+                    <PanelRight size={14} />
+                    <span>Split right</span>
+                  </button>
+                  <button
+                    type="button"
+                    disabled={!canSplitColumn}
+                    onClick={() => {
+                      createApplet("terminal", "column");
+                      setToolMenuOpen(false);
+                    }}
+                  >
+                    <PanelTop size={14} />
+                    <span>Split down</span>
+                  </button>
+                  <div className="applet-tools-menu-section">Add Applet</div>
+                  {appletCatalog.map((item) => {
+                    const ItemIcon = iconByKind[item.kind];
+                    return (
+                      <div className="applet-picker-menu-item" key={`add-${item.kind}`} role="none">
+                        <span className="applet-picker-menu-label">
+                          <ItemIcon size={14} />
+                          <span>{item.label}</span>
+                        </span>
+                        <span className="applet-picker-split-controls always-visible">
+                          <button
+                            aria-label={`Add ${item.label} split right`}
+                            disabled={!canSplitRow}
+                            type="button"
+                            onClick={() => {
+                              createApplet(item.kind, "row");
+                              setToolMenuOpen(false);
+                            }}
+                          >
+                            <PanelRight size={15} />
+                          </button>
+                          <button
+                            aria-label={`Add ${item.label} split down`}
+                            disabled={!canSplitColumn}
+                            type="button"
+                            onClick={() => {
+                              createApplet(item.kind, "column");
+                              setToolMenuOpen(false);
+                            }}
+                          >
+                            <PanelTop size={15} />
+                          </button>
+                        </span>
+                      </div>
+                    );
+                  })}
+                  <div className="applet-tools-menu-section">Change Type</div>
+                  {appletCatalog.map((item) => {
+                    const ItemIcon = iconByKind[item.kind];
+                    return (
+                      <button
+                        key={`change-${item.kind}`}
+                        className={item.kind === session.kind ? "active" : undefined}
+                        type="button"
+                        onClick={() => {
+                          changeAppletKind(item.kind);
+                          setToolMenuOpen(false);
+                        }}
+                      >
+                        <ItemIcon size={14} />
+                        <span>{item.label}</span>
+                      </button>
+                    );
+                  })}
+                  <div className="applet-tools-menu-section">Applet</div>
+                  <button type="button" onClick={closeApplet}>
+                    <Trash2 size={14} />
+                    <span>Close</span>
+                  </button>
+                </div>
+              ) : null}
+            </div>
+          ) : (
+            <>
           <div className="applet-picker">
             <button
               className="icon-button"
@@ -3088,6 +3609,15 @@ function AppletFrame({
             ) : null}
           </div>
           <button
+            className="icon-button"
+            type="button"
+            aria-label={`${session.title} move to sidebar`}
+            disabled={!canMoveToSidebar}
+            onClick={() => onMoveToSidebar(instanceId)}
+          >
+            <PanelRightDashed size={16} />
+          </button>
+          <button
             className={switchSourceInstanceId === instanceId ? "icon-button active" : "icon-button"}
             type="button"
             aria-label={`${session.title} switch places`}
@@ -3095,6 +3625,7 @@ function AppletFrame({
             onClick={() => {
               setAddMenuOpen(false);
               setChangeMenuOpen(false);
+              setToolMenuOpen(false);
               onBeginAppletSwitch(instanceId);
             }}
           >
@@ -3122,20 +3653,12 @@ function AppletFrame({
             className="icon-button"
             type="button"
             aria-label={`${session.title} close`}
-            onClick={() => {
-              console.info("[unit0:applet-close] renderer close requested", {
-                workspaceId,
-                appletInstanceId: instanceId,
-                sessionId: session.id,
-                kind: session.kind
-              });
-              void window.unitApi.applets
-                .closeAppletInstance({ workspaceId, appletInstanceId: instanceId })
-                .catch((error) => console.error("[unit0:applet-close] renderer close failed", error));
-            }}
+            onClick={closeApplet}
           >
             <Trash2 size={15} />
           </button>
+            </>
+          )}
         </div>
       </header>
       )}
@@ -4200,17 +4723,13 @@ function ChatSurface() {
     ? chatState?.settingsPresets.find((preset) => preset.id === selectedThread.selectedSettingsPresetId) ?? chatState?.settingsPresets[0] ?? null
     : null;
   const selectedBuiltinFramework = selectedThread?.builtinAgenticFramework ?? selectedSettingsPreset?.builtinAgenticFramework ?? "chat";
-  const selectableBuiltinModels = selectedBuiltinFramework === "opencode"
-    ? chatState?.models.filter((model) => model.providerId !== "remote") ?? []
-    : chatState?.models ?? [];
+  const selectableBuiltinModels = chatState?.models ?? [];
   const selectableBuiltinModelId = selectableBuiltinModels.some((model) => model.id === activeBuiltinModelId) ? activeBuiltinModelId : "";
   const running = chatState?.generation.status === "running";
   const submitBlockedReason = !selectedThread
     ? "Create a new thread to start."
-    : !threadUsesCodex && selectedBuiltinFramework === "opencode" && selectedModel?.providerId === "remote"
-      ? "Select a local GGUF model before using OpenCode."
     : !threadUsesCodex && !selectedModel
-      ? "Add and select a local GGUF model before sending."
+      ? "Add and select a built-in model before sending."
       : "";
   const latestSelectedMessage = selectedMessages.at(-1) ?? null;
   const generationErrorMessage = chatState?.generation.status === "error" ? chatState.generation.error : "";
@@ -5894,7 +6413,7 @@ function ChatDropUpMenu({
           <div className="chat-dropup-section-label">Document Groups</div>
           {projectDocumentIndexes.length === 0 ? <div className="chat-dropup-empty">No document groups</div> : null}
           {projectDocumentIndexes.map((index) => {
-            const localEditableIndex = chatState.appSettings.documentIndexLocation === "local" && !index.id.startsWith("remote-doc::");
+            const localEditableIndex = !index.id.startsWith("remote-doc::");
             const statusLabel = documentIndexStatusLabel(index);
             const progressPercent = documentIndexProgressPercent(index);
             return (
@@ -6207,20 +6726,6 @@ function ChatDialog({
                     }}>Browse...</button>
                   </div>
                 </label>
-                <ChatSettingSelect
-                  label="Document Indexing"
-                  ariaLabel="Document indexing"
-                  value={appSettings.documentIndexLocation}
-                  options={[{ value: "local", label: "Local laptop" }, { value: "remote", label: "Remote host" }]}
-                  onChange={(value) => setAppSettings({ ...appSettings, documentIndexLocation: value as ChatAppSettings["documentIndexLocation"] })}
-                />
-                <ChatSettingSelect
-                  label="Document Tool Calls"
-                  ariaLabel="Document tool calls"
-                  value={appSettings.documentToolExecutionLocation}
-                  options={[{ value: "local", label: "Local laptop" }, { value: "remote", label: "Remote host" }]}
-                  onChange={(value) => setAppSettings({ ...appSettings, documentToolExecutionLocation: value as ChatAppSettings["documentToolExecutionLocation"] })}
-                />
               </div>
             </section>
             <section className="chat-settings-section">

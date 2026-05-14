@@ -100,6 +100,7 @@ export interface ChatThread {
   planModeEnabled: boolean;
   documentIndexId: string;
   codexLastSessionId: string;
+  openCodeSessionId: string;
   remoteSessionId: string;
   remoteSlotId: number;
   remoteSettingsSignature: string;
@@ -152,6 +153,8 @@ export interface ChatModel {
   path: string;
   providerId?: "local" | "remote";
   reference?: string;
+  promptFormat?: string;
+  contextTokens?: number;
   sourceLabel?: string;
   hostId?: string;
   createdAt: string;
@@ -214,8 +217,6 @@ export interface ChatAppSettings {
   actionButtons: ChatActionButton[];
   expandedProjectIds: string[];
   autoExpandCodexDisclosures: boolean;
-  documentIndexLocation: "local" | "remote";
-  documentToolExecutionLocation: "local" | "remote";
   tokenizerModelPath: string;
   remoteHostAddress: string;
   remoteHostPort: number;
@@ -360,6 +361,7 @@ export interface ChatUpdateThreadSettingsPayload {
   planModeEnabled?: boolean;
   documentIndexId?: string;
   codexLastSessionId?: string;
+  openCodeSessionId?: string;
   remoteSessionId?: string;
   remoteSlotId?: number;
   remoteSettingsSignature?: string;
@@ -525,6 +527,13 @@ export interface TabDragSession {
   finishing: boolean;
 }
 
+export type TileResizeMode = "adjacent" | "cascade";
+
+export interface UnitSettings {
+  tileResizeMode: TileResizeMode;
+  expandedSidebarWidthRatio: number;
+}
+
 export interface UnitState {
   workspaces: Record<string, Workspace>;
   appletSessions: Record<string, AppletSession>;
@@ -532,6 +541,7 @@ export interface UnitState {
   hosts: Record<number, TabHostState>;
   primaryWindowId: number;
   dragSession: TabDragSession | null;
+  settings: UnitSettings;
 }
 
 export interface BootstrapPayload {
@@ -602,6 +612,10 @@ export interface CloseWorkspacePayload {
   workspaceId: string;
 }
 
+export interface UpdateUnitSettingsPayload {
+  settings: Partial<UnitSettings>;
+}
+
 export interface UpdateLayoutRatiosPayload {
   workspaceId: string;
   ratios: Record<string, number>;
@@ -668,9 +682,20 @@ export interface CreateAppletPayload {
   kind: AppletKind;
   targetLeafId?: string;
   splitDirection?: "row" | "column";
+  sidebar?: boolean;
 }
 
 export interface CloseAppletInstancePayload {
+  workspaceId: string;
+  appletInstanceId: string;
+}
+
+export interface ShelveAppletInstancePayload {
+  workspaceId: string;
+  appletInstanceId: string;
+}
+
+export interface UnshelveAppletInstancePayload {
   workspaceId: string;
   appletInstanceId: string;
 }
@@ -824,6 +849,7 @@ export interface BrowserStatusPayload {
 
 export interface UnitApi {
   bootstrap: () => Promise<BootstrapPayload>;
+  updateSettings: (payload: UpdateUnitSettingsPayload) => Promise<UnitSettings>;
   onStateChanged: (callback: (payload: BootstrapPayload) => void) => () => void;
   onWindowRegistered: (callback: (windowId: number) => void) => () => void;
   tabs: {
@@ -851,6 +877,8 @@ export interface UnitApi {
   applets: {
     createApplet: (payload: CreateAppletPayload) => Promise<AppletInstance>;
     closeAppletInstance: (payload: CloseAppletInstancePayload) => Promise<void>;
+    shelveAppletInstance: (payload: ShelveAppletInstancePayload) => Promise<void>;
+    unshelveAppletInstance: (payload: UnshelveAppletInstancePayload) => Promise<void>;
     changeAppletInstanceKind: (payload: ChangeAppletInstanceKindPayload) => Promise<void>;
     moveAppletInstance: (payload: MoveAppletInstancePayload) => Promise<void>;
     updateAppletSessionState: (payload: UpdateAppletSessionStatePayload) => Promise<void>;

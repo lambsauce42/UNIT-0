@@ -1,0 +1,26 @@
+{
+  "host": "0.0.0.0",
+  "port": 14555,
+  "pairingCode": "ABCD-1234",
+  "hostIdentity": "unit0-gpu-host",
+  "models": [
+    {
+      "id": "gpt-oss-remote",
+      "label": "GPT-OSS Remote",
+      "reference": "gpt-oss",
+      "sourceLabel": "Remote Inference",
+      "backend": "llama-server",
+      "launchMode": "managed",
+      "url": "http://127.0.0.1:8080",
+      "modelPath": "C:\\Users\\Max\\Models\\gpt-oss-20b-GGUF\\gpt-oss-20b-mxfp4.gguf",
+      "binaryPath": "C:\\Users\\Max\\Desktop\\Code\\UNIT-0\\runtime\\llama.cpp\\llama-server.exe",
+      "runtimeHost": "127.0.0.1",
+      "runtimePort": 8080,
+      "nCtx": 8192,
+      "nGpuLayers": -1,
+      "parallelSlots": 1,
+      "prewarmOnStart": true,
+      "promptFormat": "gpt-oss"
+    }
+  ]
+}

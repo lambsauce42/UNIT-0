@@ -61,8 +61,11 @@ import type {
   TerminalResizePayload,
   TerminalStartPayload,
   UnitApi,
+  UpdateUnitSettingsPayload,
   SelectDirectoryPayload,
   SelectFilesPayload,
+  ShelveAppletInstancePayload,
+  UnshelveAppletInstancePayload,
   UpdateLayoutRatiosPayload,
   UpdateAppletSessionStatePayload,
   UpdateTabDragPayload,
@@ -71,6 +74,7 @@ import type {
 
 const api: UnitApi = {
   bootstrap: () => ipcRenderer.invoke("unit:bootstrap"),
+  updateSettings: (payload: UpdateUnitSettingsPayload) => ipcRenderer.invoke("unit:updateSettings", payload),
   onStateChanged: (callback: (payload: BootstrapPayload) => void) => {
     const handler = (_event: Electron.IpcRendererEvent, payload: BootstrapPayload) => callback(payload);
     ipcRenderer.on("unit:state-changed", handler);
@@ -108,6 +112,8 @@ const api: UnitApi = {
   applets: {
     createApplet: (payload: CreateAppletPayload) => ipcRenderer.invoke("applets:createApplet", payload),
     closeAppletInstance: (payload: CloseAppletInstancePayload) => ipcRenderer.invoke("applets:closeAppletInstance", payload),
+    shelveAppletInstance: (payload: ShelveAppletInstancePayload) => ipcRenderer.invoke("applets:shelveAppletInstance", payload),
+    unshelveAppletInstance: (payload: UnshelveAppletInstancePayload) => ipcRenderer.invoke("applets:unshelveAppletInstance", payload),
     changeAppletInstanceKind: (payload: ChangeAppletInstanceKindPayload) =>
       ipcRenderer.invoke("applets:changeAppletInstanceKind", payload),
     moveAppletInstance: (payload: MoveAppletInstancePayload) => ipcRenderer.invoke("applets:moveAppletInstance", payload),

@@ -1,4 +1,4 @@
-import type { WorkspaceLayoutNode } from "./types";
+import type { TileResizeMode, WorkspaceLayoutNode } from "./types";
 
 export const TILE_GUTTER_SIZE = 8;
 export const MIN_APPLET_SIZE = 50;
@@ -196,11 +196,12 @@ export function projectResize(
   geometry: CanonicalLayoutGeometry,
   target: ResizeTarget,
   delta: PointLike,
-  minSize = MIN_APPLET_SIZE
+  minSize = MIN_APPLET_SIZE,
+  resizeMode: TileResizeMode = "adjacent"
 ): ResizeProjection {
   const ratios: Record<string, number> = {};
-  const dx = target.vertical ? clampGroupDelta(geometry, target.vertical, Math.round(delta.x), minSize) : 0;
-  const dy = target.horizontal ? clampGroupDelta(geometry, target.horizontal, Math.round(delta.y), minSize) : 0;
+  const dx = target.vertical ? clampResizeDelta(geometry, target.vertical, Math.round(delta.x), minSize, resizeMode) : 0;
+  const dy = target.horizontal ? clampResizeDelta(geometry, target.horizontal, Math.round(delta.y), minSize, resizeMode) : 0;
   if (target.vertical) {
     addGroupRatios(geometry, target.vertical, dx, ratios);
   }
@@ -208,6 +209,16 @@ export function projectResize(
     addGroupRatios(geometry, target.horizontal, dy, ratios);
   }
   return { ratios, dx, dy };
+}
+
+export function resizeTargetRequiresStructuralResize(
+  geometry: CanonicalLayoutGeometry,
+  target: ResizeTarget,
+  resizeMode: TileResizeMode = "adjacent"
+): boolean {
+  return [target.vertical, target.horizontal]
+    .filter((group): group is EdgeGroup => group !== null)
+    .some((group) => groupRequiresStructuralResize(geometry, group, resizeMode));
 }
 
 export function applyRatioOverrides(node: WorkspaceLayoutNode, ratios: Record<string, number>): WorkspaceLayoutNode {
@@ -243,10 +254,11 @@ export function rebuildLayoutFromLeafRects(
   baseLayout: WorkspaceLayoutNode,
   leaves: CanonicalLeaf[],
   rect: IntRect,
-  gutterSize = TILE_GUTTER_SIZE
+  gutterSize = TILE_GUTTER_SIZE,
+  primaryCutDirection: SplitDirection | null = null
 ): WorkspaceLayoutNode {
   const reusableIds = reusableSplitIds(baseLayout);
-  return buildLayoutFromRects(leaves, rect, reusableIds, gutterSize);
+  return buildLayoutFromRects(leaves, rect, reusableIds, gutterSize, primaryCutDirection);
 }
 
 function buildNodeGeometry(
@@ -458,6 +470,44 @@ function clampGroupDelta(
   return Math.max(minDelta, Math.min(maxDelta, delta));
 }
 
+function clampResizeDelta(
+  geometry: CanonicalLayoutGeometry,
+  group: EdgeGroup,
+  delta: number,
+  minSize: number,
+  resizeMode: TileResizeMode
+): number {
+  return resizeMode === "cascade"
+    ? clampCascadeGroupDelta(geometry, group, delta, minSize)
+    : clampGroupDelta(geometry, group, delta, minSize);
+}
+
+function clampCascadeGroupDelta(
+  geometry: CanonicalLayoutGeometry,
+  group: EdgeGroup,
+  delta: number,
+  minSize: number
+): number {
+  if (delta === 0) {
+    return 0;
+  }
+  let minDelta = -Infinity;
+  let maxDelta = Infinity;
+  const splitIds = new Set(group.edges.map((edge) => edge.splitId));
+  if (delta > 0) {
+    for (const splitId of splitIds) {
+      const split = requiredSplit(geometry, splitId);
+      maxDelta = Math.min(maxDelta, split.secondSize - minimumLeafSetSize(geometry, group.axis, split.secondLeafIds, minSize));
+    }
+    return Math.max(0, Math.min(maxDelta, delta));
+  }
+  for (const splitId of splitIds) {
+    const split = requiredSplit(geometry, splitId);
+    minDelta = Math.max(minDelta, minimumLeafSetSize(geometry, group.axis, split.firstLeafIds, minSize) - split.firstSize);
+  }
+  return Math.min(0, Math.max(minDelta, delta));
+}
+
 function addGroupRatios(
   geometry: CanonicalLayoutGeometry,
   group: EdgeGroup,
@@ -472,6 +522,125 @@ function addGroupRatios(
     }
     ratios[splitId] = (split.firstSize + delta) / split.availableSize;
   }
+}
+
+function minimumLeafSetSize(
+  geometry: CanonicalLayoutGeometry,
+  axis: EdgeAxis,
+  leafIds: string[],
+  minSize: number
+): number {
+  if (leafIds.length <= 1) {
+    return minSize;
+  }
+  const leafIdSet = new Set(leafIds);
+  const split = geometry.splits.find((candidate) => sameStringSet(splitLeafIds(candidate), leafIdSet));
+  if (!split) {
+    return minSize;
+  }
+  const firstSize = minimumLeafSetSize(geometry, axis, split.firstLeafIds, minSize);
+  const secondSize = minimumLeafSetSize(geometry, axis, split.secondLeafIds, minSize);
+  const splitAxis = split.direction === "row" ? "vertical" : "horizontal";
+  return splitAxis === axis ? firstSize + TILE_GUTTER_SIZE + secondSize : Math.max(firstSize, secondSize);
+}
+
+function groupRequiresStructuralResize(
+  geometry: CanonicalLayoutGeometry,
+  group: EdgeGroup,
+  resizeMode: TileResizeMode
+): boolean {
+  const splits = new Map(geometry.splits.map((split) => [split.id, split]));
+  for (const splitId of new Set(group.edges.map((edge) => edge.splitId))) {
+    const split = splits.get(splitId);
+    if (!split) {
+      continue;
+    }
+    const splitEdges = group.edges.filter((edge) => edge.splitId === splitId);
+    const touchedBefore = new Set(splitEdges.map((edge) => edge.beforeLeafId));
+    const touchedAfter = new Set(splitEdges.map((edge) => edge.afterLeafId));
+    const firstIds = new Set(split.firstLeafIds);
+    const secondIds = new Set(split.secondLeafIds);
+    if (sameStringSet(firstIds, touchedBefore) && sameStringSet(secondIds, touchedAfter)) {
+      continue;
+    }
+    if (
+      resizeMode === "cascade" &&
+      sideCanCascadeAlongAxis(geometry, group.axis, split.firstLeafIds, touchedBefore) &&
+      sideCanCascadeAlongAxis(geometry, group.axis, split.secondLeafIds, touchedAfter)
+    ) {
+      continue;
+    }
+    return true;
+  }
+  return false;
+}
+
+function sideCanCascadeAlongAxis(
+  geometry: CanonicalLayoutGeometry,
+  axis: EdgeAxis,
+  sideLeafIds: string[],
+  touchedLeafIds: Set<string>
+): boolean {
+  const sideIdSet = new Set(sideLeafIds);
+  if (sameStringSet(sideIdSet, touchedLeafIds)) {
+    return true;
+  }
+  const split = geometry.splits.find((candidate) => sameStringSet(splitLeafIds(candidate), sideIdSet));
+  if (!split) {
+    return false;
+  }
+  const splitAxis = split.direction === "row" ? "vertical" : "horizontal";
+  if (splitAxis !== axis) {
+    return false;
+  }
+  const firstIds = new Set(split.firstLeafIds);
+  const secondIds = new Set(split.secondLeafIds);
+  const firstTouched = intersectStringSets(touchedLeafIds, firstIds);
+  const secondTouched = intersectStringSets(touchedLeafIds, secondIds);
+  if (firstTouched.size > 0 && secondTouched.size > 0) {
+    return false;
+  }
+  if (firstTouched.size > 0) {
+    return sideCanCascadeAlongAxis(geometry, axis, split.firstLeafIds, firstTouched);
+  }
+  if (secondTouched.size > 0) {
+    return sideCanCascadeAlongAxis(geometry, axis, split.secondLeafIds, secondTouched);
+  }
+  return false;
+}
+
+function splitLeafIds(split: CanonicalSplit): Set<string> {
+  return new Set([...split.firstLeafIds, ...split.secondLeafIds]);
+}
+
+function intersectStringSets(left: Set<string>, right: Set<string>): Set<string> {
+  const intersection = new Set<string>();
+  for (const value of left) {
+    if (right.has(value)) {
+      intersection.add(value);
+    }
+  }
+  return intersection;
+}
+
+function sameStringSet(left: Set<string>, right: Set<string>): boolean {
+  if (left.size !== right.size) {
+    return false;
+  }
+  for (const value of left) {
+    if (!right.has(value)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function requiredSplit(geometry: CanonicalLayoutGeometry, splitId: string): CanonicalSplit {
+  const split = geometry.splits.find((item) => item.id === splitId);
+  if (!split) {
+    throw new Error(`Primitive edge group references missing split ${splitId}`);
+  }
+  return split;
 }
 
 function applyGroupDelta(leaves: Map<string, CanonicalLeaf>, group: EdgeGroup, delta: number): void {
@@ -520,18 +689,35 @@ function buildLayoutFromRects(
   leaves: CanonicalLeaf[],
   rect: IntRect,
   reusableIds: Map<string, string>,
-  gutterSize: number
+  gutterSize: number,
+  primaryCutDirection: SplitDirection | null
 ): WorkspaceLayoutNode {
   if (leaves.length === 1) {
     return { id: leaves[0].id, type: "leaf", appletInstanceId: leaves[0].appletInstanceId };
   }
-  const verticalCut = findVerticalCut(leaves, rect, gutterSize);
-  if (verticalCut) {
-    return splitFromCut("row", verticalCut.left, verticalCut.right, leaves, rect, reusableIds, gutterSize);
-  }
-  const horizontalCut = findHorizontalCut(leaves, rect, gutterSize);
-  if (horizontalCut) {
-    return splitFromCut("column", horizontalCut.top, horizontalCut.bottom, leaves, rect, reusableIds, gutterSize);
+  const directions: SplitDirection[] =
+    primaryCutDirection === "column" ? ["column", "row"] : ["row", "column"];
+  for (const direction of directions) {
+    if (direction === "row") {
+      const verticalCut = findVerticalCut(leaves, rect, gutterSize);
+      if (verticalCut) {
+        return splitFromCut("row", verticalCut.left, verticalCut.right, leaves, rect, reusableIds, gutterSize, primaryCutDirection);
+      }
+    } else {
+      const horizontalCut = findHorizontalCut(leaves, rect, gutterSize);
+      if (horizontalCut) {
+        return splitFromCut(
+          "column",
+          horizontalCut.top,
+          horizontalCut.bottom,
+          leaves,
+          rect,
+          reusableIds,
+          gutterSize,
+          primaryCutDirection
+        );
+      }
+    }
   }
   throw new Error("Cannot rebuild workspace layout from non-slicing applet rectangles");
 }
@@ -543,7 +729,8 @@ function splitFromCut(
   leaves: CanonicalLeaf[],
   rect: IntRect,
   reusableIds: Map<string, string>,
-  gutterSize: number
+  gutterSize: number,
+  primaryCutDirection: SplitDirection | null
 ): WorkspaceLayoutNode {
   const firstLeaves =
     direction === "row" ? leaves.filter((leaf) => leaf.rect.right <= cutStart) : leaves.filter((leaf) => leaf.rect.bottom <= cutStart);
@@ -557,8 +744,8 @@ function splitFromCut(
     direction === "row"
       ? { left: cutEnd, top: rect.top, right: rect.right, bottom: rect.bottom }
       : { left: rect.left, top: cutEnd, right: rect.right, bottom: rect.bottom };
-  const first = buildLayoutFromRects(firstLeaves, firstRect, reusableIds, gutterSize);
-  const second = buildLayoutFromRects(secondLeaves, secondRect, reusableIds, gutterSize);
+  const first = buildLayoutFromRects(firstLeaves, firstRect, reusableIds, gutterSize, primaryCutDirection);
+  const second = buildLayoutFromRects(secondLeaves, secondRect, reusableIds, gutterSize, primaryCutDirection);
   const firstIds = collectLeafNodeIds(first);
   const secondIds = collectLeafNodeIds(second);
   const availableSize = Math.max(1, (direction === "row" ? rect.right - rect.left : rect.bottom - rect.top) - gutterSize);

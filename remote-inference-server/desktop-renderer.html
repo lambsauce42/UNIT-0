@@ -1,0 +1,335 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Unit 0 Remote Inference Server</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0f141b;
+      --panel: #151d27;
+      --panel-2: #101821;
+      --line: #263544;
+      --text: #e0e8f0;
+      --muted: #8fa0b2;
+      --accent: #7bb7ff;
+      --danger: #ff8f8f;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--text); font: 13px/1.4 "Segoe UI", Arial, sans-serif; }
+    button, input, select, textarea { font: inherit; }
+    button { border: 1px solid var(--line); background: #1b2836; color: var(--text); border-radius: 6px; padding: 7px 10px; cursor: pointer; }
+    button.primary { border-color: #2b75bd; background: #19558d; }
+    button.danger { border-color: #814141; background: #50252a; }
+    button:disabled { opacity: .55; cursor: default; }
+    input, select, textarea { width: 100%; min-width: 0; border: 1px solid var(--line); border-radius: 6px; background: #0c1219; color: var(--text); padding: 7px 8px; }
+    textarea { min-height: 68px; resize: vertical; }
+    main { display: grid; grid-template-columns: minmax(360px, 430px) minmax(0, 1fr); gap: 0; min-height: 100vh; }
+    aside { border-right: 1px solid var(--line); background: var(--panel); padding: 18px; overflow: auto; }
+    section { padding: 18px; overflow: auto; }
+    h1 { margin: 0 0 14px; font-size: 20px; font-weight: 650; }
+    h2 { margin: 18px 0 10px; font-size: 13px; color: var(--muted); text-transform: uppercase; letter-spacing: 0; }
+    label { display: grid; gap: 5px; margin-bottom: 10px; color: var(--muted); }
+    .row { display: grid; grid-template-columns: 1fr 110px; gap: 10px; }
+    .file-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: end; }
+    .actions { display: flex; gap: 8px; align-items: center; margin: 14px 0; }
+    .status { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin-bottom: 16px; }
+    .metric { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 10px; }
+    .metric strong { display: block; font-size: 18px; }
+    .metric span { color: var(--muted); }
+    table { width: 100%; border-collapse: collapse; background: var(--panel); border: 1px solid var(--line); }
+    th, td { padding: 8px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+    th { color: var(--muted); font-weight: 600; }
+    tr.selected { background: #1b2d40; }
+    .model-editor { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin-top: 12px; }
+    .model-editor label.full { grid-column: 1 / -1; }
+    .logs { height: 220px; overflow: auto; background: #0a0f15; border: 1px solid var(--line); border-radius: 6px; padding: 10px; white-space: pre-wrap; font-family: Consolas, monospace; color: #c6d3df; }
+    .hint { color: var(--muted); }
+    .error { color: var(--danger); min-height: 18px; }
+    code { font-family: Consolas, monospace; }
+  </style>
+</head>
+<body>
+  <main>
+    <aside>
+      <h1>Remote Inference Server</h1>
+      <div class="error" id="error"></div>
+      <label>Config File<input id="config-path" readonly></label>
+      <label>Host<input id="host" data-config="host"></label>
+      <div class="row">
+        <label>Port<input id="port" data-config="port" inputmode="numeric"></label>
+        <label>Pairing Code<input id="pairing-code" data-config="pairingCode"></label>
+      </div>
+      <label>Host Identity<input id="host-identity" data-config="hostIdentity"></label>
+      <div class="actions">
+        <button id="save" class="primary" type="button">Save Config</button>
+        <button id="start" type="button">Start Server</button>
+        <button id="stop" class="danger" type="button">Stop</button>
+      </div>
+      <p class="hint" id="address-hint"></p>
+      <h2>Model Configuration</h2>
+      <div class="actions">
+        <button id="add-model" type="button">Add Model</button>
+        <button id="remove-model" type="button">Remove Selected</button>
+      </div>
+      <table aria-label="Configured models">
+        <thead><tr><th>ID</th><th>Label</th><th>Backend</th></tr></thead>
+        <tbody id="models"></tbody>
+      </table>
+    </aside>
+    <section>
+      <div class="status">
+        <div class="metric"><strong id="running">Stopped</strong><span>Status</span></div>
+        <div class="metric"><strong id="client-count">0</strong><span>Clients</span></div>
+        <div class="metric"><strong id="request-count">0</strong><span>Active Requests</span></div>
+      </div>
+      <h2>Selected Model</h2>
+      <div class="model-editor">
+        <label>Model ID<input id="model-id" data-model="id"></label>
+        <label>Label<input id="model-label" data-model="label"></label>
+        <label>Reference<input id="model-reference" data-model="reference" placeholder="gpt-oss"></label>
+        <label>Backend<select id="model-backend" data-model="backend"><option value="llama-server">llama-server</option></select></label>
+        <label>llama Launch<select id="model-launch-mode" data-model="launchMode"><option value="managed">Launch GGUF on this machine</option><option value="external">Use existing llama-server URL</option></select></label>
+        <label>llama-server URL<input id="model-url" data-model="url" placeholder="http://127.0.0.1:8080"></label>
+        <label class="full">GGUF Model File
+          <div class="file-row">
+            <input id="model-path" data-model="modelPath" placeholder="C:\Models\gpt-oss.gguf">
+            <button id="browse-model" type="button">Browse</button>
+          </div>
+        </label>
+        <label class="full">llama-server Executable
+          <div class="file-row">
+            <input id="binary-path" data-model="binaryPath" placeholder="runtime\llama.cpp\llama-server.exe">
+            <button id="browse-binary" type="button">Browse</button>
+          </div>
+        </label>
+        <label>Runtime Host<input id="runtime-host" data-model="runtimeHost" placeholder="127.0.0.1"></label>
+        <label>Runtime Port<input id="runtime-port" data-model="runtimePort" inputmode="numeric" placeholder="8080"></label>
+        <label>Context Tokens<input id="model-n-ctx" data-model="nCtx" inputmode="numeric" placeholder="8192"></label>
+        <label>GPU Layers<input id="model-n-gpu-layers" data-model="nGpuLayers" inputmode="numeric" placeholder="-1"></label>
+        <label>Parallel Slots<input id="model-parallel-slots" data-model="parallelSlots" inputmode="numeric" placeholder="1"></label>
+        <label>Prewarm<select id="model-prewarm" data-model="prewarmOnStart"><option value="true">on start</option><option value="false">manual/first request</option></select></label>
+        <label>Prompt Format<select id="model-prompt-format" data-model="promptFormat"><option value="">auto</option><option value="gpt-oss">gpt-oss</option></select></label>
+      </div>
+      <h2>Connected Clients</h2>
+      <pre class="logs" id="clients"></pre>
+      <h2>Runtime Logs</h2>
+      <pre class="logs" id="logs"></pre>
+    </section>
+  </main>
+  <script>
+    let state = null;
+    let editableConfig = null;
+    let selectedModelIndex = 0;
+    let dirty = false;
+
+    const $ = (id) => document.getElementById(id);
+    const error = (message) => { $("error").textContent = message || ""; };
+    const clone = (value) => JSON.parse(JSON.stringify(value));
+
+    function currentConfigFromForm() {
+      return {
+        host: $("host").value.trim(),
+        port: Number.parseInt($("port").value, 10) || 0,
+        pairingCode: $("pairing-code").value.trim(),
+        hostIdentity: $("host-identity").value.trim(),
+        models: editableConfig.models
+      };
+    }
+
+    function selectedModel() {
+      return editableConfig?.models[selectedModelIndex] || null;
+    }
+
+    function markDirty() {
+      dirty = true;
+    }
+
+    function syncConfigFromInputs() {
+      if (!editableConfig) return;
+      editableConfig.host = $("host").value.trim();
+      editableConfig.port = Number.parseInt($("port").value, 10) || 0;
+      editableConfig.pairingCode = $("pairing-code").value.trim();
+      editableConfig.hostIdentity = $("host-identity").value.trim();
+      markDirty();
+    }
+
+    function syncModelFromEditor(mark = true) {
+      const model = selectedModel();
+      if (!model) return;
+      for (const input of document.querySelectorAll("[data-model]")) {
+        model[input.dataset.model] = input.value;
+      }
+      if (mark) {
+        markDirty();
+      }
+      renderModels();
+    }
+
+    function render(nextState, options = {}) {
+      state = nextState;
+      if (!editableConfig || options.replaceEditable || !dirty) {
+        editableConfig = clone(state.config);
+        dirty = false;
+        selectedModelIndex = Math.min(selectedModelIndex, Math.max(0, editableConfig.models.length - 1));
+      }
+      $("config-path").value = state.configPath;
+      if (options.replaceEditable || document.activeElement !== $("host")) $("host").value = editableConfig.host;
+      if (options.replaceEditable || document.activeElement !== $("port")) $("port").value = String(editableConfig.port);
+      if (options.replaceEditable || document.activeElement !== $("pairing-code")) $("pairing-code").value = editableConfig.pairingCode;
+      if (options.replaceEditable || document.activeElement !== $("host-identity")) $("host-identity").value = editableConfig.hostIdentity;
+      $("running").textContent = state.server.running ? "Running" : "Stopped";
+      $("client-count").textContent = String(state.server.clients.length);
+      $("request-count").textContent = String(state.server.activeRequests.length);
+      $("address-hint").textContent = state.server.addresses.length
+        ? "LAN addresses: " + state.server.addresses.map((item) => item + ":" + editableConfig.port).join(", ")
+        : "Use the GPU machine IP address and this port from the laptop.";
+      renderModels();
+      if (options.replaceEditable || !document.activeElement?.matches?.("[data-model]")) {
+        renderEditor();
+      }
+      $("clients").textContent = JSON.stringify(state.server.clients, null, 2);
+      $("logs").textContent = state.server.logs.map((entry) => "[" + entry.time + "] " + entry.level.toUpperCase() + " " + entry.message + " " + JSON.stringify(entry.details)).join("\n");
+    }
+
+    function renderModels() {
+      const body = $("models");
+      body.innerHTML = "";
+      editableConfig.models.forEach((model, index) => {
+        const tr = document.createElement("tr");
+        tr.className = index === selectedModelIndex ? "selected" : "";
+        tr.innerHTML = "<td><code></code></td><td></td><td></td>";
+        tr.children[0].firstChild.textContent = model.id;
+        tr.children[1].textContent = model.label;
+        tr.children[2].textContent = model.backend;
+        tr.addEventListener("click", () => {
+          syncModelFromEditor();
+          selectedModelIndex = index;
+          renderModels();
+          renderEditor();
+        });
+        body.appendChild(tr);
+      });
+    }
+
+    function renderEditor() {
+      const model = selectedModel();
+      for (const input of document.querySelectorAll("[data-model]")) {
+        input.disabled = !model;
+        input.value = model ? (model[input.dataset.model] || "") : "";
+      }
+      updateModelControls();
+    }
+
+    function updateModelControls() {
+      const model = selectedModel();
+      const backend = model?.backend || "";
+      const launchMode = model?.launchMode || "managed";
+      const isManaged = backend === "llama-server" && launchMode === "managed";
+      const isExternal = backend === "llama-server" && launchMode === "external";
+      $("model-launch-mode").disabled = !model;
+      $("model-url").disabled = !model || !isExternal;
+      $("model-path").disabled = !model || !isManaged;
+      $("browse-model").disabled = !model || !isManaged;
+      $("binary-path").disabled = !model || !isManaged;
+      $("browse-binary").disabled = !model || !isManaged;
+      $("runtime-host").disabled = !model || !isManaged;
+      $("runtime-port").disabled = !model || !isManaged;
+      $("model-n-ctx").disabled = !model || !isManaged;
+      $("model-n-gpu-layers").disabled = !model || !isManaged;
+      $("model-parallel-slots").disabled = !model || !isManaged;
+      $("model-prewarm").disabled = !model || !isManaged;
+    }
+
+    async function saveConfig() {
+      syncConfigFromInputs();
+      syncModelFromEditor(false);
+      const next = await window.remoteInferenceApi.saveConfig(currentConfigFromForm());
+      render(next, { replaceEditable: true });
+    }
+
+    $("save").addEventListener("click", () => saveConfig().catch((err) => error(err.message)));
+    $("start").addEventListener("click", async () => {
+      try {
+        error("");
+        await saveConfig();
+        render(await window.remoteInferenceApi.start(), { replaceEditable: true });
+      } catch (err) {
+        error(err.message);
+      }
+    });
+    $("stop").addEventListener("click", async () => {
+      try {
+        error("");
+        render(await window.remoteInferenceApi.stop(), { replaceEditable: true });
+      } catch (err) {
+        error(err.message);
+      }
+    });
+    $("add-model").addEventListener("click", () => {
+      syncModelFromEditor();
+      editableConfig.models.push({
+        id: "gpt-oss-remote",
+        label: "GPT-OSS Remote",
+        reference: "gpt-oss",
+        sourceLabel: "Remote Inference",
+        backend: "llama-server",
+        launchMode: "managed",
+        url: "http://127.0.0.1:8080",
+        modelPath: "",
+        binaryPath: state.defaultLlamaServerBinaryPath || "",
+        runtimeHost: "127.0.0.1",
+        runtimePort: 8080,
+        nCtx: 8192,
+        nGpuLayers: -1,
+        parallelSlots: 1,
+        prewarmOnStart: true,
+        promptFormat: "gpt-oss"
+      });
+      selectedModelIndex = editableConfig.models.length - 1;
+      markDirty();
+      renderModels();
+      renderEditor();
+    });
+    $("remove-model").addEventListener("click", () => {
+      if (!editableConfig.models.length) return;
+      editableConfig.models.splice(selectedModelIndex, 1);
+      selectedModelIndex = Math.max(0, selectedModelIndex - 1);
+      markDirty();
+      renderModels();
+      renderEditor();
+    });
+    document.querySelectorAll("[data-config]").forEach((input) => input.addEventListener("input", syncConfigFromInputs));
+    document.querySelectorAll("[data-model]").forEach((input) => {
+      input.addEventListener("input", () => {
+        syncModelFromEditor(true);
+        updateModelControls();
+      });
+      input.addEventListener("change", () => {
+        syncModelFromEditor(true);
+        updateModelControls();
+      });
+    });
+    $("browse-model").addEventListener("click", async () => {
+      const file = await window.remoteInferenceApi.selectFile({
+        title: "Select GGUF model",
+        filters: [{ name: "GGUF models", extensions: ["gguf"] }]
+      });
+      if (!file) return;
+      $("model-path").value = file;
+      syncModelFromEditor(true);
+    });
+    $("browse-binary").addEventListener("click", async () => {
+      const file = await window.remoteInferenceApi.selectFile({
+        title: "Select llama-server executable",
+        filters: [{ name: "Executables", extensions: ["exe"] }, { name: "All Files", extensions: ["*"] }]
+      });
+      if (!file) return;
+      $("binary-path").value = file;
+      syncModelFromEditor(true);
+    });
+    window.remoteInferenceApi.onState((next) => render(next));
+    window.remoteInferenceApi.getState().then((next) => render(next, { replaceEditable: true })).catch((err) => error(err.message));
+  </script>
+</body>
+</html>
