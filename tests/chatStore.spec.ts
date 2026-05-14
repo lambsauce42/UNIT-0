@@ -418,9 +418,20 @@ test("persists settings presets and applies provider/framework state", () => {
   state = store.loadState();
   expect(state.threads.find((thread) => thread.id === threadId)?.selectedSettingsPresetId).toBe("custom::default");
   store.applySettingsPreset(threadId, openCodePreset.id);
+  store.updateRuntimeSettings({ permissionMode: "default_permissions" });
+  state = store.loadState();
+  expect(state.threads.find((thread) => thread.id === threadId)?.selectedSettingsPresetId).toBe(openCodePreset.id);
   store.updateRuntimeSettings({ temperature: 0.7 });
   state = store.loadState();
   expect(state.threads.find((thread) => thread.id === threadId)?.selectedSettingsPresetId).toBe("custom::default");
+
+  store.applySettingsPreset(threadId, codexPreset.id);
+  store.updateThreadSettings(threadId, {
+    permissionMode: "full_access",
+    codexApprovalMode: "never"
+  });
+  state = store.loadState();
+  expect(state.threads.find((thread) => thread.id === threadId)?.selectedSettingsPresetId).toBe(codexPreset.id);
 
   store.deleteSettingsPreset("builtin::fast");
   expect(store.loadState().settingsPresets.some((item) => item.id === "builtin::fast")).toBe(false);

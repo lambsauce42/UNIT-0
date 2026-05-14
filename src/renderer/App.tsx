@@ -4147,7 +4147,7 @@ function ChatSurface() {
   }, []);
 
   useEffect(() => {
-    if (chatState?.codexAccount.status === "ready") {
+    if (chatState?.codexAccount.status !== "unknown") {
       return;
     }
     let cancelled = false;
@@ -6041,6 +6041,7 @@ function ChatDialog({
   const [presetBuiltinFramework, setPresetBuiltinFramework] = useState<ChatBuiltinAgenticFramework>(() => initialSettingsPresetBuiltinFramework(dialog, state));
   const [presetEmbeddingModelPath, setPresetEmbeddingModelPath] = useState(() => initialSettingsPresetEmbeddingModelPath(dialog, state));
   const [documentIndexPaths, setDocumentIndexPaths] = useState<string[]>(() => initialDocumentIndexPaths(dialog, state));
+  const dialogKey = chatDialogKey(dialog);
 
   useEffect(() => {
     setTitle(initialChatDialogTitle(dialog, state));
@@ -6058,7 +6059,7 @@ function ChatDialog({
     setPresetBuiltinFramework(initialSettingsPresetBuiltinFramework(dialog, state));
     setPresetEmbeddingModelPath(initialSettingsPresetEmbeddingModelPath(dialog, state));
     setDocumentIndexPaths(initialDocumentIndexPaths(dialog, state));
-  }, [dialog, state]);
+  }, [dialogKey]);
 
   useEffect(() => {
     if (presetBuiltinFramework !== "opencode") {
@@ -7009,6 +7010,25 @@ function ChatDialog({
       </form>
     </div>
   );
+}
+
+function chatDialogKey(dialog: ChatDialogState) {
+  if (!dialog) {
+    return "closed";
+  }
+  if ("projectId" in dialog && typeof dialog.projectId === "string") {
+    return `${dialog.kind}:${dialog.projectId}`;
+  }
+  if ("threadId" in dialog && typeof dialog.threadId === "string") {
+    return `${dialog.kind}:${dialog.threadId}`;
+  }
+  if ("presetId" in dialog && typeof dialog.presetId === "string") {
+    return `${dialog.kind}:${dialog.presetId}`;
+  }
+  if ("documentIndexId" in dialog && typeof dialog.documentIndexId === "string") {
+    return `${dialog.kind}:${dialog.documentIndexId}`;
+  }
+  return dialog.kind;
 }
 
 function initialChatDialogTitle(dialog: ChatDialogState, state: ChatState) {

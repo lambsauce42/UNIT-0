@@ -814,7 +814,7 @@ let appQuitting = false;
 const defaultFileViewerRoot = path.resolve(process.cwd());
 
 function workspaceDatabasePath(): string {
-  const dataDir = process.env.UNIT0_DATA_DIR ?? app.getPath("userData");
+  const dataDir = process.env.UNIT0_DATA_DIR ?? (app.isPackaged ? path.join(path.dirname(app.getPath("exe")), "Unit 0 Data") : app.getPath("userData"));
   return path.join(dataDir, "unit0.sqlite");
 }
 

@@ -880,7 +880,8 @@ export class ChatStore {
     try {
       this.setSettingInTransaction("runtime_settings_json", JSON.stringify(nextSettings));
       if (selectedThreadId) {
-        this.db.prepare("UPDATE chat_threads SET selected_settings_preset_id = ?, runtime_settings_json = ?, updated_at = ? WHERE id = ?").run(DEFAULT_SETTINGS_PRESET_ID, JSON.stringify(nextSettings), timestamp(), selectedThreadId);
+        const selectedSettingsPresetId = runtimeSettingsPatchInvalidatesPreset(settings) ? DEFAULT_SETTINGS_PRESET_ID : null;
+        this.db.prepare("UPDATE chat_threads SET selected_settings_preset_id = COALESCE(?, selected_settings_preset_id), runtime_settings_json = ?, updated_at = ? WHERE id = ?").run(selectedSettingsPresetId, JSON.stringify(nextSettings), timestamp(), selectedThreadId);
       }
       this.db.exec("COMMIT");
     } catch (error) {
@@ -2481,9 +2482,11 @@ function threadSettingsChangeInvalidatesPreset(current: ChatThread, next: {
     || (next.documentAnalysisEmbeddingModelPath !== undefined && next.documentAnalysisEmbeddingModelPath !== current.documentAnalysisEmbeddingModelPath)
     || (next.codexModelId !== undefined && next.codexModelId !== current.codexModelId)
     || (next.codexReasoningEffort !== undefined && next.codexReasoningEffort !== current.codexReasoningEffort)
-    || (next.permissionMode !== undefined && next.permissionMode !== current.permissionMode)
-    || (next.codexApprovalMode !== undefined && next.codexApprovalMode !== current.codexApprovalMode)
     || (next.planModeEnabled !== undefined && next.planModeEnabled !== current.planModeEnabled);
+}
+
+function runtimeSettingsPatchInvalidatesPreset(settings: Partial<ChatRuntimeSettings>): boolean {
+  return Object.keys(settings).some((key) => key !== "permissionMode");
 }
 
 function normalizeUsageIndicatorPreferences(value: Partial<Record<ChatUsageIndicatorId, Partial<ChatUsageIndicatorPreference>>> | undefined): Record<ChatUsageIndicatorId, ChatUsageIndicatorPreference> {

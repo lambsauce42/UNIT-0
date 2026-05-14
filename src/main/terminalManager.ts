@@ -16,12 +16,17 @@ type TerminalSession = {
   disposed: boolean;
 };
 
+type TerminalSpawn = (kind: TerminalAppletKind, cols: number, rows: number) => pty.IPty;
+
 const MAX_REPLAY_BUFFER = 200_000;
 
 export class TerminalManager {
   private readonly sessions = new Map<string, TerminalSession>();
 
-  constructor(private readonly publish: (payload: TerminalDataPayload) => void) {}
+  constructor(
+    private readonly publish: (payload: TerminalDataPayload) => void,
+    private readonly spawnProcess: TerminalSpawn = spawnTerminalProcess
+  ) {}
 
   start(payload: TerminalStartPayload): TerminalStartResult {
     const existing = this.sessions.get(payload.sessionId);
@@ -30,7 +35,12 @@ export class TerminalManager {
       return { sessionId: existing.id, output: existing.output };
     }
 
-    const process = this.spawn(payload.kind, payload.cols, payload.rows);
+    let process: pty.IPty;
+    try {
+      process = this.spawnProcess(payload.kind, payload.cols, payload.rows);
+    } catch (error) {
+      return { sessionId: payload.sessionId, output: terminalStartFailureMessage(payload.kind, error) };
+    }
     const session: TerminalSession = {
       id: payload.sessionId,
       process,
@@ -62,7 +72,7 @@ export class TerminalManager {
   input(payload: TerminalInputPayload): void {
     const session = this.sessions.get(payload.sessionId);
     if (!session) {
-      throw new Error(`Terminal session ${payload.sessionId} is not running`);
+      return;
     }
     session.process.write(payload.data);
   }
@@ -90,21 +100,12 @@ export class TerminalManager {
       this.dispose(sessionId);
     }
   }
+}
 
-  private spawn(kind: TerminalAppletKind, cols: number, rows: number): pty.IPty {
-    const cwd = process.env.UNIT0_WORKSPACE_DIR ?? process.cwd();
-    if (kind === "wslTerminal") {
-      return pty.spawn("wsl.exe", [], {
-        name: "xterm-256color",
-        cols,
-        rows,
-        cwd,
-        env: terminalEnv()
-      });
-    }
-
-    const shell = process.platform === "win32" ? "powershell.exe" : (process.env.SHELL ?? "/bin/sh");
-    return pty.spawn(shell, [], {
+function spawnTerminalProcess(kind: TerminalAppletKind, cols: number, rows: number): pty.IPty {
+  const cwd = process.env.UNIT0_WORKSPACE_DIR ?? process.cwd();
+  if (kind === "wslTerminal") {
+    return pty.spawn("wsl.exe", [], {
       name: "xterm-256color",
       cols,
       rows,
@@ -112,6 +113,23 @@ export class TerminalManager {
       env: terminalEnv()
     });
   }
+
+  const shell = process.platform === "win32" ? "powershell.exe" : (process.env.SHELL ?? "/bin/sh");
+  return pty.spawn(shell, [], {
+    name: "xterm-256color",
+    cols,
+    rows,
+    cwd,
+    env: terminalEnv()
+  });
+}
+
+export function terminalStartFailureMessage(kind: TerminalAppletKind, error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  if (kind === "wslTerminal") {
+    return `WSL terminal could not start.\r\n${message}\r\n`;
+  }
+  return `Terminal could not start.\r\n${message}\r\n`;
 }
 
 function killTerminalProcess(process: pty.IPty): void {
