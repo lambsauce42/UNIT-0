@@ -300,13 +300,20 @@ test("updates and deletes document index groups", () => {
       text: "alpha project facts",
       tokenCount: 5,
       ordinalStart: 0,
-      ordinalEnd: 0
+      ordinalEnd: 0,
+      embedding: [1, 0, 0]
     }
   ]);
   store.updateDocumentIndexStatus(index.id, { state: "ready", progress: 1, message: "Ready" });
 
-  const updated = store.updateDocumentIndex(index.id, "Brief", nextSourcePath);
+  const renamed = store.updateDocumentIndex(index.id, "Knowledge", sourcePath);
   let next = store.loadState();
+  expect(renamed).toMatchObject({ id: index.id, title: "Knowledge", sourcePath, state: "ready", progress: 1 });
+  expect(next.documentIndexes.find((item) => item.id === index.id)).toMatchObject({ title: "Knowledge", sourcePath, state: "ready" });
+  expect(store.searchDocumentIndexByVector(index.id, [1, 0, 0], 1, 100)).toHaveLength(1);
+
+  const updated = store.updateDocumentIndex(index.id, "Brief", nextSourcePath);
+  next = store.loadState();
   expect(updated).toMatchObject({ id: index.id, title: "Brief", sourcePath: nextSourcePath, state: "building", progress: 0 });
   expect(next.documentIndexes.find((item) => item.id === index.id)).toMatchObject({ title: "Brief", sourcePath: nextSourcePath, state: "building" });
   expect(() => store.searchDocumentIndexByVector(index.id, [1, 0, 0])).toThrow(/not ready/);
@@ -403,6 +410,7 @@ test("persists settings presets and applies provider/framework state", () => {
   store.applySettingsPreset(threadId, preset.id);
   state = store.loadState();
   expect(state.runtimeSettings.nCtx).toBe(8192);
+  expect(state.runtimeSettings.permissionMode).toBe("full_access");
   expect(state.threads.find((thread) => thread.id === threadId)).toMatchObject({
     selectedSettingsPresetId: preset.id,
     builtinAgenticFramework: "document_analysis",
@@ -425,13 +433,17 @@ test("persists settings presets and applies provider/framework state", () => {
   state = store.loadState();
   expect(state.threads.find((thread) => thread.id === threadId)?.selectedSettingsPresetId).toBe("custom::default");
 
-  store.applySettingsPreset(threadId, codexPreset.id);
   store.updateThreadSettings(threadId, {
     permissionMode: "full_access",
     codexApprovalMode: "never"
   });
+  store.applySettingsPreset(threadId, codexPreset.id);
   state = store.loadState();
-  expect(state.threads.find((thread) => thread.id === threadId)?.selectedSettingsPresetId).toBe(codexPreset.id);
+  expect(state.threads.find((thread) => thread.id === threadId)).toMatchObject({
+    selectedSettingsPresetId: codexPreset.id,
+    permissionMode: "full_access",
+    codexApprovalMode: "never"
+  });
 
   store.deleteSettingsPreset("builtin::fast");
   expect(store.loadState().settingsPresets.some((item) => item.id === "builtin::fast")).toBe(false);

@@ -1474,6 +1474,7 @@ app.whenReady().then(() => {
     process.env.NODE_ENV === "test" ? new MockCodexRuntime() : new CodexAppServerRuntime(),
     broadcastChatState
   );
+  chatService.warmSelectedLocalRuntime();
   terminalManager = new TerminalManager((payload) => {
     for (const browserWindow of windows.values()) {
       if (!browserWindow.isDestroyed()) {
@@ -1667,6 +1668,10 @@ app.whenReady().then(() => {
   ipcMain.handle("chat:deleteSettingsPreset", (_event, payload: ChatDeleteSettingsPresetPayload) => chatService.deleteSettingsPreset(payload));
   ipcMain.handle("chat:refreshCodexAccount", (_event, payload?: ChatRefreshCodexAccountPayload) => chatService.refreshCodexAccount(payload));
   ipcMain.handle("chat:refreshLocalModels", () => chatService.refreshLocalModels());
+  ipcMain.handle("chat:warmLocalAi", () => {
+    chatService.warmSelectedLocalRuntime();
+    return chatService.state();
+  });
   ipcMain.handle("chat:cancelQueuedSubmission", (_event, payload: ChatCancelQueuedSubmissionPayload) => chatService.cancelQueuedSubmission(payload.submissionId));
   ipcMain.handle("chat:moveThread", (_event, payload: ChatMoveThreadPayload) =>
     chatService.moveThread(payload.threadId, payload.projectId, payload.targetThreadId, payload.position)

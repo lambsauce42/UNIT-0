@@ -2,6 +2,7 @@ import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
 import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
+import { createHash } from "node:crypto";
 import type { ChatBuiltinAgenticFramework, ChatMessage, ChatModel, ChatRuntimeSettings } from "../shared/types.js";
 
 const GPTOSS_END_MARKER = "<|end|>";
@@ -119,10 +120,17 @@ type ActiveServer = {
   baseUrl: string;
   modelId: string;
   process: ChildProcess;
+  slotSavePath: string;
+  activeSlotCacheKey: string;
 };
 
 export class LocalLlamaRuntime {
   private activeServer: ActiveServer | null = null;
+  private pendingServer: Promise<ActiveServer> | null = null;
+  private pendingServerKey: ServerKey | null = null;
+  private startingProcess: ChildProcess | null = null;
+  private serverGeneration = 0;
+  private slotLock: Promise<void> = Promise.resolve();
   private activeAbortController: AbortController | null = null;
   private readonly startupTimeoutMs: number;
   private readonly fetchImpl: typeof fetch;
@@ -143,13 +151,36 @@ export class LocalLlamaRuntime {
       onReasoning?: (token: string) => void;
       builtinAgenticFramework?: ChatBuiltinAgenticFramework;
       documentTitle?: string;
+      cacheKey?: string;
+    }
+  ): Promise<void> {
+    return this.withSlotLock(() => this.streamChatLocked(options));
+  }
+
+  private async streamChatLocked(
+    options: {
+      model: ChatModel;
+      settings: ChatRuntimeSettings;
+      messages: ChatMessage[];
+      onToken: (token: string) => void;
+      onReasoning?: (token: string) => void;
+      builtinAgenticFramework?: ChatBuiltinAgenticFramework;
+      documentTitle?: string;
+      cacheKey?: string;
     }
   ): Promise<void> {
     const server = await this.ensureServer(options.model, options.settings);
+    await this.restoreSlotIfNeeded(server, options.cacheKey);
     const abortController = new AbortController();
     this.activeAbortController = abortController;
     try {
       const nativeGptOss = isNativeGptOssModel(options.model);
+      const gptOssPrompt = nativeGptOss
+        ? renderGptOssPrompt(options.messages, options.settings, {
+          builtinAgenticFramework: options.builtinAgenticFramework ?? "chat",
+          documentTitle: options.documentTitle ?? ""
+        })
+        : "";
       const response = nativeGptOss
         ? await this.fetchImpl(`${server.baseUrl}/completion`, {
           method: "POST",
@@ -158,15 +189,9 @@ export class LocalLlamaRuntime {
             "Content-Type": "application/json"
           },
           body: JSON.stringify({
-            prompt: renderGptOssPrompt(options.messages, options.settings, {
-              builtinAgenticFramework: options.builtinAgenticFramework ?? "chat",
-              documentTitle: options.documentTitle ?? ""
-            }),
+            prompt: gptOssPrompt,
             stream: true,
-            n_predict: gptOssRequestMaxTokens(options.messages, options.settings, {
-              builtinAgenticFramework: options.builtinAgenticFramework ?? "chat",
-              documentTitle: options.documentTitle ?? ""
-            }),
+            n_predict: gptOssRequestMaxTokens(gptOssPrompt, options.settings),
             temperature: options.settings.temperature,
             repeat_penalty: options.settings.repeatPenalty,
             cache_prompt: true,
@@ -244,6 +269,7 @@ export class LocalLlamaRuntime {
           options.onReasoning?.(reasoning);
         }
       }
+      await this.saveSlotIfNeeded(server, options.cacheKey);
     } catch (error) {
       if (abortController.signal.aborted) {
         throw new LocalLlamaRuntimeError("Bundled llama-server request was cancelled.");
@@ -256,16 +282,41 @@ export class LocalLlamaRuntime {
     }
   }
 
+  async warmChatSession(options: {
+    model: ChatModel;
+    settings: ChatRuntimeSettings;
+    cacheKey?: string;
+    shouldCancel?: () => boolean;
+  }): Promise<void> {
+    await this.withSlotLock(async () => {
+      if (options.shouldCancel?.()) {
+        return;
+      }
+      const server = await this.ensureServer(options.model, options.settings);
+      if (options.shouldCancel?.()) {
+        return;
+      }
+      await this.restoreSlotIfNeeded(server, options.cacheKey);
+    });
+  }
+
   cancelActiveRequest(): void {
     this.activeAbortController?.abort();
   }
 
   close(): void {
+    this.serverGeneration += 1;
     this.cancelActiveRequest();
+    if (this.startingProcess && this.startingProcess.exitCode === null) {
+      this.startingProcess.kill();
+    }
+    this.startingProcess = null;
     if (this.activeServer && this.activeServer.process.exitCode === null) {
       this.activeServer.process.kill();
     }
     this.activeServer = null;
+    this.pendingServer = null;
+    this.pendingServerKey = null;
   }
 
   private async ensureServer(model: ChatModel, settings: ChatRuntimeSettings): Promise<ActiveServer> {
@@ -283,7 +334,25 @@ export class LocalLlamaRuntime {
     if (this.activeServer && serverKeyMatches(this.activeServer.key, key) && this.activeServer.process.exitCode === null) {
       return this.activeServer;
     }
+    if (this.pendingServer && this.pendingServerKey && serverKeyMatches(this.pendingServerKey, key)) {
+      return this.pendingServer;
+    }
     this.close();
+    const startGeneration = ++this.serverGeneration;
+    this.pendingServerKey = key;
+    this.pendingServer = this.startServer(key, settings, startGeneration);
+    try {
+      this.activeServer = await this.pendingServer;
+      return this.activeServer;
+    } finally {
+      if (this.pendingServerKey && serverKeyMatches(this.pendingServerKey, key)) {
+        this.pendingServer = null;
+        this.pendingServerKey = null;
+      }
+    }
+  }
+
+  private async startServer(key: ServerKey, settings: ChatRuntimeSettings, startGeneration: number): Promise<ActiveServer> {
     const binaryPath = this.options.binaryPath ? path.resolve(this.options.binaryPath) : resolveBundledLlamaServerBinary(this.options.runtimeRoot);
     if (!binaryPath) {
       throw new LocalLlamaRuntimeError("Bundled llama-server binary was not found. Expected runtime/llama.cpp/llama-server(.exe).");
@@ -292,37 +361,59 @@ export class LocalLlamaRuntime {
       throw new LocalLlamaRuntimeError(`Bundled llama-server binary was not found: ${binaryPath}`);
     }
     const port = await reserveLocalPort();
+    this.assertCurrentServerGeneration(startGeneration);
+    const slotSavePath = this.slotSavePath(binaryPath);
     const command = buildLlamaServerCommand({
       binaryPath,
       port,
-      modelPath,
+      modelPath: key.modelPath,
       settings,
-      nativeGptOss,
-      slotSavePath: this.slotSavePath(binaryPath)
+      nativeGptOss: key.nativeGptOss,
+      slotSavePath
     });
     const process = this.spawnImpl(command.command, command.args, {
       cwd: command.cwd,
       windowsHide: true,
       stdio: "ignore"
     } as SpawnOptions);
+    this.startingProcess = process;
+    if (this.serverGeneration !== startGeneration) {
+      if (process.exitCode === null) {
+        process.kill();
+      }
+      throw new LocalLlamaRuntimeError("Bundled llama-server startup was superseded.");
+    }
     const baseUrl = `http://127.0.0.1:${port}`;
-    const modelId = await this.waitUntilReady(process, baseUrl, binaryPath);
-    this.activeServer = { key, baseUrl, modelId, process };
-    return this.activeServer;
+    const modelId = await this.waitUntilReady(process, baseUrl, binaryPath, startGeneration);
+    if (this.startingProcess === process) {
+      this.startingProcess = null;
+    }
+    if (this.serverGeneration !== startGeneration) {
+      if (process.exitCode === null) {
+        process.kill();
+      }
+      throw new LocalLlamaRuntimeError("Bundled llama-server startup was superseded.");
+    }
+    return { key, baseUrl, modelId, process, slotSavePath, activeSlotCacheKey: "" };
   }
 
-  private async waitUntilReady(process: ChildProcess, baseUrl: string, binaryPath: string): Promise<string> {
+  private async waitUntilReady(process: ChildProcess, baseUrl: string, binaryPath: string, startGeneration: number): Promise<string> {
     const deadline = Date.now() + this.startupTimeoutMs;
     let lastError = "server did not become ready";
+    let pollDelayMs = 100;
     while (Date.now() < deadline) {
       if (process.exitCode !== null) {
         throw new LocalLlamaRuntimeError(`Bundled llama-server exited during startup with code ${process.exitCode}. Binary: ${binaryPath}`);
       }
+      this.assertCurrentServerGeneration(startGeneration);
       try {
         const health = await this.fetchJson(`${baseUrl}/health`, 2_000);
         const status = String((health as { status?: unknown }).status ?? "").toLowerCase();
         if (status && status !== "ok") {
           lastError = `health status ${status}`;
+          await sleep(pollDelayMs);
+          pollDelayMs = Math.min(500, Math.round(pollDelayMs * 1.35));
+          continue;
         }
         const models = await this.fetchJson(`${baseUrl}/v1/models`, 3_000);
         const data = (models as { data?: unknown }).data;
@@ -335,7 +426,8 @@ export class LocalLlamaRuntime {
       } catch (error) {
         lastError = error instanceof Error ? error.message : String(error);
       }
-      await sleep(500);
+      await sleep(pollDelayMs);
+      pollDelayMs = Math.min(500, Math.round(pollDelayMs * 1.35));
     }
     throw new LocalLlamaRuntimeError(`Bundled llama-server startup timed out: ${lastError}`);
   }
@@ -360,6 +452,75 @@ export class LocalLlamaRuntime {
       : path.join(path.dirname(binaryPath), "slots");
     fs.mkdirSync(slotDir, { recursive: true });
     return slotDir;
+  }
+
+  private async restoreSlotIfNeeded(server: ActiveServer, cacheKey?: string): Promise<void> {
+    const normalizedKey = normalizeSlotCacheKey(cacheKey);
+    if (!normalizedKey || server.activeSlotCacheKey === normalizedKey) {
+      return;
+    }
+    if (server.activeSlotCacheKey) {
+      await this.saveSlot(server, slotCacheFilename(server, server.activeSlotCacheKey));
+      server.activeSlotCacheKey = "";
+    }
+    const filename = slotCacheFilename(server, normalizedKey);
+    if (fs.existsSync(path.join(server.slotSavePath, filename))) {
+      await this.slotAction(server.baseUrl, "restore", filename);
+      server.activeSlotCacheKey = normalizedKey;
+    }
+  }
+
+  private async saveSlotIfNeeded(server: ActiveServer, cacheKey?: string): Promise<void> {
+    const normalizedKey = normalizeSlotCacheKey(cacheKey);
+    if (!normalizedKey) {
+      return;
+    }
+    await this.saveSlot(server, slotCacheFilename(server, normalizedKey));
+    server.activeSlotCacheKey = normalizedKey;
+  }
+
+  private async saveSlot(server: ActiveServer, filename: string): Promise<void> {
+    await this.slotAction(server.baseUrl, "save", filename);
+  }
+
+  private async slotAction(baseUrl: string, action: "save" | "restore", filename: string): Promise<void> {
+    const abortController = new AbortController();
+    const timer = setTimeout(() => abortController.abort(), 30_000);
+    try {
+      const response = await this.fetchImpl(`${baseUrl}/slots/0?action=${action}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ filename }),
+        signal: abortController.signal
+      });
+      if (!response.ok) {
+        const body = await response.text().catch(() => "");
+        throw new LocalLlamaRuntimeError(`Bundled llama-server slot ${action} failed (${response.status}): ${body || response.statusText}`);
+      }
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  private assertCurrentServerGeneration(startGeneration: number): void {
+    if (this.serverGeneration !== startGeneration) {
+      throw new LocalLlamaRuntimeError("Bundled llama-server startup was superseded.");
+    }
+  }
+
+  private async withSlotLock<T>(operation: () => Promise<T>): Promise<T> {
+    const previous = this.slotLock;
+    let release: () => void = () => undefined;
+    const current = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    this.slotLock = previous.then(() => current);
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      release();
+    }
   }
 }
 
@@ -386,7 +547,8 @@ export function buildLlamaServerCommand(options: {
     "1",
     "--slots",
     "--slot-save-path",
-    options.slotSavePath ?? path.join(path.dirname(options.binaryPath), "slots")
+    options.slotSavePath ?? path.join(path.dirname(options.binaryPath), "slots"),
+    "--no-webui"
   ];
   if (options.nativeGptOss ?? isNativeGptOssReference(options.modelPath)) {
     args.push("--special");
@@ -461,7 +623,15 @@ async function readServerSentEvents(body: ReadableStream<Uint8Array>, onPayload:
 }
 
 function serverKeyMatches(left: ServerKey, right: ServerKey): boolean {
-  return left.modelPath === right.modelPath && left.nCtx === right.nCtx && left.nGpuLayers === right.nGpuLayers;
+  return left.modelPath === right.modelPath && left.nCtx === right.nCtx && left.nGpuLayers === right.nGpuLayers && left.nativeGptOss === right.nativeGptOss;
+}
+
+function normalizeSlotCacheKey(value: string | undefined): string {
+  return value?.trim() ?? "";
+}
+
+function slotCacheFilename(server: ActiveServer, cacheKey: string): string {
+  return `${createHash("sha256").update(JSON.stringify({ server: server.key, cacheKey })).digest("hex")}.slot`;
 }
 
 function extractText(value: unknown): string {
@@ -531,12 +701,8 @@ function renderGptOssPrompt(
   return parts.join("");
 }
 
-function gptOssRequestMaxTokens(
-  messages: ChatMessage[],
-  settings: ChatRuntimeSettings,
-  options: { builtinAgenticFramework: ChatBuiltinAgenticFramework; documentTitle: string }
-): number {
-  const promptChars = renderGptOssPrompt(messages, settings, options).length;
+function gptOssRequestMaxTokens(prompt: string, settings: ChatRuntimeSettings): number {
+  const promptChars = prompt.length;
   const estimatedPromptTokens = Math.ceil(promptChars / 3);
   const remainingContextTokens = Math.max(0, settings.nCtx - estimatedPromptTokens);
   const configuredMaxTokens = settings.maxTokens > 0 ? settings.maxTokens : remainingContextTokens;

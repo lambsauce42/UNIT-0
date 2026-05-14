@@ -4117,6 +4117,7 @@ function ChatSurface() {
       if (mounted) {
         setChatState(state);
         setExpandedProjectIds(new Set(state.appSettings.expandedProjectIds.length > 0 ? state.appSettings.expandedProjectIds : state.projects.map((project) => project.id)));
+        void window.unitApi.chat.warmLocalAi().catch(() => undefined);
       }
     }).catch((error: unknown) => setLocalError(errorMessage(error)));
     const removeListener = window.unitApi.chat.onStateChanged((state) => {
@@ -5415,6 +5416,7 @@ function ChatSurface() {
                 type="button"
                 onPointerDown={(event) => openChatMenu(event, { kind: "quality" })}
               >
+                <Brain size={14} />
                 <span>{reasoningButtonLabel}</span>
                 <ChevronRight className="chat-model-caret" size={12} />
               </button>
@@ -5733,7 +5735,7 @@ function ChatDropUpMenu({
               }
             }}
           >
-            <Settings size={14} />
+            <Brain size={14} />
             <span>{option.label}</span>
           </button>
         ))

@@ -883,6 +883,7 @@ export interface UnitApi {
     deleteSettingsPreset: (payload: ChatDeleteSettingsPresetPayload) => Promise<ChatState>;
     refreshCodexAccount: (payload?: ChatRefreshCodexAccountPayload) => Promise<ChatState>;
     refreshLocalModels: () => Promise<ChatState>;
+    warmLocalAi: () => Promise<ChatState>;
     cancelQueuedSubmission: (payload: ChatCancelQueuedSubmissionPayload) => Promise<ChatState>;
     moveThread: (payload: ChatMoveThreadPayload) => Promise<ChatState>;
     moveProject: (payload: ChatMoveProjectPayload) => Promise<ChatState>;

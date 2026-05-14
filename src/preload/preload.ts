@@ -146,6 +146,7 @@ const api: UnitApi = {
     deleteSettingsPreset: (payload: ChatDeleteSettingsPresetPayload) => ipcRenderer.invoke("chat:deleteSettingsPreset", payload),
     refreshCodexAccount: (payload?: ChatRefreshCodexAccountPayload) => ipcRenderer.invoke("chat:refreshCodexAccount", payload),
     refreshLocalModels: () => ipcRenderer.invoke("chat:refreshLocalModels"),
+    warmLocalAi: () => ipcRenderer.invoke("chat:warmLocalAi"),
     cancelQueuedSubmission: (payload: ChatCancelQueuedSubmissionPayload) => ipcRenderer.invoke("chat:cancelQueuedSubmission", payload),
     moveThread: (payload: ChatMoveThreadPayload) => ipcRenderer.invoke("chat:moveThread", payload),
     moveProject: (payload: ChatMoveProjectPayload) => ipcRenderer.invoke("chat:moveProject", payload),

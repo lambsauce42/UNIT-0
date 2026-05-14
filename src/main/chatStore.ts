@@ -132,7 +132,15 @@ type ChatDocumentChunkRow = ChatDocumentSearchEntry & {
   embedding?: number[];
 };
 
+type ResidentDocumentVectorIndex = {
+  documentIndexId: string;
+  updatedAt: string;
+  rows: ChatDocumentChunkRow[];
+  missingEmbeddings: boolean;
+};
+
 const MIN_DOCUMENT_VECTOR_SCORE = 0.6;
+const MAX_RESIDENT_DOCUMENT_VECTOR_INDEXES = 3;
 
 const DEFAULT_RUNTIME_SETTINGS: ChatRuntimeSettings = {
   nCtx: 32768,
@@ -253,6 +261,7 @@ const DEFAULT_SETTINGS_PRESETS: ChatSettingsPreset[] = [
 
 export class ChatStore {
   private readonly db: DatabaseSync;
+  private readonly documentVectorIndexes = new Map<string, ResidentDocumentVectorIndex>();
 
   constructor(private readonly dbPath: string) {
     fs.mkdirSync(path.dirname(dbPath), { recursive: true });
@@ -1033,17 +1042,16 @@ export class ChatStore {
     if (preset.providerMode === "builtin" && preset.builtinModelId) {
       this.selectModel(preset.builtinModelId);
     }
+    const { permissionMode: _permissionMode, ...runtimeSettingsWithoutAccess } = preset.runtimeSettings;
     this.updateThreadSettings(thread.id, {
       providerMode: preset.providerMode,
       selectedSettingsPresetId: preset.id,
       builtinModelId: preset.builtinModelId,
-      runtimeSettings: preset.runtimeSettings,
+      runtimeSettings: runtimeSettingsWithoutAccess,
       builtinAgenticFramework: preset.builtinAgenticFramework,
       documentAnalysisEmbeddingModelPath: preset.documentAnalysisEmbeddingModelPath,
       codexModelId: preset.codexModelId || defaultCodexModelId(),
-      codexReasoningEffort: preset.codexReasoningEffort,
-      permissionMode: preset.runtimeSettings.permissionMode,
-      codexApprovalMode: codexApprovalModeForAccessMode(preset.runtimeSettings.permissionMode)
+      codexReasoningEffort: preset.codexReasoningEffort
     });
   }
 
@@ -1117,7 +1125,7 @@ export class ChatStore {
     if (!normalizedSourcePath) {
       throw new Error("Document index requires a source path.");
     }
-    const sourcePaths = normalizedSourcePath.split(/\r?\n/g).map((item) => item.trim()).filter(Boolean);
+    const sourcePaths = normalizeDocumentSourcePaths(normalizedSourcePath);
     for (const sourceItem of sourcePaths) {
       if (!fs.existsSync(sourceItem)) {
         throw new Error(`Document source does not exist: ${sourceItem}`);
@@ -1157,7 +1165,7 @@ export class ChatStore {
     if (!normalizedSourcePath) {
       throw new Error("Document index requires a source path.");
     }
-    const sourcePaths = normalizedSourcePath.split(/\r?\n/g).map((item) => item.trim()).filter(Boolean);
+    const sourcePaths = normalizeDocumentSourcePaths(normalizedSourcePath);
     for (const sourceItem of sourcePaths) {
       if (!fs.existsSync(sourceItem)) {
         throw new Error(`Document source does not exist: ${sourceItem}`);
@@ -1168,21 +1176,48 @@ export class ChatStore {
       throw new Error("Document index requires a title.");
     }
     const now = timestamp();
-    this.db
-      .prepare(`UPDATE chat_document_indexes
-        SET title = ?, source_path = ?, embedding_model_path = ?, state = ?, progress = ?, message = ?, updated_at = ?
-        WHERE id = ?`)
-      .run(normalizedTitle, normalizedSourcePath, embeddingModelPath.trim(), "building", 0, "Queued", now, current.id);
-    this.db.prepare("DELETE FROM chat_document_index_chunks WHERE document_index_id = ?").run(current.id);
-    this.db.prepare("UPDATE chat_projects SET updated_at = ? WHERE id = ?").run(now, current.projectId);
+    const normalizedEmbeddingModelPath = embeddingModelPath.trim();
+    const embeddingModelChanged = normalizedEmbeddingModelPath !== current.embeddingModelPath.trim();
+    const indexedSourcePaths = this.documentIndexIndexedSourcePaths(current.id);
+    const indexedSourceKeys = new Set(indexedSourcePaths.map(documentSourcePathKey));
+    const nextSourceKeys = new Set(sourcePaths.map(documentSourcePathKey));
+    const removedIndexedSourcePaths = indexedSourcePaths.filter((indexedSourcePath) => !nextSourceKeys.has(documentSourcePathKey(indexedSourcePath)));
+    const hasNewSourcePaths = sourcePaths.some((sourceItem) => !indexedSourceKeys.has(documentSourcePathKey(sourceItem)));
+    const nextState = embeddingModelChanged || hasNewSourcePaths ? "building" : current.state;
+    const nextProgress = embeddingModelChanged || hasNewSourcePaths ? 0 : current.progress;
+    const nextMessage = embeddingModelChanged || hasNewSourcePaths ? "Queued" : current.message;
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db
+        .prepare(`UPDATE chat_document_indexes
+          SET title = ?, source_path = ?, embedding_model_path = ?, state = ?, progress = ?, message = ?, updated_at = ?
+          WHERE id = ?`)
+        .run(normalizedTitle, normalizedSourcePath, normalizedEmbeddingModelPath, nextState, nextProgress, nextMessage, now, current.id);
+      if (embeddingModelChanged) {
+        this.db.prepare("DELETE FROM chat_document_index_chunks WHERE document_index_id = ?").run(current.id);
+      } else if (removedIndexedSourcePaths.length > 0) {
+        const deleteRemovedChunks = this.db.prepare("DELETE FROM chat_document_index_chunks WHERE document_index_id = ? AND source_path = ?");
+        for (const removedSourcePath of removedIndexedSourcePaths) {
+          deleteRemovedChunks.run(current.id, removedSourcePath);
+        }
+      }
+      this.db.prepare("UPDATE chat_projects SET updated_at = ? WHERE id = ?").run(now, current.projectId);
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+    if (embeddingModelChanged || removedIndexedSourcePaths.length > 0 || hasNewSourcePaths) {
+      this.documentVectorIndexes.delete(current.id);
+    }
     return {
       ...current,
       title: normalizedTitle,
       sourcePath: normalizedSourcePath,
-      embeddingModelPath: embeddingModelPath.trim(),
-      state: "building",
-      progress: 0,
-      message: "Queued",
+      embeddingModelPath: normalizedEmbeddingModelPath,
+      state: nextState,
+      progress: nextProgress,
+      message: nextMessage,
       updatedAt: now
     };
   }
@@ -1199,6 +1234,7 @@ export class ChatStore {
       this.db.prepare("DELETE FROM chat_document_indexes WHERE id = ?").run(current.id);
       this.db.prepare("UPDATE chat_projects SET updated_at = ? WHERE id = ?").run(now, current.projectId);
       this.db.exec("COMMIT");
+      this.documentVectorIndexes.delete(current.id);
     } catch (error) {
       this.db.exec("ROLLBACK");
       throw error;
@@ -1263,10 +1299,59 @@ export class ChatStore {
         insert.run(chunk.chunkId, documentIndexId, chunk.sourceTitle, chunk.sourcePath, chunk.pageStart, chunk.pageEnd, chunk.text, chunk.tokenCount, ordinal, chunk.embedding ? JSON.stringify(normalizeEmbedding(chunk.embedding)) : null);
       });
       this.db.exec("COMMIT");
+      this.documentVectorIndexes.delete(documentIndexId);
     } catch (error) {
       this.db.exec("ROLLBACK");
       throw error;
     }
+  }
+
+  appendDocumentIndexChunks(documentIndexId: string, chunks: ChatDocumentChunkInput[]): void {
+    const index = this.db.prepare("SELECT id FROM chat_document_indexes WHERE id = ?").get(documentIndexId) as { id: string } | undefined;
+    if (!index) {
+      throw new Error(`Document index does not exist: ${documentIndexId}`);
+    }
+    if (chunks.length === 0) {
+      return;
+    }
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const nextOrdinal = this.nextDocumentIndexChunkOrdinal(documentIndexId);
+      const insert = this.db.prepare(
+        `INSERT INTO chat_document_index_chunks
+          (id, document_index_id, source_title, source_path, page_start, page_end, text, token_count, ordinal, embedding_json)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      );
+      chunks.forEach((chunk, index) => {
+        insert.run(chunk.chunkId, documentIndexId, chunk.sourceTitle, chunk.sourcePath, chunk.pageStart, chunk.pageEnd, chunk.text, chunk.tokenCount, nextOrdinal + index, chunk.embedding ? JSON.stringify(normalizeEmbedding(chunk.embedding)) : null);
+      });
+      this.db.exec("COMMIT");
+      this.documentVectorIndexes.delete(documentIndexId);
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  documentIndexUnindexedSourcePaths(documentIndexId: string): string[] {
+    const index = this.documentIndex(documentIndexId);
+    if (!index) {
+      throw new Error(`Document index does not exist: ${documentIndexId}`);
+    }
+    const indexedSourceKeys = new Set(this.documentIndexIndexedSourcePaths(documentIndexId).map(documentSourcePathKey));
+    return normalizeDocumentSourcePaths(index.sourcePath).filter((sourcePath) => !indexedSourceKeys.has(documentSourcePathKey(sourcePath)));
+  }
+
+  nextDocumentIndexChunkOrdinal(documentIndexId: string): number {
+    const row = this.db.prepare("SELECT COALESCE(MAX(ordinal) + 1, 0) AS next_ordinal FROM chat_document_index_chunks WHERE document_index_id = ?")
+      .get(documentIndexId) as { next_ordinal: number } | undefined;
+    return Math.max(0, Number(row?.next_ordinal ?? 0));
+  }
+
+  documentIndexChunkCount(documentIndexId: string): number {
+    const row = this.db.prepare("SELECT COUNT(*) AS count FROM chat_document_index_chunks WHERE document_index_id = ?")
+      .get(documentIndexId) as { count: number } | undefined;
+    return Math.max(0, Number(row?.count ?? 0));
   }
 
   documentIndex(documentIndexId: string): ChatDocumentIndex | undefined {
@@ -1289,19 +1374,27 @@ export class ChatStore {
       throw new Error("Selected document index is not ready yet.");
     }
     const normalizedQuery = normalizeEmbedding(queryEmbedding);
-    const rows = this.documentIndexChunks(documentIndexId);
-    const missingEmbeddings = rows.some((row) => !row.embedding);
-    if (rows.length === 0 || missingEmbeddings) {
+    const vectorIndex = this.documentVectorIndex(documentIndexId, index.updatedAt);
+    if (vectorIndex.rows.length === 0 || vectorIndex.missingEmbeddings) {
       throw new Error("Selected document index does not contain vector embeddings. Rebuild the document group.");
     }
     let usedTokens = 0;
-    return rows
-      .map((row) => ({ row, score: cosineSimilarity(normalizedQuery, row.embedding ?? []) }))
-      .filter((item) => item.score >= MIN_DOCUMENT_VECTOR_SCORE)
-      .sort((a, b) => b.score - a.score || a.row.ordinalStart - b.row.ordinalStart)
-      .slice(0, Math.max(1, topK))
+    const candidates: Array<{ row: ChatDocumentChunkRow; score: number }> = [];
+    const boundedTopK = Math.max(1, topK);
+    for (const row of vectorIndex.rows) {
+      const score = cosineSimilarity(normalizedQuery, row.embedding ?? []);
+      if (score < MIN_DOCUMENT_VECTOR_SCORE) {
+        continue;
+      }
+      candidates.push({ row, score });
+      candidates.sort((a, b) => b.score - a.score || a.row.ordinalStart - b.row.ordinalStart);
+      if (candidates.length > boundedTopK) {
+        candidates.pop();
+      }
+    }
+    return candidates
       .filter((item) => {
-        if (usedTokens >= budgetTokens) {
+        if (usedTokens >= budgetTokens || usedTokens + item.row.tokenCount > budgetTokens) {
           return false;
         }
         usedTokens += item.row.tokenCount;
@@ -1314,7 +1407,7 @@ export class ChatStore {
         sourceTitle: item.row.sourceTitle,
         sourcePath: item.row.sourcePath,
         sectionLabel: item.row.sectionLabel ?? `page ${item.row.pageStart}${item.row.pageEnd !== item.row.pageStart ? `-${item.row.pageEnd}` : ""}`,
-        candidateCount: rows.length,
+        candidateCount: vectorIndex.rows.length,
         truncated: usedTokens >= budgetTokens,
         pageStart: item.row.pageStart,
         pageEnd: item.row.pageEnd,
@@ -1335,7 +1428,11 @@ export class ChatStore {
   ): ChatDocumentSearchEntry[] {
     const drop = new Set(dropResultIds.map((id) => id.trim()).filter(Boolean));
     const expansionById = new Map(expand.map((item) => [item.resultId, item]));
-    const rows = this.documentIndexChunks(documentIndexId);
+    const index = this.documentIndex(documentIndexId);
+    if (!index) {
+      throw new Error("Selected document index was not found.");
+    }
+    const rows = this.documentVectorIndex(documentIndexId, index.updatedAt).rows;
     let usedTokens = 0;
     const expanded: ChatDocumentSearchEntry[] = [];
     for (const result of results) {
@@ -1350,6 +1447,9 @@ export class ChatStore {
         continue;
       }
       const tokenCount = group.reduce((total, row) => total + row.tokenCount, 0);
+      if (usedTokens + tokenCount > budgetTokens) {
+        continue;
+      }
       usedTokens += tokenCount;
       expanded.push({
         ...result,
@@ -1401,6 +1501,41 @@ export class ChatStore {
       ordinalEnd: row.ordinal,
       embedding: parseEmbeddingJson(row.embedding_json)
     }));
+  }
+
+  private documentIndexIndexedSourcePaths(documentIndexId: string): string[] {
+    const rows = this.db.prepare(
+      `SELECT source_path FROM chat_document_index_chunks
+       WHERE document_index_id = ? GROUP BY source_path ORDER BY MIN(ordinal)`
+    ).all(documentIndexId) as Array<{ source_path: string }>;
+    return rows.map((row) => row.source_path);
+  }
+
+  private documentVectorIndex(documentIndexId: string, updatedAt: string): ResidentDocumentVectorIndex {
+    const cached = this.documentVectorIndexes.get(documentIndexId);
+    if (cached && cached.updatedAt === updatedAt) {
+      return cached;
+    }
+    const rows = this.documentIndexChunks(documentIndexId);
+    const vectorIndex: ResidentDocumentVectorIndex = {
+      documentIndexId,
+      updatedAt,
+      rows,
+      missingEmbeddings: rows.some((row) => !row.embedding)
+    };
+    this.documentVectorIndexes.set(documentIndexId, vectorIndex);
+    this.evictResidentDocumentVectorIndexes();
+    return vectorIndex;
+  }
+
+  private evictResidentDocumentVectorIndexes(): void {
+    while (this.documentVectorIndexes.size > MAX_RESIDENT_DOCUMENT_VECTOR_INDEXES) {
+      const oldestKey = this.documentVectorIndexes.keys().next().value as string | undefined;
+      if (!oldestKey) {
+        return;
+      }
+      this.documentVectorIndexes.delete(oldestKey);
+    }
   }
 
   selectDocumentIndex(threadId: string, documentIndexId: string): void {
@@ -2610,6 +2745,14 @@ function documentIndexFromRow(row: ChatDocumentIndexRow): ChatDocumentIndex {
   };
 }
 
+function normalizeDocumentSourcePaths(sourcePath: string): string[] {
+  return sourcePath.split(/\r?\n/g).map((item) => item.trim()).filter(Boolean);
+}
+
+function documentSourcePathKey(sourcePath: string): string {
+  return path.resolve(sourcePath).toLocaleLowerCase();
+}
+
 function normalizeEmbedding(vector: number[]): number[] {
   let norm = 0;
   for (const value of vector) {
@@ -2656,10 +2799,6 @@ function normalizeCodexApprovalMode(value: unknown, fallback: ChatCodexApprovalM
     return "never";
   }
   return value === "default" || value === "on-request" || value === "on-failure" || value === "untrusted" || value === "never" ? value : fallback;
-}
-
-function codexApprovalModeForAccessMode(value: ChatPermissionMode): ChatCodexApprovalMode {
-  return value === "full_access" ? "never" : "default";
 }
 
 function normalizeActionButtons(value: ChatActionButton[]): ChatActionButton[] {

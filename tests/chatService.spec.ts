@@ -18,16 +18,27 @@ function makeService() {
 }
 
 class TestEmbeddingRuntime implements DocumentEmbeddingRuntime {
-  async embedDocuments(options: { texts: string[]; onProgress?: (completed: number, total: number) => void }): Promise<number[][]> {
+  async embedDocuments(options: { modelPath: string; texts: string[]; nCtx: number; nGpuLayers: number; onProgress?: (completed: number, total: number) => void }): Promise<number[][]> {
     options.onProgress?.(options.texts.length, options.texts.length);
     return options.texts.map((text) => testEmbeddingForText(text));
   }
 
-  async embedQuery(options: { text: string }): Promise<number[]> {
+  async embedQuery(options: { modelPath: string; text: string; nCtx: number; nGpuLayers: number }): Promise<number[]> {
     return testEmbeddingForText(options.text);
   }
 
+  async warm(_options: { modelPath: string; nCtx: number; nGpuLayers: number; shouldCancel?: () => boolean }): Promise<void> {}
+
   close(): void {}
+}
+
+class RecordingEmbeddingRuntime extends TestEmbeddingRuntime {
+  readonly documentTextBatches: string[][] = [];
+
+  override async embedDocuments(options: { modelPath: string; texts: string[]; nCtx: number; nGpuLayers: number; onProgress?: (completed: number, total: number) => void }): Promise<number[][]> {
+    this.documentTextBatches.push([...options.texts]);
+    return super.embedDocuments(options);
+  }
 }
 
 function testEmbeddingForText(text: string): number[] {
@@ -1025,6 +1036,73 @@ test("surfaces legacy document indexes without vector embeddings on the assistan
       message: "Selected document index does not contain vector embeddings. Rebuild the document group.",
       code: "document_analysis_failed"
     });
+  } finally {
+    service.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("renames document groups without reindexing and embeds only new documents", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-doc-incremental-index-test-"));
+  const store = new ChatStore(path.join(dir, "chat.sqlite"));
+  const embeddingRuntime = new RecordingEmbeddingRuntime();
+  const service = new ChatService(
+    store,
+    new LocalLlamaRuntime(),
+    new RemoteHostRuntime(),
+    new MockCodexRuntime(),
+    () => undefined,
+    embeddingRuntime
+  );
+  try {
+    const firstSourcePath = path.join(dir, "alpha.txt");
+    const secondSourcePath = path.join(dir, "beta.txt");
+    const modelPath = path.join(dir, "model.gguf");
+    const embeddingPath = path.join(dir, "embed.gguf");
+    fs.writeFileSync(firstSourcePath, "alpha first paragraph");
+    fs.writeFileSync(secondSourcePath, "beta second paragraph");
+    fs.writeFileSync(modelPath, "");
+    fs.writeFileSync(embeddingPath, "");
+    let state = store.loadState();
+    store.addLocalModel(modelPath);
+    state = store.loadState();
+    store.updateThreadSettings(state.selectedThreadId, {
+      builtinModelId: state.models[0].id,
+      builtinAgenticFramework: "document_analysis",
+      documentAnalysisEmbeddingModelPath: embeddingPath
+    });
+
+    state = await service.createDocumentIndex({
+      projectId: state.selectedProjectId,
+      title: "Knowledge",
+      sourcePath: firstSourcePath
+    });
+    const documentIndexId = state.documentIndexes.find((index) => index.title === "Knowledge")?.id ?? "";
+    await expect.poll(() => service.state().documentIndexes.find((index) => index.id === documentIndexId)?.state).toBe("ready");
+    expect(embeddingRuntime.documentTextBatches).toEqual([["alpha first paragraph"]]);
+
+    await service.updateDocumentIndex({
+      documentIndexId,
+      title: "Renamed Knowledge",
+      sourcePath: firstSourcePath
+    });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(service.state().documentIndexes.find((index) => index.id === documentIndexId)).toMatchObject({
+      title: "Renamed Knowledge",
+      state: "ready"
+    });
+    expect(embeddingRuntime.documentTextBatches).toEqual([["alpha first paragraph"]]);
+
+    await service.updateDocumentIndex({
+      documentIndexId,
+      title: "Renamed Knowledge",
+      sourcePath: `${firstSourcePath}\n${secondSourcePath}`
+    });
+    await expect.poll(() => service.state().documentIndexes.find((index) => index.id === documentIndexId)?.state).toBe("ready");
+    expect(embeddingRuntime.documentTextBatches).toEqual([
+      ["alpha first paragraph"],
+      ["beta second paragraph"]
+    ]);
   } finally {
     service.close();
     fs.rmSync(dir, { recursive: true, force: true });

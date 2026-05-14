@@ -4568,6 +4568,12 @@ button {
   white-space: nowrap;
 }
 
+.chat-dropup button > span:not(.chat-document-index-menu-copy),
+.chat-document-index-menu-title > span:first-child,
+.chat-document-index-menu-status {
+  transform: translateY(-1px);
+}
+
 .chat-dropup button .chat-document-index-menu-copy,
 .chat-dropup button .chat-document-index-menu-title,
 .chat-dropup button .chat-document-index-menu-status,

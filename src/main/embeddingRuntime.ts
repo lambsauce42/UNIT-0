@@ -19,11 +19,16 @@ type ActiveEmbeddingServer = {
 export interface DocumentEmbeddingRuntime {
   embedDocuments(options: { modelPath: string; texts: string[]; nCtx: number; nGpuLayers: number; onProgress?: (completed: number, total: number) => void }): Promise<number[][]>;
   embedQuery(options: { modelPath: string; text: string; nCtx: number; nGpuLayers: number }): Promise<number[]>;
+  warm(options: { modelPath: string; nCtx: number; nGpuLayers: number; shouldCancel?: () => boolean }): Promise<void>;
   close(): void;
 }
 
 export class LocalEmbeddingRuntime implements DocumentEmbeddingRuntime {
   private activeServer: ActiveEmbeddingServer | null = null;
+  private pendingServer: Promise<ActiveEmbeddingServer> | null = null;
+  private pendingServerKey: EmbeddingServerKey | null = null;
+  private startingProcess: ChildProcess | null = null;
+  private serverGeneration = 0;
   private readonly startupTimeoutMs: number;
   private readonly fetchImpl: typeof fetch;
   private readonly spawnImpl: typeof spawn;
@@ -37,7 +42,7 @@ export class LocalEmbeddingRuntime implements DocumentEmbeddingRuntime {
   async embedDocuments(options: { modelPath: string; texts: string[]; nCtx: number; nGpuLayers: number; onProgress?: (completed: number, total: number) => void }): Promise<number[][]> {
     const inputs = options.texts.map((text) => embeddingInput(options.modelPath, "document", text));
     const embeddings: number[][] = [];
-    const batchSize = 1;
+    const batchSize = 16;
     for (let offset = 0; offset < inputs.length; offset += batchSize) {
       const batch = inputs.slice(offset, offset + batchSize);
       embeddings.push(...await this.embedBatch({ ...options, inputs: batch }));
@@ -56,11 +61,28 @@ export class LocalEmbeddingRuntime implements DocumentEmbeddingRuntime {
     return embedding;
   }
 
+  async warm(options: { modelPath: string; nCtx: number; nGpuLayers: number; shouldCancel?: () => boolean }): Promise<void> {
+    if (options.shouldCancel?.()) {
+      return;
+    }
+    await this.ensureServer(options.modelPath, options.nCtx, options.nGpuLayers);
+    if (options.shouldCancel?.()) {
+      return;
+    }
+  }
+
   close(): void {
+    this.serverGeneration += 1;
+    if (this.startingProcess && this.startingProcess.exitCode === null) {
+      this.startingProcess.kill();
+    }
+    this.startingProcess = null;
     if (this.activeServer && this.activeServer.process.exitCode === null) {
       this.activeServer.process.kill();
     }
     this.activeServer = null;
+    this.pendingServer = null;
+    this.pendingServerKey = null;
   }
 
   private async embedBatch(options: { modelPath: string; inputs: string[]; nCtx: number; nGpuLayers: number }): Promise<number[][]> {
@@ -99,43 +121,104 @@ export class LocalEmbeddingRuntime implements DocumentEmbeddingRuntime {
     if (this.activeServer && embeddingServerKeyMatches(this.activeServer.key, key) && this.activeServer.process.exitCode === null) {
       return this.activeServer;
     }
+    if (this.pendingServer && this.pendingServerKey && embeddingServerKeyMatches(this.pendingServerKey, key)) {
+      return this.pendingServer;
+    }
     this.close();
+    const startGeneration = ++this.serverGeneration;
+    this.pendingServerKey = key;
+    this.pendingServer = this.startServer(key, startGeneration);
+    try {
+      this.activeServer = await this.pendingServer;
+      return this.activeServer;
+    } finally {
+      if (this.pendingServerKey && embeddingServerKeyMatches(this.pendingServerKey, key)) {
+        this.pendingServer = null;
+        this.pendingServerKey = null;
+      }
+    }
+  }
+
+  private async startServer(key: EmbeddingServerKey, startGeneration: number): Promise<ActiveEmbeddingServer> {
     const binaryPath = this.options.binaryPath ? path.resolve(this.options.binaryPath) : resolveBundledLlamaServerBinary(this.options.runtimeRoot);
     if (!binaryPath) {
       throw new Error("Bundled llama-server binary was not found. Expected runtime/llama.cpp/llama-server(.exe).");
     }
     const port = await reserveLocalPort();
-    const command = buildEmbeddingServerCommand({ binaryPath, port, modelPath, nCtx, nGpuLayers });
+    this.assertCurrentServerGeneration(startGeneration);
+    const command = buildEmbeddingServerCommand({ binaryPath, port, modelPath: key.modelPath, nCtx: key.nCtx, nGpuLayers: key.nGpuLayers });
     const process = this.spawnImpl(command.command, command.args, {
       cwd: command.cwd,
       windowsHide: true,
       stdio: "ignore"
     } as SpawnOptions);
+    this.startingProcess = process;
+    if (this.serverGeneration !== startGeneration) {
+      if (process.exitCode === null) {
+        process.kill();
+      }
+      throw new Error("Embedding llama-server startup was superseded.");
+    }
     const baseUrl = `http://127.0.0.1:${port}`;
-    await this.waitUntilReady(process, baseUrl, binaryPath);
-    this.activeServer = { key, baseUrl, process };
-    return this.activeServer;
+    await this.waitUntilReady(process, baseUrl, binaryPath, startGeneration);
+    if (this.startingProcess === process) {
+      this.startingProcess = null;
+    }
+    if (this.serverGeneration !== startGeneration) {
+      if (process.exitCode === null) {
+        process.kill();
+      }
+      throw new Error("Embedding llama-server startup was superseded.");
+    }
+    return { key, baseUrl, process };
   }
 
-  private async waitUntilReady(process: ChildProcess, baseUrl: string, binaryPath: string): Promise<void> {
+  private async waitUntilReady(process: ChildProcess, baseUrl: string, binaryPath: string, startGeneration: number): Promise<void> {
     const deadline = Date.now() + this.startupTimeoutMs;
     let lastError = "server did not become ready";
+    let pollDelayMs = 100;
     while (Date.now() < deadline) {
       if (process.exitCode !== null) {
         throw new Error(`Embedding llama-server exited during startup with code ${process.exitCode}. Binary: ${binaryPath}`);
       }
+      this.assertCurrentServerGeneration(startGeneration);
       try {
-        const response = await this.fetchImpl(`${baseUrl}/health`);
+        const response = await this.fetchWithTimeout(`${baseUrl}/health`, 2_000);
         if (response.ok) {
+          const body = await response.json().catch(() => ({})) as { status?: unknown };
+          const status = String(body.status ?? "ok").toLowerCase();
+          if (status && status !== "ok") {
+            lastError = `health status ${status}`;
+            await sleep(pollDelayMs);
+            pollDelayMs = Math.min(500, Math.round(pollDelayMs * 1.35));
+            continue;
+          }
           return;
         }
         lastError = `${baseUrl}/health returned ${response.status}`;
       } catch (error) {
         lastError = error instanceof Error ? error.message : String(error);
       }
-      await sleep(500);
+      await sleep(pollDelayMs);
+      pollDelayMs = Math.min(500, Math.round(pollDelayMs * 1.35));
     }
     throw new Error(`Embedding llama-server startup timed out: ${lastError}`);
+  }
+
+  private async fetchWithTimeout(url: string, timeoutMs: number): Promise<Response> {
+    const abortController = new AbortController();
+    const timer = setTimeout(() => abortController.abort(), timeoutMs);
+    try {
+      return await this.fetchImpl(url, { signal: abortController.signal });
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  private assertCurrentServerGeneration(startGeneration: number): void {
+    if (this.serverGeneration !== startGeneration) {
+      throw new Error("Embedding llama-server startup was superseded.");
+    }
   }
 }
 

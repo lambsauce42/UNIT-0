@@ -44,7 +44,8 @@ test("builds a llama-server command for one local slot", () => {
     "1",
     "--slots",
     "--slot-save-path",
-    "C:\\runtime\\slots"
+    "C:\\runtime\\slots",
+    "--no-webui"
   ]);
 });
 
