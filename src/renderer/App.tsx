@@ -113,7 +113,6 @@ import type {
   RectLike,
   TabHostState,
   TemplateCellAssignment,
-  TileResizeMode,
   UnitState,
   Workspace,
   WorkspaceLayoutNode,
@@ -262,7 +261,6 @@ type ResizeDragState = {
   target: ResizeTarget;
   geometry: CanonicalLayoutGeometry;
   layout: WorkspaceLayoutNode;
-  resizeMode: TileResizeMode;
 };
 
 type ResizeSnapGuide = {
@@ -387,14 +385,7 @@ export function App() {
   );
 }
 
-function SettingsDialog({ state, onClose }: { state: UnitState; onClose: () => void }) {
-  const [activeSection, setActiveSection] = useState<"tiling" | "about">("tiling");
-  const updateTileResizeMode = (tileResizeMode: TileResizeMode) => {
-    void window.unitApi.updateSettings({ settings: { tileResizeMode } }).catch((error) => {
-      console.error("Failed to update tiling settings", error);
-    });
-  };
-
+function SettingsDialog({ onClose }: { state: UnitState; onClose: () => void }) {
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
@@ -415,67 +406,13 @@ function SettingsDialog({ state, onClose }: { state: UnitState; onClose: () => v
           </button>
         </header>
         <div className="settings-body">
-          <nav className="settings-tabs" aria-label="Settings sections">
-            <button
-              className={activeSection === "tiling" ? "active" : ""}
-              type="button"
-              aria-current={activeSection === "tiling" ? "page" : undefined}
-              onClick={() => setActiveSection("tiling")}
-            >
-              Tiling
-            </button>
-            <button
-              className={activeSection === "about" ? "active" : ""}
-              type="button"
-              aria-current={activeSection === "about" ? "page" : undefined}
-              onClick={() => setActiveSection("about")}
-            >
-              About
-            </button>
-          </nav>
-          {activeSection === "tiling" ? (
-            <section className="settings-panel settings-form-panel" aria-label="Tiling">
-              <div className="settings-section">
-                <h3>Resize Behavior</h3>
-                <div className="settings-radio-list" role="radiogroup" aria-label="Tile resize behavior">
-                  <label>
-                    <input
-                      type="radio"
-                      name="tile-resize-mode"
-                      value="adjacent"
-                      checked={state.settings.tileResizeMode === "adjacent"}
-                      onChange={() => updateTileResizeMode("adjacent")}
-                    />
-                    <span>
-                      <strong>Adjacent tiles</strong>
-                      <small>Resize only the tiles touching the dragged edge.</small>
-                    </span>
-                  </label>
-                  <label>
-                    <input
-                      type="radio"
-                      name="tile-resize-mode"
-                      value="cascade"
-                      checked={state.settings.tileResizeMode === "cascade"}
-                      onChange={() => updateTileResizeMode("cascade")}
-                    />
-                    <span>
-                      <strong>Cascading tiles</strong>
-                      <small>Share the resize proportionally through connected tiles in the drag direction.</small>
-                    </span>
-                  </label>
-                </div>
-              </div>
-            </section>
-          ) : (
-            <section className="settings-panel" aria-label="About">
-              <div className="about-product">
-                <strong>UNIT-0</strong>
-                <span>Version 0.1.0</span>
-              </div>
-              <pre className="license-notices">{THIRD_PARTY_LICENSES}</pre>
-            </section>
-          )}
+          <section className="settings-panel" aria-label="About">
+            <div className="about-product">
+              <strong>UNIT-0</strong>
+              <span>Version 0.1.0</span>
+            </div>
+            <pre className="license-notices">{THIRD_PARTY_LICENSES}</pre>
+          </section>
         </div>
       </section>
     </div>
@@ -1526,10 +1463,8 @@ function WorkspaceSurface({ state, windowId, workspace }: { state: UnitState; wi
   const appletDragRef = useRef<AppletDragState | null>(null);
   const resizeDragRef = useRef<ResizeDragState | null>(null);
   const resizePublishRafRef = useRef<number | null>(null);
-  const pendingResizeRatiosRef = useRef<Record<string, number> | null>(null);
   const pendingResizeLayoutRef = useRef<WorkspaceLayoutNode | null>(null);
   const [layoutSize, setLayoutSize] = useState<LayoutSize>({ width: 0, height: 0 });
-  const [ratioOverrides, setRatioOverrides] = useState<Record<string, number>>({});
   const [layoutOverride, setLayoutOverride] = useState<WorkspaceLayoutNode | null>(null);
   const [hoverResizeTarget, setHoverResizeTarget] = useState<ResizeTarget | null>(null);
   const [resizeDrag, setResizeDrag] = useState<ResizeDragState | null>(null);
@@ -1568,7 +1503,6 @@ function WorkspaceSurface({ state, windowId, workspace }: { state: UnitState; wi
     ),
     [state.appletSessions, workspace.applets]
   );
-  const ratioOverrideKey = JSON.stringify(ratioOverrides);
   const workspaceAppletIdList = useMemo(() => workspace.applets.map((instance) => instance.id), [workspace.applets]);
   const workspaceShelfAppletIds = useMemo(() => new Set(workspace.shelfAppletIds), [workspace.shelfAppletIds]);
   const sidebarAppletIds = workspace.shelfAppletIds.slice(0, 5);
@@ -1594,8 +1528,7 @@ function WorkspaceSurface({ state, windowId, workspace }: { state: UnitState; wi
       visibleWorkspaceAppletIds: visibleWorkspaceAppletIdList,
       shelfAppletIds: workspace.shelfAppletIds,
       workspaceLayoutAppletIds: workspace.layout ? collectLayoutAppletIds(workspace.layout) : [],
-      overrideLayoutAppletIds: layoutOverrideAppletIds,
-      ratioOverrideIds: Object.keys(ratioOverrides)
+      overrideLayoutAppletIds: layoutOverrideAppletIds
     });
   }
   const activeLayoutOverride = layoutOverrideMatchesWorkspace ? layoutOverride : null;
@@ -1604,8 +1537,8 @@ function WorkspaceSurface({ state, windowId, workspace }: { state: UnitState; wi
     [workspace.layout, workspaceShelfAppletIds]
   );
   const effectiveLayout = useMemo(
-    () => activeLayoutOverride ?? (visibleWorkspaceLayout ? applyRatioOverrides(visibleWorkspaceLayout, ratioOverrides) : null),
-    [activeLayoutOverride, visibleWorkspaceLayout, ratioOverrideKey]
+    () => activeLayoutOverride ?? visibleWorkspaceLayout,
+    [activeLayoutOverride, visibleWorkspaceLayout]
   );
   const layoutSource = activeLayoutOverride ? "override" : "workspace";
   const effectiveLayoutAppletIds = useMemo(
@@ -1620,8 +1553,7 @@ function WorkspaceSurface({ state, windowId, workspace }: { state: UnitState; wi
       missingAppletIds: missingEffectiveLayoutAppletIds,
       workspaceAppletIds: workspace.applets.map((instance) => instance.id),
       workspaceLayoutAppletIds: workspace.layout ? collectLayoutAppletIds(workspace.layout) : [],
-      overrideLayoutAppletIds: layoutOverride ? collectLayoutAppletIds(layoutOverride) : [],
-      ratioOverrideIds: Object.keys(ratioOverrides)
+      overrideLayoutAppletIds: layoutOverride ? collectLayoutAppletIds(layoutOverride) : []
     });
   }
   const layoutGeometry = useMemo(
@@ -1707,7 +1639,6 @@ function WorkspaceSurface({ state, windowId, workspace }: { state: UnitState; wi
   }, [sidebarAddMenuOpen]);
   useEffect(() => {
     if (!resizeDragRef.current) {
-      setRatioOverrides({});
       setLayoutOverride(null);
     }
   }, [workspace.id, workspace.layout]);
@@ -1732,29 +1663,8 @@ function WorkspaceSurface({ state, windowId, workspace }: { state: UnitState; wi
       y: Math.round(clientY - rect.top - WORKSPACE_SURFACE_PADDING)
     };
   }, []);
-  const publishResizeRatios = useCallback(
-    (ratios: Record<string, number>) => {
-      pendingResizeLayoutRef.current = null;
-      pendingResizeRatiosRef.current = ratios;
-      if (resizePublishRafRef.current !== null) {
-        return;
-      }
-      resizePublishRafRef.current = window.requestAnimationFrame(() => {
-        resizePublishRafRef.current = null;
-        const nextRatios = pendingResizeRatiosRef.current;
-        pendingResizeRatiosRef.current = null;
-        if (nextRatios && Object.keys(nextRatios).length > 0) {
-          void window.unitApi.workspaces
-            .updateLayoutRatios({ workspaceId: workspace.id, ratios: nextRatios })
-            .catch((error) => console.error("Failed to update layout ratios", error));
-        }
-      });
-    },
-    [workspace.id]
-  );
   const publishResizeLayout = useCallback(
     (layout: WorkspaceLayoutNode) => {
-      pendingResizeRatiosRef.current = null;
       pendingResizeLayoutRef.current = layout;
       if (resizePublishRafRef.current !== null) {
         return;
@@ -1777,20 +1687,12 @@ function WorkspaceSurface({ state, windowId, workspace }: { state: UnitState; wi
       window.cancelAnimationFrame(resizePublishRafRef.current);
       resizePublishRafRef.current = null;
     }
-    const nextRatios = pendingResizeRatiosRef.current;
     const nextLayout = pendingResizeLayoutRef.current;
-    pendingResizeRatiosRef.current = null;
     pendingResizeLayoutRef.current = null;
     if (nextLayout) {
       void window.unitApi.workspaces
         .replaceLayout({ workspaceId: workspace.id, layout: nextLayout })
         .catch((error) => console.error("Failed to replace workspace layout", error));
-      return;
-    }
-    if (nextRatios && Object.keys(nextRatios).length > 0) {
-      void window.unitApi.workspaces
-        .updateLayoutRatios({ workspaceId: workspace.id, ratios: nextRatios })
-        .catch((error) => console.error("Failed to update layout ratios", error));
     }
   }, [workspace.id]);
   const beginResizeDrag = useCallback(
@@ -1818,33 +1720,24 @@ function WorkspaceSurface({ state, windowId, workspace }: { state: UnitState; wi
         grabOffsetY: target.horizontal ? point.y - target.horizontal.center : 0,
         target,
         geometry: layoutGeometry,
-        layout: effectiveLayout,
-        resizeMode: state.settings.tileResizeMode
+        layout: effectiveLayout
       };
       resizeDragRef.current = nextDrag;
       setResizeDrag(nextDrag);
       setHoverResizeTarget(target);
     },
-    [effectiveLayout, layoutGeometry, localTilingPoint, state.settings.tileResizeMode]
+    [effectiveLayout, layoutGeometry, localTilingPoint]
   );
   useEffect(() => {
-    const onPointerMove = (event: PointerEvent) => {
-      const drag = resizeDragRef.current;
-      if (!drag || event.pointerId !== drag.pointerId) {
-        return;
-      }
-      const point = localTilingPoint(event.clientX, event.clientY);
-      if (!point) {
-        return;
-      }
+    const applyResizeDragAtPoint = (drag: ResizeDragState, point: { x: number; y: number }, altKey: boolean) => {
       const rawDelta = {
         x: point.x - drag.startX,
         y: point.y - drag.startY
       };
-      const snapTrace = traceResizeSnap(drag, rawDelta, event.altKey);
+      const snapTrace = traceResizeSnap(drag, rawDelta, altKey);
       const snapped = snapTrace.snapped;
-      const projected = projectResize(drag.geometry, drag.target, snapped, MIN_APPLET_SIZE, drag.resizeMode);
-      const structural = resizeTargetRequiresStructuralResize(drag.geometry, drag.target, drag.resizeMode);
+      const projected = projectResize(drag.geometry, drag.target, snapped, MIN_APPLET_SIZE);
+      const structural = resizeTargetRequiresStructuralResize(drag.geometry, drag.target, projected);
       if (structural) {
         const structuralDelta = clampStructuralResize(drag, projected.dx, projected.dy);
         setResizeSnapGuides(activeSnapGuides(drag.target, snapped.guides, structuralDelta.dx, structuralDelta.dy, snapped));
@@ -1862,22 +1755,34 @@ function WorkspaceSurface({ state, windowId, workspace }: { state: UnitState; wi
           structuralResizePrimaryCutDirection(drag.target)
         );
         setLayoutOverride(nextLayout);
-        setRatioOverrides({});
         publishResizeLayout(nextLayout);
         return;
       }
       setResizeSnapGuides(activeSnapGuides(drag.target, snapped.guides, projected.dx, projected.dy, snapped));
-      const nextRatios = drag.resizeMode === "cascade"
-        ? projected.ratios
-        : compensatedResizeRatios(drag, projected.ratios, projected.dx, projected.dy, layoutSize);
-      setRatioOverrides((current) => ({ ...current, ...nextRatios }));
-      setLayoutOverride(null);
-      publishResizeRatios(nextRatios);
+      const nextRatios = compensatedResizeRatios(drag, projected.ratios, projected.dx, projected.dy, layoutSize);
+      const nextLayout = applyRatioOverrides(drag.layout, nextRatios);
+      setLayoutOverride(nextLayout);
+      publishResizeLayout(nextLayout);
+    };
+    const onPointerMove = (event: PointerEvent) => {
+      const drag = resizeDragRef.current;
+      if (!drag || event.pointerId !== drag.pointerId) {
+        return;
+      }
+      const point = localTilingPoint(event.clientX, event.clientY);
+      if (!point) {
+        return;
+      }
+      applyResizeDragAtPoint(drag, point, event.altKey);
     };
     const finishDrag = (event: PointerEvent) => {
       const drag = resizeDragRef.current;
       if (!drag || event.pointerId !== drag.pointerId) {
         return;
+      }
+      const point = localTilingPoint(event.clientX, event.clientY);
+      if (point) {
+        applyResizeDragAtPoint(drag, point, event.altKey);
       }
       resizeDragRef.current = null;
       setResizeDrag(null);
@@ -1896,7 +1801,7 @@ function WorkspaceSurface({ state, windowId, workspace }: { state: UnitState; wi
         resizePublishRafRef.current = null;
       }
     };
-  }, [flushResizeRatios, layoutSize, localTilingPoint, publishResizeLayout, publishResizeRatios]);
+  }, [flushResizeRatios, layoutSize, localTilingPoint, publishResizeLayout]);
   const dropTargetFor = useCallback(
     (clientX: number, clientY: number, draggedInstanceId: string): AppletDropTarget | null => {
       const surface = mainStageRef.current;
@@ -2053,7 +1958,6 @@ function WorkspaceSurface({ state, windowId, workspace }: { state: UnitState; wi
       }
       const nextLayout = swapLayoutAppletInstances(workspace.layout, switchSourceInstanceId, targetInstanceId);
       setSwitchSourceInstanceId(null);
-      setRatioOverrides({});
       setLayoutOverride(nextLayout);
       void window.unitApi.workspaces
         .replaceLayout({ workspaceId: workspace.id, layout: nextLayout })
@@ -2656,26 +2560,6 @@ function traceResizeSnap(drag: ResizeDragState, delta: { x: number; y: number },
   return { snapped: { x, y, guides }, disabled: false, vertical, horizontal };
 }
 
-function snapResizeDelta(drag: ResizeDragState, delta: { x: number; y: number }): { x: number; y: number; guides: ResizeSnapGuide[] } {
-  return traceResizeSnap(drag, delta, false).snapped;
-}
-
-function snapGroupDelta(
-  geometry: CanonicalLayoutGeometry,
-  group: EdgeGroup,
-  delta: number,
-  grabOffset: number
-): { delta: number; guide: ResizeSnapGuide | null } {
-  const trace = traceGroupSnap(geometry, group, delta, grabOffset);
-  if (!trace.chosen) {
-    return { delta, guide: null };
-  }
-  return {
-    delta: trace.chosen.delta,
-    guide: fullWorkspaceSnapGuide(geometry, group, trace.chosen.center)
-  };
-}
-
 function traceGroupSnap(
   geometry: CanonicalLayoutGeometry,
   group: EdgeGroup,
@@ -2775,7 +2659,44 @@ function compensatedResizeRatios(
   if (drag.target.horizontal && dy !== 0) {
     addBranchCompensation(drag.geometry, previewGeometry, drag.target.horizontal, nextRatios);
   }
+  const compensatedGeometry = computeCanonicalLayout(applyRatioOverrides(drag.layout, nextRatios), layoutSize);
+  if (drag.target.vertical && dx !== 0) {
+    anchorCompensatedGroupDelta(compensatedGeometry, drag.target.vertical, dx, nextRatios);
+  }
+  if (drag.target.horizontal && dy !== 0) {
+    anchorCompensatedGroupDelta(compensatedGeometry, drag.target.horizontal, dy, nextRatios);
+  }
   return nextRatios;
+}
+
+function anchorCompensatedGroupDelta(
+  geometry: CanonicalLayoutGeometry,
+  snapshotGroup: EdgeGroup,
+  delta: number,
+  ratios: Record<string, number>
+): void {
+  const liveGroups = completedEdgeGroups(geometry.primitiveEdges, geometry.leaves);
+  const liveGroup = liveGroupForSnapshot(snapshotGroup, liveGroups);
+  if (!liveGroup) {
+    return;
+  }
+  const correction = snapshotGroup.center + delta - liveGroup.center;
+  if (correction === 0) {
+    return;
+  }
+  const target =
+    liveGroup.axis === "vertical"
+      ? { type: "edge" as const, vertical: liveGroup, horizontal: null }
+      : { type: "edge" as const, vertical: null, horizontal: liveGroup };
+  Object.assign(
+    ratios,
+    projectResize(
+      geometry,
+      target,
+      liveGroup.axis === "vertical" ? { x: correction, y: 0 } : { x: 0, y: correction },
+      MIN_APPLET_SIZE
+    ).ratios
+  );
 }
 
 function clampStructuralResize(drag: ResizeDragState, dx: number, dy: number): { dx: number; dy: number } {
@@ -3005,10 +2926,10 @@ function SplitterOverlay({
           onPointerDown={(event) => onBeginResizeDrag(event, { type: "junction", vertical, horizontal })}
           role="separator"
           style={{
-            left: vertical.center - (TILE_GUTTER_SIZE * 3) / 2,
-            top: horizontal.center - (TILE_GUTTER_SIZE * 3) / 2,
-            width: TILE_GUTTER_SIZE * 3,
-            height: TILE_GUTTER_SIZE * 3
+            left: vertical.center - TILE_GUTTER_SIZE / 2,
+            top: horizontal.center - TILE_GUTTER_SIZE / 2,
+            width: TILE_GUTTER_SIZE,
+            height: TILE_GUTTER_SIZE
           }}
         />
       ))}
@@ -3018,7 +2939,7 @@ function SplitterOverlay({
 
 function junctionTargets(verticalGroups: EdgeGroup[], horizontalGroups: EdgeGroup[]) {
   const targets = new Map<string, { vertical: EdgeGroup; horizontal: EdgeGroup }>();
-  const radius = (TILE_GUTTER_SIZE * 3) / 2;
+  const radius = TILE_GUTTER_SIZE / 2;
   for (const vertical of verticalGroups) {
     for (const horizontal of horizontalGroups) {
       if (

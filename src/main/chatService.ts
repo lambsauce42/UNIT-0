@@ -114,7 +114,7 @@ function upsertCodexTextTimelineBlock(
   blocks: ChatTimelineBlock[],
   eventType: Extract<CodexThreadEvent["type"], "item.started" | "item.updated" | "item.completed">,
   item: Extract<CodexThreadItem, { type: "agent_message" | "reasoning" }>,
-  options?: { timelineId?: string; text?: string }
+  options?: { timelineId?: string; text?: string; replace?: boolean }
 ): void {
   const kind = item.type === "agent_message" ? "assistant_message" : "reasoning";
   const id = options?.timelineId ?? item.id ?? `${kind}-${blocks.length}`;
@@ -123,7 +123,7 @@ function upsertCodexTextTimelineBlock(
   const incomingText = options?.text ?? item.text ?? "";
   const status = eventType === "item.completed" ? "completed" : eventType === "item.started" ? "started" : "updated";
   if (item.type === "reasoning") {
-    const sections = mergeCodexReasoningSections(prior?.kind === "reasoning" ? prior : null, item, incomingText, eventType);
+    const sections = options?.replace ? [] : mergeCodexReasoningSections(prior?.kind === "reasoning" ? prior : null, item, incomingText, eventType);
     const text = sections.length > 0
       ? sections.map((section) => section.text.trim()).filter(Boolean).join("\n\n")
       : incomingText;
@@ -143,7 +143,9 @@ function upsertCodexTextTimelineBlock(
     return;
   }
   const text = prior
-    ? eventType === "item.completed"
+    ? options?.replace
+      ? incomingText
+      : eventType === "item.completed"
       ? incomingText
         ? incomingText.startsWith(prior.text) ? incomingText : `${prior.text}${incomingText}`
         : prior.text
@@ -183,100 +185,35 @@ function completeOpenCodeAssistantBlocks(blocks: ChatTimelineBlock[]): void {
   }
 }
 
-function lastMapKey(map: Map<string, string>): string | undefined {
-  let last: string | undefined;
-  for (const key of map.keys()) {
-    last = key;
+function openCodeTimelineIdForDelta(blocks: ChatTimelineBlock[], kind: "assistant_message" | "reasoning", sourceId: string): string {
+  const last = blocks.at(-1);
+  if (last?.kind === kind && isOpenCodeTimelineSegmentId(last.id, sourceId)) {
+    return last.id;
   }
-  return last;
+  const hasPriorSegment = blocks.some((block) => block.kind === kind && isOpenCodeTimelineSegmentId(block.id, sourceId));
+  if (!hasPriorSegment) {
+    return sourceId;
+  }
+  let segment = 1;
+  while (blocks.some((block) => block.id === `${sourceId}:segment-${segment}` && block.kind === kind)) {
+    segment += 1;
+  }
+  return `${sourceId}:segment-${segment}`;
 }
 
-function removeDuplicateOpenCodeTextBlocks(blocks: ChatTimelineBlock[], kind: "assistant_message" | "reasoning"): void {
-  let sawFirst = false;
-  for (let index = 0; index < blocks.length; index += 1) {
-    if (blocks[index].kind !== kind) {
-      continue;
-    }
-    if (sawFirst) {
+function isOpenCodeTimelineSegmentId(id: string, sourceId: string): boolean {
+  return id === sourceId || id.startsWith(`${sourceId}:segment-`);
+}
+
+function prepareOpenCodeTimelineForReplace(blocks: ChatTimelineBlock[], kind: "assistant_message" | "reasoning", sourceId: string): string {
+  const first = blocks.find((block) => block.kind === kind && isOpenCodeTimelineSegmentId(block.id, sourceId))?.id ?? sourceId;
+  for (let index = blocks.length - 1; index >= 0; index -= 1) {
+    const block = blocks[index];
+    if (block.kind === kind && isOpenCodeTimelineSegmentId(block.id, sourceId) && block.id !== first) {
       blocks.splice(index, 1);
-      index -= 1;
-      continue;
-    }
-    sawFirst = true;
-  }
-}
-
-function moveOpenCodeReasoningBeforeAssistant(blocks: ChatTimelineBlock[]): void {
-  let assistantIndex = blocks.findIndex((block) => block.kind === "assistant_message");
-  if (assistantIndex < 0) {
-    return;
-  }
-  for (let index = assistantIndex + 1; index < blocks.length; index += 1) {
-    if (blocks[index].kind !== "reasoning") {
-      continue;
-    }
-    const [reasoningBlock] = blocks.splice(index, 1);
-    blocks.splice(assistantIndex, 0, reasoningBlock);
-    assistantIndex += 1;
-  }
-}
-
-function reconcileOpenCodeFinalSnapshotTimelineBlocks(
-  blocks: ChatTimelineBlock[],
-  content: string,
-  reasoning: string,
-  assistantTextById: Map<string, string>,
-  reasoningTextById: Map<string, string>
-): void {
-  if (reasoning.length > 0) {
-    const reasoningIndex = blocks.findIndex((block) => block.kind === "reasoning");
-    const priorReasoning = reasoningIndex >= 0 ? blocks[reasoningIndex] : null;
-    const reasoningBlock: Extract<ChatTimelineBlock, { kind: "reasoning" }> = {
-      kind: "reasoning",
-      id: priorReasoning?.id ?? lastMapKey(reasoningTextById) ?? "opencode-final-reasoning",
-      status: "completed",
-      text: reasoning,
-      initiallyExpanded: priorReasoning?.kind === "reasoning" ? priorReasoning.initiallyExpanded : true
-    };
-    if (reasoningIndex >= 0) {
-      blocks[reasoningIndex] = reasoningBlock;
-    } else {
-      const assistantIndex = blocks.findIndex((block) => block.kind === "assistant_message");
-      blocks.splice(assistantIndex >= 0 ? assistantIndex : blocks.length, 0, reasoningBlock);
-    }
-  } else {
-    for (let index = blocks.length - 1; index >= 0; index -= 1) {
-      if (blocks[index].kind === "reasoning") {
-        blocks.splice(index, 1);
-      }
     }
   }
-
-  if (content.length > 0) {
-    const assistantIndex = blocks.findIndex((block) => block.kind === "assistant_message");
-    const assistantBlock: Extract<ChatTimelineBlock, { kind: "assistant_message" }> = {
-      kind: "assistant_message",
-      id: assistantIndex >= 0 ? blocks[assistantIndex].id : lastMapKey(assistantTextById) ?? "opencode-final-assistant",
-      status: "completed",
-      text: content
-    };
-    if (assistantIndex >= 0) {
-      blocks[assistantIndex] = assistantBlock;
-    } else {
-      const reasoningIndex = blocks.findIndex((block) => block.kind === "reasoning");
-      blocks.splice(reasoningIndex >= 0 ? reasoningIndex + 1 : blocks.length, 0, assistantBlock);
-    }
-  } else {
-    for (let index = blocks.length - 1; index >= 0; index -= 1) {
-      if (blocks[index].kind === "assistant_message") {
-        blocks.splice(index, 1);
-      }
-    }
-  }
-
-  removeDuplicateOpenCodeTextBlocks(blocks, "reasoning");
-  removeDuplicateOpenCodeTextBlocks(blocks, "assistant_message");
-  moveOpenCodeReasoningBeforeAssistant(blocks);
+  return first;
 }
 
 function mergeCodexReasoningSections(
@@ -1471,6 +1408,9 @@ export class ChatService {
         }
         this.applyOpenCodeEvent(options.assistantMessageId, options.thread.id, event, timelineBlocks, assistantTextById, reasoningTextById);
       }
+      if (!options.runCancelled()) {
+        this.assertOpenCodeStreamProducedVisibleOutput(options.assistantMessageId);
+      }
       this.store.updateMessageStatus(options.assistantMessageId, options.runCancelled() ? "interrupted" : "complete");
       if (options.ownsActiveGeneration()) {
         this.generation = { status: "idle" };
@@ -1498,6 +1438,21 @@ export class ChatService {
     return this.store.loadState().messages.find((message) => message.id === messageId)?.content ?? "";
   }
 
+  private assertOpenCodeStreamProducedVisibleOutput(assistantMessageId: string): void {
+    const assistant = this.store.loadState().messages.find((message) => message.id === assistantMessageId);
+    const content = assistant?.content.trim() ?? "";
+    const reasoning = assistant?.reasoning?.trim() ?? "";
+    const hasStreamedTextTimeline = (assistant?.timelineBlocks ?? []).some((block) =>
+      (block.kind === "assistant_message" || block.kind === "reasoning") && block.text.trim().length > 0
+    );
+    if (!content) {
+      if (reasoning || hasStreamedTextTimeline) {
+        throw new Error("OpenCode completed without streamed final answer.");
+      }
+      throw new Error("OpenCode completed without streamed output.");
+    }
+  }
+
   private applyOpenCodeEvent(
     assistantMessageId: string,
     threadId: string,
@@ -1512,30 +1467,49 @@ export class ChatService {
       return;
     }
     if (event.type === "assistant.delta") {
-      if (event.text) {
+      if (event.text || event.replace) {
         completeOpenCodeReasoningBlocks(timelineBlocks);
-        this.store.appendToMessage(assistantMessageId, event.text);
-        assistantTextById.set(event.id, `${assistantTextById.get(event.id) ?? ""}${event.text}`);
+        if (event.replace) {
+          assistantTextById.set(event.id, event.text);
+          this.store.replaceMessageContent(assistantMessageId, [...assistantTextById.values()].join(""));
+        } else {
+          this.store.appendToMessage(assistantMessageId, event.text);
+          assistantTextById.set(event.id, `${assistantTextById.get(event.id) ?? ""}${event.text}`);
+        }
+        const timelineId = event.replace
+          ? prepareOpenCodeTimelineForReplace(timelineBlocks, "assistant_message", event.id)
+          : openCodeTimelineIdForDelta(timelineBlocks, "assistant_message", event.id);
         upsertCodexTextTimelineBlock(timelineBlocks, "item.updated", {
           id: event.id,
           type: "agent_message",
           text: event.text
-        });
+        }, { timelineId, text: event.text, replace: event.replace });
         this.store.updateMessageTimelineBlocks(assistantMessageId, timelineBlocks);
         this.broadcast();
       }
       return;
     }
     if (event.type === "reasoning.delta") {
-      if (event.text) {
-        this.store.appendToMessageReasoning(assistantMessageId, event.text);
-        reasoningTextById.set(event.id, `${reasoningTextById.get(event.id) ?? ""}${event.text}`);
-        upsertCodexTextTimelineBlock(timelineBlocks, "item.updated", {
-          id: event.id,
-          type: "reasoning",
-          text: event.text
-        });
-        moveOpenCodeReasoningBeforeAssistant(timelineBlocks);
+      if (event.text || event.replace) {
+        const reasoningText = event.replace ? event.text : `${reasoningTextById.get(event.id) ?? ""}${event.text}`;
+        const reasoningDelta = event.replace ? event.text : reasoningText.slice(reasoningTextById.get(event.id)?.length ?? 0);
+        if (event.replace) {
+          reasoningTextById.set(event.id, event.text);
+          this.store.replaceMessageReasoning(assistantMessageId, [...reasoningTextById.values()].join(""));
+        } else if (reasoningDelta) {
+          this.store.appendToMessageReasoning(assistantMessageId, reasoningDelta);
+          reasoningTextById.set(event.id, reasoningText);
+        }
+        if (reasoningDelta || event.replace) {
+          const timelineId = event.replace
+            ? prepareOpenCodeTimelineForReplace(timelineBlocks, "reasoning", event.id)
+            : openCodeTimelineIdForDelta(timelineBlocks, "reasoning", event.id);
+          upsertCodexTextTimelineBlock(timelineBlocks, "item.updated", {
+            id: event.id,
+            type: "reasoning",
+            text: reasoningDelta
+          }, { timelineId, text: reasoningDelta, replace: event.replace });
+        }
         this.store.updateMessageTimelineBlocks(assistantMessageId, timelineBlocks);
         this.broadcast();
       }
@@ -1555,9 +1529,12 @@ export class ChatService {
       return;
     }
     if (event.type === "final.snapshot") {
-      this.store.replaceMessageContent(assistantMessageId, event.content);
-      this.store.replaceMessageReasoning(assistantMessageId, event.reasoning);
-      reconcileOpenCodeFinalSnapshotTimelineBlocks(timelineBlocks, event.content, event.reasoning, assistantTextById, reasoningTextById);
+      const existingContent = this.assistantMessageContent(assistantMessageId);
+      const existingReasoning = this.store.loadState().messages.find((message) => message.id === assistantMessageId)?.reasoning ?? "";
+      this.store.replaceMessageReasoning(assistantMessageId, existingReasoning);
+      this.store.replaceMessageContent(assistantMessageId, existingContent);
+      completeOpenCodeReasoningBlocks(timelineBlocks);
+      completeOpenCodeAssistantBlocks(timelineBlocks);
       this.store.updateMessageTimelineBlocks(assistantMessageId, timelineBlocks);
       this.broadcast();
       return;

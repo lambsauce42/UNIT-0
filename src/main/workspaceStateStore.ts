@@ -65,11 +65,6 @@ export type MoveAppletOptions = {
 
 const MAX_SIDEBAR_APPLETS = 5;
 
-export type UpdateLayoutRatiosOptions = {
-  workspaceId: string;
-  ratios: Record<string, number>;
-};
-
 export type ReplaceWorkspaceLayoutOptions = {
   workspaceId: string;
   layout: WorkspaceLayoutNode;
@@ -89,7 +84,6 @@ const DEFAULT_APPLET_SESSIONS: Record<string, AppletSession> = {
 };
 
 const DEFAULT_UNIT_SETTINGS: UnitSettings = {
-  tileResizeMode: "adjacent",
   expandedSidebarWidthRatio: 0.25
 };
 
@@ -696,29 +690,6 @@ export class WorkspaceStateStore {
     return nextSession;
   }
 
-  updateLayoutRatios(options: UpdateLayoutRatiosOptions): Workspace {
-    const model = this.load();
-    const workspace = model.workspaces[options.workspaceId];
-    if (!workspace) {
-      throw new Error(`Workspace ${options.workspaceId} does not exist`);
-    }
-    if (!workspace.layout) {
-      throw new Error(`Workspace ${options.workspaceId} does not have a layout`);
-    }
-    const nextLayout = updateLayoutRatios(workspace.layout, options.ratios);
-    validateWorkspaceLayoutForWorkspace(nextLayout, workspace);
-    const nextWorkspace = { ...workspace, layout: nextLayout };
-    this.db.exec("BEGIN IMMEDIATE");
-    try {
-      this.saveWorkspaceLayoutInTransaction(workspace.id, nextLayout);
-      this.db.exec("COMMIT");
-    } catch (error) {
-      this.db.exec("ROLLBACK");
-      throw error;
-    }
-    return nextWorkspace;
-  }
-
   replaceWorkspaceLayout(options: ReplaceWorkspaceLayoutOptions): Workspace {
     const model = this.load();
     const workspace = model.workspaces[options.workspaceId];
@@ -1165,7 +1136,6 @@ function normalizeUnitSettings(value: unknown): UnitSettings {
   }
   const item = value as Partial<UnitSettings>;
   return {
-    tileResizeMode: item.tileResizeMode === "cascade" ? "cascade" : "adjacent",
     expandedSidebarWidthRatio: clampSidebarWidthRatio(item.expandedSidebarWidthRatio)
   };
 }
@@ -1316,37 +1286,6 @@ function moveAppletLeaf(layout: WorkspaceLayoutNode | null, options: MoveAppletO
     throw new Error(`Layout leaf ${options.targetLeafId} does not exist`);
   }
   return inserted.node;
-}
-
-function updateLayoutRatios(layout: WorkspaceLayoutNode, ratios: Record<string, number>): WorkspaceLayoutNode {
-  const remaining = new Set(Object.keys(ratios));
-  if (remaining.size === 0) {
-    return layout;
-  }
-  const visit = (node: WorkspaceLayoutNode): WorkspaceLayoutNode => {
-    if (node.type === "leaf") {
-      return node;
-    }
-    const nextRatio = ratios[node.id];
-    const hasRatio = Object.prototype.hasOwnProperty.call(ratios, node.id);
-    if (hasRatio) {
-      remaining.delete(node.id);
-      if (!Number.isFinite(nextRatio) || nextRatio <= 0 || nextRatio >= 1) {
-        throw new Error(`Workspace layout split ${node.id} has an invalid ratio update`);
-      }
-    }
-    return {
-      ...node,
-      ratio: hasRatio ? nextRatio : node.ratio,
-      first: visit(node.first),
-      second: visit(node.second)
-    };
-  };
-  const nextLayout = visit(layout);
-  if (remaining.size > 0) {
-    throw new Error(`Workspace layout ratio update references missing split(s): ${[...remaining].join(", ")}`);
-  }
-  return nextLayout;
 }
 
 function splitWithPlacement(

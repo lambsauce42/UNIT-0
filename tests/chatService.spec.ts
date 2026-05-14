@@ -7,7 +7,7 @@ import { ChatStore } from "../src/main/chatStore";
 import { MockCodexRuntime, type CodexRunOptions, type CodexThreadEvent } from "../src/main/codexRuntime";
 import type { DocumentEmbeddingRuntime } from "../src/main/embeddingRuntime";
 import { LocalLlamaRuntime } from "../src/main/localLlamaRuntime";
-import { mapOpenCodeEvent, normalizeOpenCodeHarmonyEvent, parseOpenCodeHarmonySnapshot, type OpenCodeRunOptions, type OpenCodeRuntime, type OpenCodeRuntimeEvent } from "../src/main/openCodeRuntime";
+import { mapOpenCodeEvent, normalizeOpenCodeHarmonyEvent, parseOpenCodeHarmonySnapshot, splitSseFrames, type OpenCodeRunOptions, type OpenCodeRuntime, type OpenCodeRuntimeEvent } from "../src/main/openCodeRuntime";
 import { RemoteHostRuntime } from "../src/main/remoteHostRuntime";
 import type { ChatBuiltinAgenticFramework, ChatMessage, ChatModel, ChatRuntimeSettings } from "../src/shared/types";
 
@@ -16,6 +16,14 @@ function makeService() {
   const store = new ChatStore(path.join(dir, "chat.sqlite"));
   const service = new ChatService(store, new LocalLlamaRuntime(), new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined, new TestEmbeddingRuntime());
   return { service, store, cleanup: () => fs.rmSync(dir, { recursive: true, force: true }) };
+}
+
+function captureAssistantFrame(service: ChatService): { content: string; reasoning: string } {
+  const assistant = service.state().messages.find((message) => message.role === "assistant");
+  return {
+    content: assistant?.content ?? "",
+    reasoning: assistant?.reasoning ?? ""
+  };
 }
 
 class TestEmbeddingRuntime implements DocumentEmbeddingRuntime {
@@ -186,6 +194,20 @@ class ScriptedOpenCodeRuntime implements OpenCodeRuntime {
   async answerApproval(permissionId: string, decision: "approve" | "deny"): Promise<void> {
     this.approvals.push({ permissionId, decision });
   }
+
+  cancelActiveRequest(): void {}
+
+  close(): void {}
+}
+
+class IncompleteOpenCodeRuntime implements OpenCodeRuntime {
+  async *runTurn(): AsyncIterable<OpenCodeRuntimeEvent> {
+    yield { type: "session.started", sessionId: "opencode-incomplete-session" };
+    yield { type: "assistant.delta", id: "assistant-1", status: "updated", text: "Partial answer." };
+    throw new Error("OpenCode event stream ended before turn completion.");
+  }
+
+  async answerApproval(): Promise<void> {}
 
   cancelActiveRequest(): void {}
 
@@ -583,6 +605,293 @@ test("runs OpenCode shell tool calls through local harness timeline blocks", asy
   }
 });
 
+test("does not mark an incomplete OpenCode runtime stream as complete", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-opencode-incomplete-test-"));
+  const modelPath = path.join(dir, "model.gguf");
+  fs.writeFileSync(modelPath, "");
+  const store = new ChatStore(path.join(dir, "chat.sqlite"));
+  const service = new ChatService(store, new EndpointOnlyLlamaRuntime(), new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined, new TestEmbeddingRuntime(), new IncompleteOpenCodeRuntime());
+  try {
+    let state = store.loadState();
+    store.updateProjectSettings(state.selectedProjectId, "OpenCode Incomplete Project", dir);
+    store.addLocalModel(modelPath);
+    state = store.loadState();
+    store.updateThreadSettings(state.selectedThreadId, {
+      builtinAgenticFramework: "opencode",
+      builtinModelId: state.selectedModelId
+    });
+
+    await service.submit({ text: "stream partially" });
+    await expect.poll(() => service.state().generation.status).toBe("error");
+
+    state = store.loadState();
+    const assistant = state.messages.find((message) => message.role === "assistant");
+    expect(assistant?.content).toBe("Partial answer.");
+    expect(assistant?.status).toBe("error");
+  } finally {
+    service.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("streams OpenCode reasoning answer and tool blocks in event order", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-opencode-stream-order-test-"));
+  const modelPath = path.join(dir, "model.gguf");
+  fs.writeFileSync(modelPath, "");
+  const store = new ChatStore(path.join(dir, "chat.sqlite"));
+  const openCodeRuntime = new ScriptedOpenCodeRuntime([[
+    { type: "reasoning.delta", id: "reasoning-1", status: "updated", text: "Plan " },
+    { type: "reasoning.delta", id: "reasoning-1", status: "updated", text: "work." },
+    { type: "assistant.delta", id: "assistant-1", status: "updated", text: "First visible answer. " },
+    {
+      type: "timeline",
+      eventType: "item.started",
+      block: { kind: "tool", id: "tool-1", toolName: "bash", status: "started", command: "echo ok", initiallyExpanded: true }
+    },
+    {
+      type: "timeline",
+      eventType: "item.completed",
+      block: { kind: "tool", id: "tool-1", toolName: "bash", status: "completed", command: "echo ok", output: "ok" }
+    },
+    { type: "reasoning.delta", id: "reasoning-2", status: "updated", text: "Check " },
+    { type: "reasoning.delta", id: "reasoning-2", status: "updated", text: "result." },
+    { type: "assistant.delta", id: "assistant-1", status: "updated", text: "After tool." },
+    { type: "final.snapshot", content: "First visible answer. After tool. Hidden tail.", reasoning: "Plan work.Check result. Hidden reasoning." }
+  ]]);
+  const frames: Array<ReturnType<ChatService["state"]>> = [];
+  let service: ChatService | null = null;
+  service = new ChatService(store, new EndpointOnlyLlamaRuntime(), new RemoteHostRuntime(), new MockCodexRuntime(), () => {
+    const snapshot = service?.state();
+    if (snapshot) {
+      frames.push(snapshot);
+    }
+  }, new TestEmbeddingRuntime(), openCodeRuntime);
+  try {
+    let state = store.loadState();
+    store.updateProjectSettings(state.selectedProjectId, "OpenCode Stream Order Project", dir);
+    store.addLocalModel(modelPath);
+    state = store.loadState();
+    store.updateThreadSettings(state.selectedThreadId, {
+      builtinAgenticFramework: "opencode",
+      builtinModelId: state.selectedModelId
+    });
+
+    await service.submit({ text: "stream in order" });
+    await expect.poll(() => service?.state().generation.status).toBe("idle");
+
+    state = store.loadState();
+    const assistant = state.messages.find((message) => message.role === "assistant");
+    expect(assistant?.content).toBe("First visible answer. After tool.");
+    expect(assistant?.reasoning).toBe("Plan work.Check result.");
+    expect(assistant?.timelineBlocks?.map((block) => block.kind)).toEqual(["reasoning", "assistant_message", "tool", "reasoning", "assistant_message"]);
+    expect(assistant?.timelineBlocks?.[0]).toMatchObject({ kind: "reasoning", text: "Plan work.", status: "completed" });
+    expect(assistant?.timelineBlocks?.[1]).toMatchObject({ kind: "assistant_message", text: "First visible answer. ", status: "completed" });
+    expect(assistant?.timelineBlocks?.[2]).toMatchObject({ kind: "tool", status: "completed", output: "ok" });
+    expect(assistant?.timelineBlocks?.[3]).toMatchObject({ kind: "reasoning", text: "Check result.", status: "completed" });
+    expect(assistant?.timelineBlocks?.[4]).toMatchObject({ kind: "assistant_message", text: "After tool.", status: "completed" });
+
+    const assistantFrames = frames.map((frame) => frame.messages.find((message) => message.role === "assistant")).filter(Boolean);
+    expect(assistantFrames.some((message) => message?.reasoning === "Plan ")).toBe(true);
+    expect(assistantFrames.some((message) => message?.reasoning === "Plan work.")).toBe(true);
+    expect(assistantFrames.some((message) => message?.reasoning === "Plan work.Check ")).toBe(true);
+    expect(assistantFrames.some((message) => message?.reasoning === "Plan work.Check result.")).toBe(true);
+    expect(assistantFrames.some((message) => message?.content === "First visible answer. ")).toBe(true);
+    expect(assistantFrames.some((message) => message?.content === "First visible answer. After tool.")).toBe(true);
+    expect(assistantFrames.some((message) => message?.timelineBlocks?.some((block) => block.kind === "reasoning" && block.text === "Plan"))).toBe(true);
+    expect(assistantFrames.some((message) => message?.timelineBlocks?.some((block) => block.kind === "reasoning" && block.text === "Check result."))).toBe(true);
+    expect(assistantFrames.some((message) => message?.timelineBlocks?.some((block) => block.kind === "assistant_message" && block.text === "First visible answer. "))).toBe(true);
+    expect(assistantFrames.some((message) => message?.timelineBlocks?.some((block) => block.kind === "tool" && block.status === "started"))).toBe(true);
+    expect(assistantFrames.some((message) => message?.timelineBlocks?.map((block) => block.kind).join(",") === "reasoning,assistant_message,tool,reasoning,assistant_message")).toBe(true);
+    expect(assistantFrames.some((message) => message?.content.includes("Hidden tail"))).toBe(false);
+    expect(assistantFrames.some((message) => (message?.reasoning ?? "").includes("Hidden reasoning"))).toBe(false);
+  } finally {
+    service?.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("collapses stale OpenCode timeline segments when a full part snapshot replaces text", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-opencode-replace-segment-test-"));
+  const modelPath = path.join(dir, "model.gguf");
+  fs.writeFileSync(modelPath, "");
+  const store = new ChatStore(path.join(dir, "chat.sqlite"));
+  const openCodeRuntime = new ScriptedOpenCodeRuntime([[
+    { type: "assistant.delta", id: "assistant-1", status: "updated", text: "First. " },
+    {
+      type: "timeline",
+      eventType: "item.completed",
+      block: { kind: "tool", id: "tool-1", toolName: "bash", status: "completed", command: "echo ok", output: "ok" }
+    },
+    { type: "assistant.delta", id: "assistant-1", status: "updated", text: "Second." },
+    { type: "assistant.delta", id: "assistant-1", status: "updated", text: "Replacement.", replace: true }
+  ]]);
+  const service = new ChatService(store, new EndpointOnlyLlamaRuntime(), new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined, new TestEmbeddingRuntime(), openCodeRuntime);
+  try {
+    let state = store.loadState();
+    store.updateProjectSettings(state.selectedProjectId, "OpenCode Replace Segment Project", dir);
+    store.addLocalModel(modelPath);
+    state = store.loadState();
+    store.updateThreadSettings(state.selectedThreadId, {
+      builtinAgenticFramework: "opencode",
+      builtinModelId: state.selectedModelId
+    });
+
+    await service.submit({ text: "replace segmented text" });
+    await expect.poll(() => service.state().generation.status).toBe("idle");
+
+    state = store.loadState();
+    const assistant = state.messages.find((message) => message.role === "assistant");
+    expect(assistant?.content).toBe("Replacement.");
+    expect(assistant?.timelineBlocks?.map((block) => block.kind)).toEqual(["assistant_message", "tool"]);
+    expect(assistant?.timelineBlocks?.[0]).toMatchObject({ kind: "assistant_message", text: "Replacement." });
+    expect(JSON.stringify(assistant?.timelineBlocks)).not.toContain("Second.");
+  } finally {
+    service.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("clears stale OpenCode timeline text when a full part snapshot replaces with empty text", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-opencode-empty-replace-test-"));
+  const modelPath = path.join(dir, "model.gguf");
+  fs.writeFileSync(modelPath, "");
+  const store = new ChatStore(path.join(dir, "chat.sqlite"));
+  const openCodeRuntime = new ScriptedOpenCodeRuntime([[
+    { type: "assistant.delta", id: "assistant-1", status: "updated", text: "Stale text." },
+    { type: "assistant.delta", id: "assistant-1", status: "updated", text: "", replace: true }
+  ]]);
+  const service = new ChatService(store, new EndpointOnlyLlamaRuntime(), new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined, new TestEmbeddingRuntime(), openCodeRuntime);
+  try {
+    let state = store.loadState();
+    store.updateProjectSettings(state.selectedProjectId, "OpenCode Empty Replace Project", dir);
+    store.addLocalModel(modelPath);
+    state = store.loadState();
+    store.updateThreadSettings(state.selectedThreadId, {
+      builtinAgenticFramework: "opencode",
+      builtinModelId: state.selectedModelId
+    });
+
+    await service.submit({ text: "clear stale text" });
+    await expect.poll(() => service.state().generation.status).toBe("error");
+
+    state = store.loadState();
+    const assistant = state.messages.find((message) => message.role === "assistant");
+    expect(assistant?.content).toBe("");
+    expect(JSON.stringify(assistant?.timelineBlocks)).not.toContain("Stale text.");
+    expect(assistant?.timelineBlocks?.some((block) => block.kind === "status" && block.code === "opencode_failed")).toBe(true);
+  } finally {
+    service.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("clears stale OpenCode reasoning timeline text when a full part snapshot replaces with empty text", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-opencode-empty-reasoning-replace-test-"));
+  const modelPath = path.join(dir, "model.gguf");
+  fs.writeFileSync(modelPath, "");
+  const store = new ChatStore(path.join(dir, "chat.sqlite"));
+  const openCodeRuntime = new ScriptedOpenCodeRuntime([[
+    { type: "reasoning.delta", id: "reasoning-1", status: "updated", text: "Stale reasoning." },
+    { type: "reasoning.delta", id: "reasoning-1", status: "updated", text: "", replace: true },
+    { type: "assistant.delta", id: "assistant-1", status: "updated", text: "Final answer." }
+  ]]);
+  const service = new ChatService(store, new EndpointOnlyLlamaRuntime(), new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined, new TestEmbeddingRuntime(), openCodeRuntime);
+  try {
+    let state = store.loadState();
+    store.updateProjectSettings(state.selectedProjectId, "OpenCode Empty Reasoning Replace Project", dir);
+    store.addLocalModel(modelPath);
+    state = store.loadState();
+    store.updateThreadSettings(state.selectedThreadId, {
+      builtinAgenticFramework: "opencode",
+      builtinModelId: state.selectedModelId
+    });
+
+    await service.submit({ text: "clear stale reasoning text" });
+    await expect.poll(() => service.state().generation.status).toBe("idle");
+
+    state = store.loadState();
+    const assistant = state.messages.find((message) => message.role === "assistant");
+    expect(assistant?.content).toBe("Final answer.");
+    expect(assistant?.reasoning).toBe("");
+    expect(JSON.stringify(assistant?.timelineBlocks)).not.toContain("Stale reasoning.");
+  } finally {
+    service.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("completes OpenCode answer-only turns without requiring reasoning", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-opencode-answer-only-test-"));
+  const modelPath = path.join(dir, "model.gguf");
+  fs.writeFileSync(modelPath, "");
+  const store = new ChatStore(path.join(dir, "chat.sqlite"));
+  const openCodeRuntime = new ScriptedOpenCodeRuntime([[
+    { type: "assistant.delta", id: "assistant-1", status: "updated", text: "Hello!" }
+  ]]);
+  const service = new ChatService(store, new EndpointOnlyLlamaRuntime(), new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined, new TestEmbeddingRuntime(), openCodeRuntime);
+  try {
+    let state = store.loadState();
+    store.updateProjectSettings(state.selectedProjectId, "OpenCode Answer Only Project", dir);
+    store.addLocalModel(modelPath);
+    state = store.loadState();
+    store.updateThreadSettings(state.selectedThreadId, {
+      builtinAgenticFramework: "opencode",
+      builtinModelId: state.selectedModelId
+    });
+
+    await service.submit({ text: "hi" });
+    await expect.poll(() => service.state().generation.status).toBe("idle");
+
+    state = store.loadState();
+    const assistant = state.messages.find((message) => message.role === "assistant");
+    expect(assistant?.content).toBe("Hello!");
+    expect(assistant?.reasoning ?? "").toBe("");
+    expect(assistant?.status).toBe("complete");
+    expect(assistant?.timelineBlocks?.some((block) => block.kind === "status" && block.code === "opencode_failed")).toBe(false);
+  } finally {
+    service.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("fails OpenCode tool-only turns that never stream answer or reasoning text", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-opencode-tool-only-test-"));
+  const modelPath = path.join(dir, "model.gguf");
+  fs.writeFileSync(modelPath, "");
+  const store = new ChatStore(path.join(dir, "chat.sqlite"));
+  const openCodeRuntime = new ScriptedOpenCodeRuntime([[
+    {
+      type: "timeline",
+      eventType: "item.completed",
+      block: { kind: "tool", id: "tool-1", toolName: "bash", status: "completed", command: "echo ok", output: "ok" }
+    },
+    { type: "final.snapshot", content: "Unstreamed answer.", reasoning: "Unstreamed reasoning." }
+  ]]);
+  const service = new ChatService(store, new EndpointOnlyLlamaRuntime(), new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined, new TestEmbeddingRuntime(), openCodeRuntime);
+  try {
+    let state = store.loadState();
+    store.updateProjectSettings(state.selectedProjectId, "OpenCode Tool Only Project", dir);
+    store.addLocalModel(modelPath);
+    state = store.loadState();
+    store.updateThreadSettings(state.selectedThreadId, {
+      builtinAgenticFramework: "opencode",
+      builtinModelId: state.selectedModelId
+    });
+
+    await service.submit({ text: "run tool only" });
+    await expect.poll(() => service.state().generation.status).toBe("error");
+
+    state = store.loadState();
+    const assistant = state.messages.find((message) => message.role === "assistant");
+    expect(assistant?.content).toBe("");
+    expect(assistant?.timelineBlocks?.some((block) => block.kind === "tool")).toBe(true);
+    expect(assistant?.timelineBlocks?.some((block) => block.kind === "status" && block.code === "opencode_failed" && block.message.includes("without streamed output"))).toBe(true);
+  } finally {
+    service.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("routes flattened OpenCode GPT-OSS snapshots into reasoning instead of assistant content", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-opencode-flat-test-"));
   const modelPath = path.join(dir, "gpt-oss-renamed-model.gguf");
@@ -686,11 +995,10 @@ test("reconciles OpenCode final snapshots with visible timeline blocks", async (
   fs.writeFileSync(modelPath, "");
   const store = new ChatStore(path.join(dir, "chat.sqlite"));
   const openCodeRuntime = new ScriptedOpenCodeRuntime([[
-    { type: "assistant.delta", id: "assistant-1", status: "updated", text: "Draft answer." },
-    { type: "assistant.delta", id: "assistant-2", status: "updated", text: "Stale second answer." },
     { type: "reasoning.delta", id: "reasoning-1", status: "updated", text: "Need a final answer." },
-    { type: "reasoning.delta", id: "reasoning-2", status: "updated", text: "Stale second reason." },
-    { type: "final.snapshot", content: "Final answer.", reasoning: "Need a final answer." }
+    { type: "assistant.delta", id: "assistant-1", status: "updated", text: "Final " },
+    { type: "assistant.delta", id: "assistant-1", status: "updated", text: "answer." },
+    { type: "final.snapshot", content: "Final answer. Hidden tail.", reasoning: "Need a final answer. Hidden reasoning." }
   ]]);
   const frames: Array<ReturnType<ChatService["state"]>> = [];
   let service: ChatService | null = null;
@@ -736,8 +1044,209 @@ test("reconciles OpenCode final snapshots with visible timeline blocks", async (
       });
     });
     expect(reasoningAfterAssistantFrames).toEqual([]);
+    expect(frames.some((frame) => frame.messages.some((message) => message.role === "assistant" && message.content === "Final "))).toBe(true);
+    expect(frames.some((frame) => frame.messages.some((message) => message.role === "assistant" && message.content === "Final answer."))).toBe(true);
+    expect(frames.some((frame) => frame.messages.some((message) => message.role === "assistant" && message.content.includes("Hidden tail")))).toBe(false);
+    expect(frames.some((frame) => frame.messages.some((message) => message.role === "assistant" && (message.reasoning ?? "").includes("Hidden reasoning")))).toBe(false);
   } finally {
     service?.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("does not clear streamed OpenCode content when final snapshot content is empty", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-opencode-empty-final-test-"));
+  const modelPath = path.join(dir, "model.gguf");
+  fs.writeFileSync(modelPath, "");
+  const store = new ChatStore(path.join(dir, "chat.sqlite"));
+  const openCodeRuntime = new ScriptedOpenCodeRuntime([[
+    { type: "reasoning.delta", id: "reasoning-1", status: "updated", text: "Need a final answer." },
+    { type: "assistant.delta", id: "assistant-1", status: "updated", text: "Final answer." },
+    { type: "final.snapshot", content: "", reasoning: "Need a final answer." }
+  ]]);
+  const service = new ChatService(store, new EndpointOnlyLlamaRuntime(), new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined, new TestEmbeddingRuntime(), openCodeRuntime);
+  try {
+    let state = store.loadState();
+    store.updateProjectSettings(state.selectedProjectId, "OpenCode Empty Final Project", dir);
+    store.addLocalModel(modelPath);
+    state = store.loadState();
+    store.updateThreadSettings(state.selectedThreadId, {
+      builtinAgenticFramework: "opencode",
+      builtinModelId: state.selectedModelId
+    });
+
+    await service.submit({ text: "finish cleanly" });
+    await expect.poll(() => service.state().generation.status).toBe("idle");
+
+    state = store.loadState();
+    const assistant = state.messages.find((message) => message.role === "assistant");
+    expect(assistant?.content).toBe("Final answer.");
+    expect(assistant?.reasoning).toBe("Need a final answer.");
+    expect(assistant?.timelineBlocks?.find((block) => block.kind === "assistant_message")).toMatchObject({
+      status: "completed",
+      text: "Final answer."
+    });
+  } finally {
+    service.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("does not append snapshot-only OpenCode reasoning after streamed answer", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-opencode-answer-only-final-reasoning-test-"));
+  const modelPath = path.join(dir, "model.gguf");
+  fs.writeFileSync(modelPath, "");
+  const store = new ChatStore(path.join(dir, "chat.sqlite"));
+  const openCodeRuntime = new ScriptedOpenCodeRuntime([[
+    { type: "assistant.delta", id: "assistant-1", status: "updated", text: "opencode-ok" },
+    { type: "final.snapshot", content: "opencode-ok", reasoning: "The task is straightforward and requires no code changes." }
+  ]]);
+  const service = new ChatService(store, new EndpointOnlyLlamaRuntime(), new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined, new TestEmbeddingRuntime(), openCodeRuntime);
+  try {
+    let state = store.loadState();
+    store.updateProjectSettings(state.selectedProjectId, "OpenCode Answer Only Final Reasoning Project", dir);
+    store.addLocalModel(modelPath);
+    state = store.loadState();
+    store.updateThreadSettings(state.selectedThreadId, {
+      builtinAgenticFramework: "opencode",
+      builtinModelId: state.selectedModelId
+    });
+
+    await service.submit({ text: "finish cleanly" });
+    await expect.poll(() => service.state().generation.status).toBe("idle");
+
+    state = store.loadState();
+    const assistant = state.messages.find((message) => message.role === "assistant");
+    expect(assistant?.content).toBe("opencode-ok");
+    expect(assistant?.reasoning ?? "").toBe("");
+    expect(assistant?.timelineBlocks?.map((block) => block.kind)).toEqual(["assistant_message"]);
+    expect(assistant?.timelineBlocks?.some((block) => block.kind === "reasoning")).toBe(false);
+  } finally {
+    service.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("does not replace streamed OpenCode text with shorter stale final snapshots", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-opencode-stale-short-final-test-"));
+  const modelPath = path.join(dir, "model.gguf");
+  fs.writeFileSync(modelPath, "");
+  const store = new ChatStore(path.join(dir, "chat.sqlite"));
+  const openCodeRuntime = new ScriptedOpenCodeRuntime([[
+    { type: "reasoning.delta", id: "reasoning-1", status: "updated", text: "Need a final answer." },
+    { type: "assistant.delta", id: "assistant-1", status: "updated", text: "Final answer." },
+    { type: "final.snapshot", content: "Final", reasoning: "Need" }
+  ]]);
+  const service = new ChatService(store, new EndpointOnlyLlamaRuntime(), new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined, new TestEmbeddingRuntime(), openCodeRuntime);
+  try {
+    let state = store.loadState();
+    store.updateProjectSettings(state.selectedProjectId, "OpenCode Stale Short Final Project", dir);
+    store.addLocalModel(modelPath);
+    state = store.loadState();
+    store.updateThreadSettings(state.selectedThreadId, {
+      builtinAgenticFramework: "opencode",
+      builtinModelId: state.selectedModelId
+    });
+
+    await service.submit({ text: "finish cleanly" });
+    await expect.poll(() => service.state().generation.status).toBe("idle");
+
+    state = store.loadState();
+    const assistant = state.messages.find((message) => message.role === "assistant");
+    expect(assistant?.content).toBe("Final answer.");
+    expect(assistant?.reasoning).toBe("Need a final answer.");
+  } finally {
+    service.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("does not introduce OpenCode answer or reasoning text from snapshot-only final state", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-opencode-snapshot-only-final-test-"));
+  const modelPath = path.join(dir, "model.gguf");
+  fs.writeFileSync(modelPath, "");
+  const store = new ChatStore(path.join(dir, "chat.sqlite"));
+  const openCodeRuntime = new ScriptedOpenCodeRuntime([[
+    { type: "final.snapshot", content: "Unstreamed answer.", reasoning: "Unstreamed reasoning." }
+  ]]);
+  const service = new ChatService(store, new EndpointOnlyLlamaRuntime(), new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined, new TestEmbeddingRuntime(), openCodeRuntime);
+  try {
+    let state = store.loadState();
+    store.updateProjectSettings(state.selectedProjectId, "OpenCode Snapshot Only Final Project", dir);
+    store.addLocalModel(modelPath);
+    state = store.loadState();
+    store.updateThreadSettings(state.selectedThreadId, {
+      builtinAgenticFramework: "opencode",
+      builtinModelId: state.selectedModelId
+    });
+
+    await service.submit({ text: "finish cleanly" });
+    await expect.poll(() => service.state().generation.status).toBe("error");
+
+    state = store.loadState();
+    const assistant = state.messages.find((message) => message.role === "assistant");
+    expect(assistant?.content).toBe("");
+    expect(assistant?.reasoning).toBe("");
+    expect(assistant?.status).toBe("error");
+    expect(assistant?.timelineBlocks?.some((block) => block.kind === "status" && block.code === "opencode_failed" && block.message.includes("without streamed output"))).toBe(true);
+  } finally {
+    service.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("does not mine OpenCode answers from reasoning-channel text", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-opencode-reasoning-final-marker-test-"));
+  const modelPath = path.join(dir, "model.gguf");
+  fs.writeFileSync(modelPath, "");
+  const store = new ChatStore(path.join(dir, "chat.sqlite"));
+  const frames: Array<{ content: string; reasoning: string }> = [];
+  let service: ChatService;
+  class ObservingOpenCodeRuntime implements OpenCodeRuntime {
+    async *runTurn(): AsyncIterable<OpenCodeRuntimeEvent> {
+      yield { type: "reasoning.delta", id: "reasoning-1", status: "updated", text: "Need a final answer. Then fi" };
+      frames.push(captureAssistantFrame(service));
+      yield { type: "reasoning.delta", id: "reasoning-1", status: "updated", text: "nal." };
+      frames.push(captureAssistantFrame(service));
+      yield { type: "reasoning.delta", id: "reasoning-1", status: "updated", text: "op" };
+      frames.push(captureAssistantFrame(service));
+      yield { type: "reasoning.delta", id: "reasoning-1", status: "updated", text: "encode-ok" };
+      frames.push(captureAssistantFrame(service));
+      yield { type: "final.snapshot", content: "", reasoning: "Need a final answer. Then final." };
+    }
+
+    async answerApproval(): Promise<void> {}
+
+    cancelActiveRequest(): void {}
+
+    close(): void {}
+  }
+  service = new ChatService(store, new EndpointOnlyLlamaRuntime(), new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined, new TestEmbeddingRuntime(), new ObservingOpenCodeRuntime());
+  try {
+    let state = store.loadState();
+    store.updateProjectSettings(state.selectedProjectId, "OpenCode Reasoning Final Marker Project", dir);
+    store.addLocalModel(modelPath);
+    state = store.loadState();
+    store.updateThreadSettings(state.selectedThreadId, {
+      builtinAgenticFramework: "opencode",
+      builtinModelId: state.selectedModelId
+    });
+
+    await service.submit({ text: "finish cleanly" });
+    await expect.poll(() => service.state().generation.status).toBe("error");
+
+    state = store.loadState();
+    const assistant = state.messages.find((message) => message.role === "assistant");
+    expect(assistant?.content).toBe("");
+    expect(assistant?.reasoning).toBe("Need a final answer. Then final.opencode-ok");
+    expect(assistant?.status).toBe("error");
+    expect(assistant?.timelineBlocks?.some((block) => block.kind === "status" && block.code === "opencode_failed" && block.message.includes("without streamed final answer"))).toBe(true);
+    expect(frames[0]).toEqual({ content: "", reasoning: "Need a final answer. Then fi" });
+    expect(frames[1]).toEqual({ content: "", reasoning: "Need a final answer. Then final." });
+    expect(frames[2]).toEqual({ content: "", reasoning: "Need a final answer. Then final.op" });
+    expect(frames[3]).toEqual({ content: "", reasoning: "Need a final answer. Then final.opencode-ok" });
+  } finally {
+    service.close();
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
@@ -774,8 +1283,38 @@ test("maps OpenCode server permission events to Unit-0 approval blocks", () => {
   }]);
 });
 
-test("maps OpenCode message deltas without appending full part snapshots", () => {
+test("maps OpenCode message deltas and diffs full part snapshots", () => {
   const errors: string[] = [];
+  const snapshotOnlyState = new Map<string, { text: string; streamed: boolean }>();
+  const snapshotOnlyEvents = Array.from(mapOpenCodeEvent({
+    type: "message.part.updated",
+    properties: {
+      sessionID: "ses_snapshot_only",
+      part: {
+        id: "prt_snapshot_only",
+        sessionID: "ses_snapshot_only",
+        messageID: "msg_snapshot_only",
+        type: "text",
+        text: "snapshot-only text"
+      },
+      time: Date.now()
+    }
+  }, (message) => errors.push(message), snapshotOnlyState));
+  const repeatedSnapshotOnlyEvents = Array.from(mapOpenCodeEvent({
+    type: "message.part.updated",
+    properties: {
+      sessionID: "ses_snapshot_only",
+      part: {
+        id: "prt_snapshot_only",
+        sessionID: "ses_snapshot_only",
+        messageID: "msg_snapshot_only",
+        type: "text",
+        text: "snapshot-only text continued"
+      },
+      time: Date.now()
+    }
+  }, (message) => errors.push(message), snapshotOnlyState));
+  const snapshots = new Map<string, { text: string; streamed: boolean }>();
   const deltaEvents = Array.from(mapOpenCodeEvent({
     type: "message.part.delta",
     properties: {
@@ -785,8 +1324,8 @@ test("maps OpenCode message deltas without appending full part snapshots", () =>
       field: "text",
       delta: "hello"
     }
-  }, (message) => errors.push(message)));
-  const fullPartEvents = Array.from(mapOpenCodeEvent({
+  }, (message) => errors.push(message), snapshots));
+  const firstFullPartEvents = Array.from(mapOpenCodeEvent({
     type: "message.part.updated",
     properties: {
       sessionID: "ses_123",
@@ -799,9 +1338,139 @@ test("maps OpenCode message deltas without appending full part snapshots", () =>
       },
       time: Date.now()
     }
-  }, (message) => errors.push(message)));
+  }, (message) => errors.push(message), snapshots));
+  const secondFullPartEvents = Array.from(mapOpenCodeEvent({
+    type: "message.part.updated",
+    properties: {
+      sessionID: "ses_123",
+      part: {
+        id: "prt_123",
+        sessionID: "ses_123",
+        messageID: "msg_123",
+        type: "text",
+        text: "hello world"
+      },
+      time: Date.now()
+    }
+  }, (message) => errors.push(message), snapshots));
+  const deltaWithSnapshotEvents = Array.from(mapOpenCodeEvent({
+    type: "message.part.updated",
+    properties: {
+      sessionID: "ses_123",
+      delta: "!",
+      part: {
+        id: "prt_123",
+        sessionID: "ses_123",
+        messageID: "msg_123",
+        type: "text",
+        text: "hello world!"
+      },
+      time: Date.now()
+    }
+  }, (message) => errors.push(message), snapshots));
+  const duplicateFullPartEvents = Array.from(mapOpenCodeEvent({
+    type: "message.part.updated",
+    properties: {
+      sessionID: "ses_123",
+      part: {
+        id: "prt_123",
+        sessionID: "ses_123",
+        messageID: "msg_123",
+        type: "text",
+        text: "hello world!"
+      },
+      time: Date.now()
+    }
+  }, (message) => errors.push(message), snapshots));
+  const staleFullPartEvents = Array.from(mapOpenCodeEvent({
+    type: "message.part.updated",
+    properties: {
+      sessionID: "ses_123",
+      part: {
+        id: "prt_123",
+        sessionID: "ses_123",
+        messageID: "msg_123",
+        type: "text",
+        text: "hello world"
+      },
+      time: Date.now()
+    }
+  }, (message) => errors.push(message), snapshots));
+  const divergentFullPartEvents = Array.from(mapOpenCodeEvent({
+    type: "message.part.updated",
+    properties: {
+      sessionID: "ses_123",
+      part: {
+        id: "prt_123",
+        sessionID: "ses_123",
+        messageID: "msg_123",
+        type: "text",
+        text: "hello brave world!"
+      },
+      time: Date.now()
+    }
+  }, (message) => errors.push(message), snapshots));
+  const continuedDivergentFullPartEvents = Array.from(mapOpenCodeEvent({
+    type: "message.part.updated",
+    properties: {
+      sessionID: "ses_123",
+      part: {
+        id: "prt_123",
+        sessionID: "ses_123",
+        messageID: "msg_123",
+        type: "text",
+        text: "hello brave world! done"
+      },
+      time: Date.now()
+    }
+  }, (message) => errors.push(message), snapshots));
+  const divergentDeltaEvents = Array.from(mapOpenCodeEvent({
+    type: "message.part.updated",
+    properties: {
+      sessionID: "ses_delta_divergent",
+      delta: "!",
+      part: {
+        id: "prt_delta_divergent",
+        sessionID: "ses_delta_divergent",
+        messageID: "msg_delta_divergent",
+        type: "text",
+        text: "corrected!"
+      },
+      time: Date.now()
+    }
+  }, (message) => errors.push(message), new Map([["ses_delta_divergent:msg_delta_divergent:prt_delta_divergent:text", { text: "wrong", streamed: true }]])));
+  const shorterSnapshotEvents = Array.from(mapOpenCodeEvent({
+    type: "message.part.updated",
+    properties: {
+      sessionID: "ses_shorter",
+      part: {
+        id: "prt_shorter",
+        sessionID: "ses_shorter",
+        messageID: "msg_shorter",
+        type: "text",
+        text: "First."
+      },
+      time: Date.now()
+    }
+  }, (message) => errors.push(message), new Map([["ses_shorter:msg_shorter:prt_shorter:text", { text: "First. Second.", streamed: true }]])));
+  const emptySnapshotEvents = Array.from(mapOpenCodeEvent({
+    type: "message.part.updated",
+    properties: {
+      sessionID: "ses_empty_replace",
+      part: {
+        id: "prt_empty_replace",
+        sessionID: "ses_empty_replace",
+        messageID: "msg_empty_replace",
+        type: "text",
+        text: ""
+      },
+      time: Date.now()
+    }
+  }, (message) => errors.push(message), new Map([["ses_empty_replace:msg_empty_replace:prt_empty_replace:text", { text: "Stale text.", streamed: true }]])));
 
   expect(errors).toEqual([]);
+  expect(snapshotOnlyEvents).toEqual([]);
+  expect(repeatedSnapshotOnlyEvents).toEqual([]);
   expect(deltaEvents).toEqual([{
     type: "assistant.delta",
     id: "msg_123:prt_123",
@@ -809,7 +1478,81 @@ test("maps OpenCode message deltas without appending full part snapshots", () =>
     text: "hello",
     sessionId: "ses_123"
   }]);
-  expect(fullPartEvents).toEqual([]);
+  expect(firstFullPartEvents).toEqual([]);
+  expect(secondFullPartEvents).toEqual([{
+    type: "assistant.delta",
+    id: "msg_123:prt_123",
+    status: "updated",
+    text: " world",
+    sessionId: "ses_123"
+  }]);
+  expect(deltaWithSnapshotEvents).toEqual([{
+    type: "assistant.delta",
+    id: "msg_123:prt_123",
+    status: "updated",
+    text: "!",
+    sessionId: "ses_123"
+  }]);
+  expect(duplicateFullPartEvents).toEqual([]);
+  expect(staleFullPartEvents).toEqual([{
+    type: "assistant.delta",
+    id: "msg_123:prt_123",
+    status: "updated",
+    text: "hello world",
+    replace: true,
+    sessionId: "ses_123"
+  }]);
+  expect(divergentFullPartEvents).toEqual([{
+    type: "assistant.delta",
+    id: "msg_123:prt_123",
+    status: "updated",
+    text: "hello brave world!",
+    replace: true,
+    sessionId: "ses_123"
+  }]);
+  expect(continuedDivergentFullPartEvents).toEqual([{
+    type: "assistant.delta",
+    id: "msg_123:prt_123",
+    status: "updated",
+    text: " done",
+    sessionId: "ses_123"
+  }]);
+  expect(divergentDeltaEvents).toEqual([{
+    type: "assistant.delta",
+    id: "msg_delta_divergent:prt_delta_divergent",
+    status: "updated",
+    text: "corrected!",
+    replace: true,
+    sessionId: "ses_delta_divergent"
+  }]);
+  expect(shorterSnapshotEvents).toEqual([{
+    type: "assistant.delta",
+    id: "msg_shorter:prt_shorter",
+    status: "updated",
+    text: "First.",
+    replace: true,
+    sessionId: "ses_shorter"
+  }]);
+  expect(emptySnapshotEvents).toEqual([{
+    type: "assistant.delta",
+    id: "msg_empty_replace:prt_empty_replace",
+    status: "updated",
+    text: "",
+    replace: true,
+    sessionId: "ses_empty_replace"
+  }]);
+});
+
+test("splits OpenCode SSE frames with CRLF and flushes final unterminated data", () => {
+  const first = splitSseFrames("data: {\"type\":\"one\"}\r\n\r\n");
+  const partial = splitSseFrames("data: {\"type\":\"two\"}\r");
+  const completed = splitSseFrames(`${partial.rest}\n\r\n`);
+  const flushed = splitSseFrames("data: {\"type\":\"three\"}", true);
+
+  expect(first).toEqual({ frames: ["data: {\"type\":\"one\"}"], rest: "" });
+  expect(partial).toEqual({ frames: [], rest: "data: {\"type\":\"two\"}\r" });
+  expect(completed).toEqual({ frames: ["data: {\"type\":\"two\"}"], rest: "" });
+  expect(flushed).toEqual({ frames: ["data: {\"type\":\"three\"}"], rest: "" });
 });
 
 test("normalizes GPT-OSS Harmony channels from OpenCode text deltas", () => {
@@ -904,16 +1647,185 @@ test("normalizes flattened GPT-OSS OpenCode text after return marker", () => {
     text: "User says \"hi\". We need to respond appropriately.",
     sessionId: "ses_flat"
   }]);
-  expect(second).toEqual([{
-    type: "assistant.delta",
-    id: "msg_flat:prt_flat",
-    status: "updated",
-    text: "Hello!",
-    sessionId: "ses_flat"
-  }]);
+  expect(second).toEqual([
+    {
+      type: "assistant.delta",
+      id: "msg_flat:prt_flat",
+      status: "updated",
+      text: "Hello!",
+      sessionId: "ses_flat"
+    }
+  ]);
 });
 
-test("holds flattened GPT-OSS OpenCode final text until the return marker", () => {
+test("streams flattened GPT-OSS reasoning while holding ambiguous final text until return", () => {
+  const parsers = new Map();
+  const events = [
+    ...normalizeOpenCodeHarmonyEvent({
+      type: "assistant.delta",
+      id: "msg_live:prt_live",
+      status: "updated",
+      sessionId: "ses_live",
+      text: "Need "
+    }, parsers),
+    ...normalizeOpenCodeHarmonyEvent({
+      type: "assistant.delta",
+      id: "msg_live:prt_live",
+      status: "updated",
+      sessionId: "ses_live",
+      text: "a short greeting.\n\nHel"
+    }, parsers),
+    ...normalizeOpenCodeHarmonyEvent({
+      type: "assistant.delta",
+      id: "msg_live:prt_live",
+      status: "updated",
+      sessionId: "ses_live",
+      text: "lo<|return|>"
+    }, parsers)
+  ];
+
+  expect(events).toEqual([
+    {
+      type: "reasoning.delta",
+      id: "msg_live:prt_live:reasoning",
+      status: "updated",
+      text: "Need a short greeting.",
+      sessionId: "ses_live"
+    },
+    {
+      type: "assistant.delta",
+      id: "msg_live:prt_live",
+      status: "updated",
+      text: "Hello",
+      sessionId: "ses_live"
+    }
+  ]);
+});
+
+test("uses the last flattened GPT-OSS paragraph as final content when return arrives", () => {
+  const parsers = new Map();
+  const events = normalizeOpenCodeHarmonyEvent({
+    type: "assistant.delta",
+    id: "msg_multi:prt_multi",
+    status: "updated",
+    sessionId: "ses_multi",
+    text: "Reason one.\n\nReason two.\n\nFinal answer.<|return|>"
+  }, parsers);
+
+  expect(events).toEqual([
+    {
+      type: "reasoning.delta",
+      id: "msg_multi:prt_multi:reasoning",
+      status: "updated",
+      text: "Reason one.\n\nReason two.",
+      sessionId: "ses_multi"
+    },
+    {
+      type: "assistant.delta",
+      id: "msg_multi:prt_multi",
+      status: "updated",
+      text: "Final answer.",
+      sessionId: "ses_multi"
+    }
+  ]);
+});
+
+test("does not stream an ambiguous second flattened paragraph as final content before return", () => {
+  const parsers = new Map();
+  const events = [
+    ...normalizeOpenCodeHarmonyEvent({
+      type: "assistant.delta",
+      id: "msg_multi_live:prt_multi_live",
+      status: "updated",
+      sessionId: "ses_multi_live",
+      text: "Reason one.\n\nReason two."
+    }, parsers),
+    ...normalizeOpenCodeHarmonyEvent({
+      type: "assistant.delta",
+      id: "msg_multi_live:prt_multi_live",
+      status: "updated",
+      sessionId: "ses_multi_live",
+      text: "\n\nFinal answer.<|return|>"
+    }, parsers)
+  ];
+
+  expect(events).toEqual([
+    {
+      type: "reasoning.delta",
+      id: "msg_multi_live:prt_multi_live:reasoning",
+      status: "updated",
+      text: "Reason one.",
+      sessionId: "ses_multi_live"
+    },
+    {
+      type: "reasoning.delta",
+      id: "msg_multi_live:prt_multi_live:reasoning",
+      status: "updated",
+      text: "\n\nReason two.",
+      sessionId: "ses_multi_live"
+    },
+    {
+      type: "assistant.delta",
+      id: "msg_multi_live:prt_multi_live",
+      status: "updated",
+      text: "Final answer.",
+      sessionId: "ses_multi_live"
+    }
+  ]);
+});
+
+test("passes GPT-OSS reasoning deltas through without speculative final cue splitting", () => {
+  const states = new Map();
+  const events = [
+    ...normalizeOpenCodeHarmonyEvent({
+      type: "reasoning.delta",
+      id: "msg_reasoning:prt_reasoning",
+      status: "updated",
+      sessionId: "ses_reasoning",
+      text: "Need a short reply. Final "
+    }, states),
+    ...normalizeOpenCodeHarmonyEvent({
+      type: "reasoning.delta",
+      id: "msg_reasoning:prt_reasoning",
+      status: "updated",
+      sessionId: "ses_reasoning",
+      text: "output: op"
+    }, states),
+    ...normalizeOpenCodeHarmonyEvent({
+      type: "reasoning.delta",
+      id: "msg_reasoning:prt_reasoning",
+      status: "updated",
+      sessionId: "ses_reasoning",
+      text: "encode-ok"
+    }, states)
+  ];
+
+  expect(events).toEqual([
+    {
+      type: "reasoning.delta",
+      id: "msg_reasoning:prt_reasoning",
+      status: "updated",
+      text: "Need a short reply. Final ",
+      sessionId: "ses_reasoning"
+    },
+    {
+      type: "reasoning.delta",
+      id: "msg_reasoning:prt_reasoning",
+      status: "updated",
+      text: "output: op",
+      sessionId: "ses_reasoning"
+    },
+    {
+      type: "reasoning.delta",
+      id: "msg_reasoning:prt_reasoning",
+      status: "updated",
+      text: "encode-ok",
+      sessionId: "ses_reasoning"
+    }
+  ]);
+});
+
+test("holds flattened GPT-OSS OpenCode final text until return confirms the boundary", () => {
   const parsers = new Map();
   const events = [
     ...normalizeOpenCodeHarmonyEvent({
@@ -1090,6 +2002,60 @@ test("normalizes flattened GPT-OSS OpenCode text when no answer streamed before 
   ]);
 });
 
+test("replaces completed flattened GPT-OSS text from a corrected full part snapshot", () => {
+  const parsers = new Map();
+  const first = normalizeOpenCodeHarmonyEvent({
+    type: "assistant.delta",
+    id: "msg_replace:prt_replace",
+    status: "updated",
+    sessionId: "ses_replace",
+    text: "Old reason.\n\nold-answer<|return|>"
+  }, parsers);
+  const corrected = normalizeOpenCodeHarmonyEvent({
+    type: "assistant.delta",
+    id: "msg_replace:prt_replace",
+    status: "updated",
+    sessionId: "ses_replace",
+    text: "Correct reason.\n\ncorrect-answer<|return|>",
+    replace: true
+  }, parsers);
+
+  expect(first).toEqual([
+    {
+      type: "reasoning.delta",
+      id: "msg_replace:prt_replace:reasoning",
+      status: "updated",
+      text: "Old reason.",
+      sessionId: "ses_replace"
+    },
+    {
+      type: "assistant.delta",
+      id: "msg_replace:prt_replace",
+      status: "updated",
+      text: "old-answer",
+      sessionId: "ses_replace"
+    }
+  ]);
+  expect(corrected).toEqual([
+    {
+      type: "reasoning.delta",
+      id: "msg_replace:prt_replace:reasoning",
+      status: "updated",
+      text: "Correct reason.",
+      replace: true,
+      sessionId: "ses_replace"
+    },
+    {
+      type: "assistant.delta",
+      id: "msg_replace:prt_replace",
+      status: "updated",
+      text: "correct-answer",
+      replace: true,
+      sessionId: "ses_replace"
+    }
+  ]);
+});
+
 test("normalizes GPT-OSS Harmony channels from OpenCode final snapshots", () => {
   const parsed = parseOpenCodeHarmonySnapshot("<|channel|>analysis<|message|>Think.<|end|><|start|>assistant<|channel|>final<|message|>Done.<|return|>");
 
@@ -1132,6 +2098,52 @@ test("passes through non-GPT-OSS OpenCode plain text deltas", () => {
     status: "updated",
     sessionId: "ses_plain",
     text: "plain model text"
+  }]);
+});
+
+test("normalizes no-boundary flattened GPT-OSS text as final content only after return", () => {
+  const parsers = new Map();
+  const first = normalizeOpenCodeHarmonyEvent({
+    type: "assistant.delta",
+    id: "msg_direct:prt_direct",
+    status: "updated",
+    sessionId: "ses_direct",
+    text: "Hello"
+  }, parsers);
+  const second = normalizeOpenCodeHarmonyEvent({
+    type: "assistant.delta",
+    id: "msg_direct:prt_direct",
+    status: "updated",
+    sessionId: "ses_direct",
+    text: " world<|return|>"
+  }, parsers);
+
+  expect(first).toEqual([]);
+  expect(second).toEqual([{
+    type: "assistant.delta",
+    id: "msg_direct:prt_direct",
+    status: "updated",
+    text: "Hello world",
+    sessionId: "ses_direct"
+  }]);
+});
+
+test("keeps no-boundary multi-line flattened GPT-OSS final text intact", () => {
+  const parsers = new Map();
+  const events = normalizeOpenCodeHarmonyEvent({
+    type: "assistant.delta",
+    id: "msg_multiline_direct:prt_multiline_direct",
+    status: "updated",
+    sessionId: "ses_multiline_direct",
+    text: "Hello\nworld<|return|>"
+  }, parsers);
+
+  expect(events).toEqual([{
+    type: "assistant.delta",
+    id: "msg_multiline_direct:prt_multiline_direct",
+    status: "updated",
+    text: "Hello\nworld",
+    sessionId: "ses_multiline_direct"
   }]);
 });
 

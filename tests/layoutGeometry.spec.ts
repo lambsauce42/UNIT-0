@@ -7,6 +7,7 @@ import {
   computeCanonicalLayout,
   projectResize,
   rebuildLayoutFromLeafRects,
+  resizeLeafRectsForTarget,
   resizeTargetRequiresStructuralResize,
   resizeTargetAt
 } from "../src/shared/layoutGeometry";
@@ -17,6 +18,45 @@ const leaf = (id: string): WorkspaceLayoutNode => ({
   type: "leaf",
   appletInstanceId: id
 });
+
+function resizeLikeRenderer(
+  layout: WorkspaceLayoutNode,
+  point: { x: number; y: number },
+  delta: { x: number; y: number },
+  size: { width: number; height: number }
+) {
+  return computeCanonicalLayout(resizeLayoutLikeRenderer(layout, point, delta, size), size);
+}
+
+function resizeLayoutLikeRenderer(
+  layout: WorkspaceLayoutNode,
+  point: { x: number; y: number },
+  delta: { x: number; y: number },
+  size: { width: number; height: number }
+): WorkspaceLayoutNode {
+  const geometry = computeCanonicalLayout(layout, size);
+  const target = resizeTargetAt(geometry, point);
+  expect(target).toBeTruthy();
+  const projected = projectResize(geometry, target!, delta, MIN_APPLET_SIZE);
+  if (!resizeTargetRequiresStructuralResize(geometry, target!, projected)) {
+    return applyRatioOverrides(layout, projected.ratios);
+  }
+  const leaves = resizeLeafRectsForTarget(geometry, target!, projected.dx, projected.dy);
+  const primaryCutDirection = target!.vertical && !target!.horizontal ? "column" : target!.horizontal && !target!.vertical ? "row" : null;
+  return rebuildLayoutFromLeafRects(layout, leaves, geometry.rect, TILE_GUTTER_SIZE, primaryCutDirection);
+}
+
+function sizesByApplet(geometry: ReturnType<typeof computeCanonicalLayout>) {
+  return Object.fromEntries(
+    geometry.leaves.map((item) => [
+      item.appletInstanceId,
+      {
+        width: item.rect.right - item.rect.left,
+        height: item.rect.bottom - item.rect.top
+      }
+    ])
+  );
+}
 
 test("canonical split sizes are integer exact with fixed gutter", () => {
   const layout: WorkspaceLayoutNode = {
@@ -227,7 +267,7 @@ test("structural rebuild can prefer a vertical cut for horizontal edge drags", (
   }
 });
 
-test("cross-grid edge drags are structural in both resize modes", () => {
+test("cross-grid edge drags are structural", () => {
   const crossLayout: WorkspaceLayoutNode = {
     id: "root",
     type: "split",
@@ -254,8 +294,7 @@ test("cross-grid edge drags are structural in both resize modes", () => {
   const topVertical = resizeTargetAt(crossGeometry, { x: 504, y: 150 });
 
   expect(topVertical).toBeTruthy();
-  expect(resizeTargetRequiresStructuralResize(crossGeometry, topVertical!, "adjacent")).toBe(true);
-  expect(resizeTargetRequiresStructuralResize(crossGeometry, topVertical!, "cascade")).toBe(true);
+  expect(resizeTargetRequiresStructuralResize(crossGeometry, topVertical!)).toBe(true);
 
   const flippedLayout: WorkspaceLayoutNode = {
     id: "root",
@@ -283,31 +322,138 @@ test("cross-grid edge drags are structural in both resize modes", () => {
   const leftHorizontal = resizeTargetAt(flippedGeometry, { x: 250, y: 304 });
 
   expect(leftHorizontal).toBeTruthy();
-  expect(resizeTargetRequiresStructuralResize(flippedGeometry, leftHorizontal!, "adjacent")).toBe(true);
-  expect(resizeTargetRequiresStructuralResize(flippedGeometry, leftHorizontal!, "cascade")).toBe(true);
+  expect(resizeTargetRequiresStructuralResize(flippedGeometry, leftHorizontal!)).toBe(true);
 });
 
-test("cascade mode allows same-axis chains", () => {
-  const chainLayout: WorkspaceLayoutNode = {
+test("adjacent horizontal cross segment does not resize the opposite segment", () => {
+  const layout: WorkspaceLayoutNode = {
+    id: "root",
+    type: "split",
+    direction: "column",
+    ratio: 0.5,
+    first: {
+      id: "top-row",
+      type: "split",
+      direction: "row",
+      ratio: 0.5,
+      first: leaf("top-left"),
+      second: leaf("top-right")
+    },
+    second: {
+      id: "bottom-row",
+      type: "split",
+      direction: "row",
+      ratio: 0.5,
+      first: leaf("bottom-left"),
+      second: leaf("bottom-right")
+    }
+  };
+  const size = { width: 1008, height: 608 };
+  const point = { x: 250, y: 304 };
+  const before = sizesByApplet(computeCanonicalLayout(layout, size));
+  const after = sizesByApplet(resizeLikeRenderer(layout, point, { x: 0, y: 80 }, size));
+
+  expect(after["top-left"].height).toBe(before["top-left"].height + 80);
+  expect(after["bottom-left"].height).toBe(before["bottom-left"].height - 80);
+  expect(after["top-right"].height).toBe(before["top-right"].height);
+  expect(after["bottom-right"].height).toBe(before["bottom-right"].height);
+});
+
+test("adjacent horizontal cross segment near junction still targets only that segment", () => {
+  const layout: WorkspaceLayoutNode = {
+    id: "root",
+    type: "split",
+    direction: "column",
+    ratio: 0.5,
+    first: {
+      id: "top-row",
+      type: "split",
+      direction: "row",
+      ratio: 0.5,
+      first: leaf("top-left"),
+      second: leaf("top-right")
+    },
+    second: {
+      id: "bottom-row",
+      type: "split",
+      direction: "row",
+      ratio: 0.5,
+      first: leaf("bottom-left"),
+      second: leaf("bottom-right")
+    }
+  };
+  const size = { width: 1008, height: 608 };
+  const point = { x: 496, y: 304 };
+  const before = sizesByApplet(computeCanonicalLayout(layout, size));
+  const after = sizesByApplet(resizeLikeRenderer(layout, point, { x: 0, y: 80 }, size));
+
+  expect(after["top-left"].height).toBe(before["top-left"].height + 80);
+  expect(after["bottom-left"].height).toBe(before["bottom-left"].height - 80);
+  expect(after["top-right"].height).toBe(before["top-right"].height);
+  expect(after["bottom-right"].height).toBe(before["bottom-right"].height);
+});
+
+test("cross center still targets the junction", () => {
+  const layout: WorkspaceLayoutNode = {
+    id: "root",
+    type: "split",
+    direction: "column",
+    ratio: 0.5,
+    first: {
+      id: "top-row",
+      type: "split",
+      direction: "row",
+      ratio: 0.5,
+      first: leaf("top-left"),
+      second: leaf("top-right")
+    },
+    second: {
+      id: "bottom-row",
+      type: "split",
+      direction: "row",
+      ratio: 0.5,
+      first: leaf("bottom-left"),
+      second: leaf("bottom-right")
+    }
+  };
+  const geometry = computeCanonicalLayout(layout, { width: 1008, height: 608 });
+  const target = resizeTargetAt(geometry, { x: 504, y: 304 });
+
+  expect(target?.type).toBe("junction");
+});
+
+test("adjacent vertical cross segment does not resize the opposite segment", () => {
+  const layout: WorkspaceLayoutNode = {
     id: "root",
     type: "split",
     direction: "row",
     ratio: 0.5,
-    first: leaf("left"),
-    second: {
-      id: "right-row",
+    first: {
+      id: "left-stack",
       type: "split",
-      direction: "row",
+      direction: "column",
       ratio: 0.5,
-      first: leaf("middle"),
-      second: leaf("right")
+      first: leaf("top-left"),
+      second: leaf("bottom-left")
+    },
+    second: {
+      id: "right-stack",
+      type: "split",
+      direction: "column",
+      ratio: 0.5,
+      first: leaf("top-right"),
+      second: leaf("bottom-right")
     }
   };
-  const chainGeometry = computeCanonicalLayout(chainLayout, { width: 308, height: 120 });
-  const chainVertical = resizeTargetAt(chainGeometry, { x: 154, y: 60 });
+  const size = { width: 1008, height: 608 };
+  const point = { x: 504, y: 150 };
+  const before = sizesByApplet(computeCanonicalLayout(layout, size));
+  const after = sizesByApplet(resizeLikeRenderer(layout, point, { x: 80, y: 0 }, size));
 
-  expect(chainVertical).toBeTruthy();
-  expect(resizeTargetRequiresStructuralResize(chainGeometry, chainVertical!, "cascade")).toBe(false);
+  expect(after["top-left"].width).toBe(before["top-left"].width + 80);
+  expect(after["top-right"].width).toBe(before["top-right"].width - 80);
+  expect(after["bottom-left"].width).toBe(before["bottom-left"].width);
+  expect(after["bottom-right"].width).toBe(before["bottom-right"].width);
 });
 
 test("resize projection clamps using every touching leaf", () => {
@@ -326,39 +472,4 @@ test("resize projection clamps using every touching leaf", () => {
   const projected = projectResize(geometry, target!, { x: 120, y: 0 }, MIN_APPLET_SIZE);
   expect(projected.dx).toBe(10);
   expect(projected.ratios.root).toBeCloseTo((60 + 10) / 120, 8);
-});
-
-test("cascading resize keeps connected branch ratios and clamps by propagated leaves", () => {
-  const layout: WorkspaceLayoutNode = {
-    id: "root",
-    type: "split",
-    direction: "row",
-    ratio: 0.5,
-    first: leaf("left"),
-    second: {
-      id: "right-row",
-      type: "split",
-      direction: "row",
-      ratio: 0.5,
-      first: leaf("middle"),
-      second: leaf("right")
-    }
-  };
-  const geometry = computeCanonicalLayout(layout, { width: 308, height: 120 });
-  const target = resizeTargetAt(geometry, { x: 154, y: 60 });
-
-  expect(target).toBeTruthy();
-  const adjacent = projectResize(geometry, target!, { x: 60, y: 0 }, MIN_APPLET_SIZE);
-  const cascade = projectResize(geometry, target!, { x: 60, y: 0 }, MIN_APPLET_SIZE, "cascade");
-
-  expect(adjacent.dx).toBe(21);
-  expect(cascade.dx).toBe(42);
-  expect(cascade.ratios.root).toBeCloseTo((150 + 42) / 300, 8);
-  expect(cascade.ratios).not.toHaveProperty("right-row");
-
-  const cascadedGeometry = computeCanonicalLayout(applyRatioOverrides(layout, cascade.ratios), { width: 308, height: 120 });
-  const widths = Object.fromEntries(cascadedGeometry.leaves.map((item) => [item.appletInstanceId, item.rect.right - item.rect.left]));
-  expect(widths.left).toBe(192);
-  expect(widths.middle).toBe(50);
-  expect(widths.right).toBe(50);
 });

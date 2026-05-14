@@ -23,8 +23,8 @@ export type OpenCodeRunOptions = {
 
 export type OpenCodeRuntimeEvent =
   | { type: "session.started"; sessionId: string }
-  | { type: "assistant.delta"; id: string; status: string; text: string; sessionId?: string }
-  | { type: "reasoning.delta"; id: string; status: string; text: string; sessionId?: string }
+  | { type: "assistant.delta"; id: string; status: string; text: string; replace?: boolean; sessionId?: string }
+  | { type: "reasoning.delta"; id: string; status: string; text: string; replace?: boolean; sessionId?: string }
   | { type: "timeline"; eventType: "item.started" | "item.updated" | "item.completed"; block: ChatTimelineBlock; sessionId?: string }
   | { type: "final.snapshot"; content: string; reasoning: string }
   | { type: "turn.completed"; sessionId?: string }
@@ -39,7 +39,7 @@ type OpenCodeServer = {
 
 type QueuedOpenCodeEvent =
   | { kind: "event"; event: OpenCodeRuntimeEvent }
-  | { kind: "done" }
+  | { kind: "stream.closed" }
   | { kind: "error"; error: Error };
 
 type OpenCodePart = {
@@ -59,6 +59,9 @@ type OpenCodePart = {
   tokens?: unknown;
 };
 
+type OpenCodePartSnapshotState = Map<string, { text: string; streamed: boolean }>;
+type OpenCodePartTextUpdate = { text: string; replace: boolean };
+
 type PendingPermission = {
   serverUrl: string;
   cwd: string;
@@ -71,6 +74,8 @@ type OpenCodeHarmonyState = {
   completed: boolean;
   streamedFlattenedReasoningLength: number;
   streamedFlattenedReasoning: string;
+  flattenedContentStartIndex: number | null;
+  streamedFlattenedContentLength: number;
   harmonyParserStarted: boolean;
 };
 
@@ -96,7 +101,6 @@ export class RealOpenCodeRuntime implements OpenCodeRuntime {
     let eventStream: Promise<void> | null = null;
     const eventQueue = new AsyncEventQueue();
     let sessionId = options.sessionId?.trim() ?? "";
-    let sawIdle = false;
     let latestAssistantMessageId = "";
     const harmonyStates = new Map<string, OpenCodeHarmonyState>();
     const normalizeGptOss = options.nativeGptOss;
@@ -129,8 +133,8 @@ export class RealOpenCodeRuntime implements OpenCodeRuntime {
         if (event.type === "session.started") {
           return;
         }
-        if (event.type === "assistant.delta" && event.id) {
-          latestAssistantMessageId = latestAssistantMessageId || messageIdFromPartId(event.id);
+        if ((event.type === "assistant.delta" || event.type === "reasoning.delta") && event.id) {
+          latestAssistantMessageId = messageIdFromPartId(event.id);
         }
         if (event.type === "timeline" && event.block.kind === "approval" && server) {
           this.pendingPermissions.set(event.block.id, {
@@ -139,14 +143,11 @@ export class RealOpenCodeRuntime implements OpenCodeRuntime {
           });
         }
         for (const normalizedEvent of normalizeOpenCodeHarmonyEvent(event, harmonyStates, normalizeGptOss)) {
-          if (normalizedEvent.type === "turn.completed") {
-            sawIdle = true;
-          }
           eventQueue.push({ kind: "event", event: normalizedEvent });
         }
       }, (message, details) => {
         eventQueue.push({ kind: "event", event: { type: "error", message, details } });
-      }).then(() => eventQueue.push({ kind: "done" }), (error) => {
+      }).then(() => eventQueue.push({ kind: "stream.closed" }), (error) => {
         if (!abortController.signal.aborted) {
           eventQueue.push({ kind: "error", error: error instanceof Error ? error : new Error(String(error)) });
         }
@@ -164,19 +165,38 @@ export class RealOpenCodeRuntime implements OpenCodeRuntime {
         signal: abortController.signal,
           emptyOk: true
         });
-      while (!sawIdle) {
-        const next = await eventQueue.shift();
-        if (next.kind === "done") {
-          break;
-        }
-        if (next.kind === "error") {
-          throw next.error;
-        }
-        if (isSessionScopedEvent(next.event, sessionId)) {
-          if (next.event.type === "turn.completed") {
-            break;
+      let sawTurnCompleted = false;
+      const consumeQueuedEvent = (queued: QueuedOpenCodeEvent): OpenCodeRuntimeEvent | null => {
+        if (queued.kind === "stream.closed") {
+          if (sawTurnCompleted) {
+            return null;
           }
-          yield next.event;
+          throw new Error("OpenCode event stream closed before turn completion.");
+        }
+        if (queued.kind === "error") {
+          throw queued.error;
+        }
+        if (!isSessionScopedEvent(queued.event, sessionId)) {
+          return null;
+        }
+        if (queued.event.type === "turn.completed") {
+          sawTurnCompleted = true;
+          return null;
+        }
+        return queued.event;
+      };
+      while (!sawTurnCompleted) {
+        const next = await eventQueue.shift();
+        const event = consumeQueuedEvent(next);
+        if (event) {
+          yield event;
+        }
+      }
+      let queued: QueuedOpenCodeEvent | null;
+      while ((queued = eventQueue.tryShift())) {
+        const event = consumeQueuedEvent(queued);
+        if (event) {
+          yield event;
         }
       }
       const snapshot = latestAssistantMessageId
@@ -264,6 +284,10 @@ class AsyncEventQueue {
       return Promise.resolve(value);
     }
     return new Promise((resolve) => this.resolvers.push(resolve));
+  }
+
+  tryShift(): QueuedOpenCodeEvent | null {
+    return this.values.shift() ?? null;
   }
 }
 
@@ -392,31 +416,58 @@ async function readOpenCodeEvents(
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
+  const partSnapshots: OpenCodePartSnapshotState = new Map();
+  const processChunk = (chunk: string) => {
+    const data = sseData(chunk);
+    if (!data) {
+      return;
+    }
+    try {
+      for (const event of mapOpenCodeEvent(JSON.parse(data) as Record<string, unknown>, onErrorEvent, partSnapshots)) {
+        onEvent(event);
+      }
+    } catch (error) {
+      onErrorEvent("OpenCode emitted an event that Unit-0 could not parse.", error instanceof Error ? error.message : String(error));
+    }
+  };
   while (!signal.aborted) {
     const { value, done } = await reader.read();
     if (done) {
+      buffer += decoder.decode();
+      const drained = splitSseFrames(buffer, true);
+      buffer = drained.rest;
+      for (const chunk of drained.frames) {
+        processChunk(chunk);
+      }
       break;
     }
     buffer += decoder.decode(value, { stream: true });
-    const chunks = buffer.split("\n\n");
-    buffer = chunks.pop() ?? "";
-    for (const chunk of chunks) {
-      const data = sseData(chunk);
-      if (!data) {
-        continue;
-      }
-      try {
-        for (const event of mapOpenCodeEvent(JSON.parse(data) as Record<string, unknown>, onErrorEvent)) {
-          onEvent(event);
-        }
-      } catch (error) {
-        onErrorEvent("OpenCode emitted an event that Unit-0 could not parse.", error instanceof Error ? error.message : String(error));
-      }
+    const drained = splitSseFrames(buffer);
+    buffer = drained.rest;
+    for (const chunk of drained.frames) {
+      processChunk(chunk);
     }
   }
 }
 
-export function* mapOpenCodeEvent(raw: Record<string, unknown>, onErrorEvent: (message: string, details?: string) => void): Iterable<OpenCodeRuntimeEvent> {
+export function splitSseFrames(buffer: string, flush = false): { frames: string[]; rest: string } {
+  const frames: string[] = [];
+  const separator = /\r?\n\r?\n/g;
+  let start = 0;
+  let match: RegExpExecArray | null;
+  while ((match = separator.exec(buffer))) {
+    frames.push(buffer.slice(start, match.index));
+    start = match.index + match[0].length;
+  }
+  const rest = buffer.slice(start);
+  if (flush && rest.trim()) {
+    frames.push(rest);
+    return { frames, rest: "" };
+  }
+  return { frames, rest };
+}
+
+export function* mapOpenCodeEvent(raw: Record<string, unknown>, onErrorEvent: (message: string, details?: string) => void, partSnapshots?: OpenCodePartSnapshotState): Iterable<OpenCodeRuntimeEvent> {
   const type = String(raw.type ?? "");
   const properties = isRecord(raw.properties) ? raw.properties : {};
   if (type === "message.part.delta") {
@@ -426,9 +477,11 @@ export function* mapOpenCodeEvent(raw: Record<string, unknown>, onErrorEvent: (m
     const field = String(properties.field ?? "");
     const delta = typeof properties.delta === "string" ? properties.delta : "";
     if (delta && field === "text") {
+      appendPartSnapshotDelta(partSnapshots, `${sessionId}:${messageId}:${partId}:text`, delta);
       yield { type: "assistant.delta", id: `${messageId}:${partId}`, status: "updated", text: delta, sessionId };
     }
     if (delta && field === "reasoning") {
+      appendPartSnapshotDelta(partSnapshots, `${sessionId}:${messageId}:${partId}:reasoning`, delta);
       yield { type: "reasoning.delta", id: `${messageId}:${partId}`, status: "updated", text: delta, sessionId };
     }
     return;
@@ -437,7 +490,7 @@ export function* mapOpenCodeEvent(raw: Record<string, unknown>, onErrorEvent: (m
     const part = isRecord(properties.part) ? properties.part as OpenCodePart : {};
     const sessionId = String(properties.sessionID ?? part.sessionID ?? "");
     const delta = typeof properties.delta === "string" ? properties.delta : undefined;
-    const event = partToRuntimeEvent(part, delta);
+    const event = partToRuntimeEvent(part, delta, sessionId, partSnapshots);
     if (event) {
       if (event.type === "assistant.delta" || event.type === "reasoning.delta" || event.type === "timeline" || event.type === "turn.completed" || event.type === "error") {
         yield { ...event, sessionId };
@@ -495,21 +548,21 @@ export function* mapOpenCodeEvent(raw: Record<string, unknown>, onErrorEvent: (m
   }
 }
 
-function partToRuntimeEvent(part: OpenCodePart, delta?: string): OpenCodeRuntimeEvent | null {
+function partToRuntimeEvent(part: OpenCodePart, delta?: string, sessionId = "", partSnapshots?: OpenCodePartSnapshotState): OpenCodeRuntimeEvent | null {
   const partId = `${part.messageID ?? "message"}:${part.id ?? randomUUID()}`;
   if (part.type === "text") {
-    if (delta === undefined) {
+    const update = partTextDelta(partSnapshots, `${sessionId}:${partId}:text`, typeof part.text === "string" ? part.text : undefined, delta);
+    if (!update) {
       return null;
     }
-    const text = delta;
-    return text ? { type: "assistant.delta", id: partId, status: "updated", text } : null;
+    return update.text || update.replace ? { type: "assistant.delta", id: partId, status: "updated", text: update.text, replace: update.replace || undefined } : null;
   }
   if (part.type === "reasoning") {
-    if (delta === undefined) {
+    const update = partTextDelta(partSnapshots, `${sessionId}:${partId}:reasoning`, typeof part.text === "string" ? part.text : undefined, delta);
+    if (!update) {
       return null;
     }
-    const text = delta;
-    return text ? { type: "reasoning.delta", id: partId, status: "updated", text } : null;
+    return update.text || update.replace ? { type: "reasoning.delta", id: partId, status: "updated", text: update.text, replace: update.replace || undefined } : null;
   }
   if (part.type === "tool") {
     const state = part.state ?? {};
@@ -567,6 +620,53 @@ function partToRuntimeEvent(part: OpenCodePart, delta?: string): OpenCodeRuntime
   return null;
 }
 
+function partSnapshotDelta(partSnapshots: OpenCodePartSnapshotState | undefined, key: string, text: string | undefined): OpenCodePartTextUpdate | undefined {
+  if (!partSnapshots || text === undefined) {
+    return undefined;
+  }
+  const previous = partSnapshots.get(key);
+  if (previous === undefined) {
+    partSnapshots.set(key, { text, streamed: false });
+    return undefined;
+  }
+  if (!previous.streamed) {
+    partSnapshots.set(key, { text, streamed: false });
+    return undefined;
+  }
+  if (text.startsWith(previous.text)) {
+    partSnapshots.set(key, { text, streamed: true });
+    return { text: text.slice(previous.text.length), replace: false };
+  }
+  if (previous.text.startsWith(text)) {
+    partSnapshots.set(key, { text, streamed: true });
+    return { text, replace: true };
+  }
+  partSnapshots.set(key, { text, streamed: true });
+  return { text, replace: true };
+}
+
+function partTextDelta(partSnapshots: OpenCodePartSnapshotState | undefined, key: string, fullText: string | undefined, delta: string | undefined): OpenCodePartTextUpdate | undefined {
+  if (delta !== undefined) {
+    const previous = partSnapshots?.get(key);
+    if (partSnapshots && previous !== undefined && fullText !== undefined && fullText !== `${previous.text}${delta}`) {
+      partSnapshots.set(key, { text: fullText, streamed: true });
+      return { text: fullText, replace: true };
+    }
+    if (partSnapshots) {
+      partSnapshots.set(key, { text: fullText ?? `${partSnapshots.get(key)?.text ?? ""}${delta}`, streamed: true });
+    }
+    return { text: delta, replace: false };
+  }
+  return partSnapshotDelta(partSnapshots, key, fullText);
+}
+
+function appendPartSnapshotDelta(partSnapshots: OpenCodePartSnapshotState | undefined, key: string, delta: string): void {
+  if (!partSnapshots) {
+    return;
+  }
+  partSnapshots.set(key, { text: `${partSnapshots.get(key)?.text ?? ""}${delta}`, streamed: true });
+}
+
 export function normalizeOpenCodeHarmonyEvent(event: OpenCodeRuntimeEvent, states: Map<string, OpenCodeHarmonyState>, nativeGptOss = true): OpenCodeRuntimeEvent[] {
   if (event.type !== "assistant.delta") {
     return [event];
@@ -581,57 +681,64 @@ export function normalizeOpenCodeHarmonyEvent(event: OpenCodeRuntimeEvent, state
     completed: false,
     streamedFlattenedReasoningLength: 0,
     streamedFlattenedReasoning: "",
+    flattenedContentStartIndex: null,
+    streamedFlattenedContentLength: 0,
     harmonyParserStarted: false
   };
   states.set(event.id, state);
-  if (state.completed) {
+  if (event.replace) {
+    state.parser = new GptOssChannelParser({ defaultChannel: "final", toolRecipients: ["shell"] });
+    state.rawText = "";
+    state.sawHarmonyMarker = false;
+    state.completed = false;
+    state.streamedFlattenedReasoningLength = 0;
+    state.streamedFlattenedReasoning = "";
+    state.flattenedContentStartIndex = null;
+    state.streamedFlattenedContentLength = 0;
+    state.harmonyParserStarted = false;
+  } else if (state.completed) {
     return [];
   }
   state.rawText += event.text;
   state.sawHarmonyMarker = state.sawHarmonyMarker || containsHarmonyChannelMarker(event.text) || containsHarmonyChannelMarker(state.rawText);
   if (!state.sawHarmonyMarker) {
     const parsed = parseFlattenedGptOssText(state.rawText);
-    if (!parsed.hasBoundary && !parsed.complete) {
+    const live = parseLiveFlattenedGptOssText(state.rawText, state.flattenedContentStartIndex);
+    if (!live.hasBoundary) {
+      if (!parsed.complete) {
+        return [];
+      }
+      state.completed = true;
+      return parsed.content ? [{ ...event, text: parsed.content, replace: event.replace || undefined }] : [];
+    }
+    const nextReasoning = parsed.complete ? parsed.reasoning : live.reasoning;
+    if (!nextReasoning && !parsed.complete) {
       return [];
     }
     const events: OpenCodeRuntimeEvent[] = [];
-    if (parsed.complete) {
-      if (parsed.reasoning.startsWith(state.streamedFlattenedReasoning)) {
-        const reasoningDelta = parsed.reasoning.slice(state.streamedFlattenedReasoningLength);
-        if (reasoningDelta) {
-          events.push({
-            type: "reasoning.delta",
-            id: `${event.id}:reasoning`,
-            status: event.status,
-            text: reasoningDelta,
-            sessionId: event.sessionId
-          });
-        }
-      }
-      state.streamedFlattenedReasoning = parsed.reasoning;
-      state.streamedFlattenedReasoningLength = parsed.reasoning.length;
-      state.completed = true;
-      if (parsed.content) {
-        events.push({ ...event, text: parsed.content });
-      }
-      return events;
-    }
-    if (state.streamedFlattenedReasoningLength > 0) {
-      return [];
-    }
-    if (parsed.reasoning.startsWith(state.streamedFlattenedReasoning)) {
-      const reasoningDelta = parsed.reasoning.slice(state.streamedFlattenedReasoningLength);
-      state.streamedFlattenedReasoning = parsed.reasoning;
-      state.streamedFlattenedReasoningLength = parsed.reasoning.length;
+    if (nextReasoning.startsWith(state.streamedFlattenedReasoning)) {
+      const reasoningDelta = nextReasoning.slice(state.streamedFlattenedReasoningLength);
+      state.streamedFlattenedReasoning = nextReasoning;
+      state.streamedFlattenedReasoningLength = nextReasoning.length;
       if (reasoningDelta) {
         events.push({
           type: "reasoning.delta",
           id: `${event.id}:reasoning`,
           status: event.status,
           text: reasoningDelta,
+          replace: event.replace || undefined,
           sessionId: event.sessionId
         });
       }
+    }
+    if (parsed.complete) {
+      state.completed = true;
+      const finalContentDelta = parsed.content.slice(state.streamedFlattenedContentLength);
+      if (finalContentDelta) {
+        state.streamedFlattenedContentLength = parsed.content.length;
+        events.push({ ...event, text: finalContentDelta, replace: event.replace || undefined });
+      }
+      events.sort((left, right) => (left.type === "assistant.delta" ? 1 : 0) - (right.type === "assistant.delta" ? 1 : 0));
     }
     return events;
   }
@@ -645,11 +752,12 @@ export function normalizeOpenCodeHarmonyEvent(event: OpenCodeRuntimeEvent, state
       id: `${event.id}:reasoning`,
       status: event.status,
       text: parsed.reasoning,
+      replace: event.replace || undefined,
       sessionId: event.sessionId
     });
   }
   if (parsed.content) {
-    events.push({ ...event, text: parsed.content });
+    events.push({ ...event, text: parsed.content, replace: event.replace || undefined });
   }
   return events;
 }
@@ -722,22 +830,34 @@ function parseFlattenedGptOssText(text: string): { content: string; reasoning: s
       complete
     };
   }
-  const lines = cleanedRaw.split(/\r?\n/u).map((line) => line.trim()).filter(Boolean);
-  const hasLineBoundary = lines.length > 1;
-  if (complete && hasLineBoundary) {
-    return {
-      reasoning: lines.slice(0, -1).join("\n"),
-      content: lines.at(-1) ?? "",
-      hasBoundary: true,
-      complete
-    };
-  }
   return {
     content: complete ? cleaned : "",
     reasoning: "",
-    hasBoundary: hasParagraphBoundary || (complete && hasLineBoundary),
+    hasBoundary: hasParagraphBoundary,
     complete
   };
+}
+
+function parseLiveFlattenedGptOssText(text: string, lockedContentStartIndex: number | null): { content: string; reasoning: string; hasBoundary: boolean; contentStartIndex: number } {
+  const returnIndex = text.indexOf("<|return|>");
+  const beforeReturn = returnIndex >= 0 ? text.slice(0, returnIndex) : text;
+  const cleanedRaw = stripIncompleteHarmonyMarker(stripHarmonyMarkers(beforeReturn));
+  void lockedContentStartIndex;
+  const paragraphSplit = /\r?\n\s*\r?\n/u;
+  const hasBoundary = paragraphSplit.test(cleanedRaw);
+  if (!hasBoundary) {
+    return { content: "", reasoning: "", hasBoundary: false, contentStartIndex: 0 };
+  }
+  const paragraphs = cleanedRaw.split(paragraphSplit).map((part) => part.trim()).filter(Boolean);
+  if (paragraphs.length === 0) {
+    return { content: "", reasoning: "", hasBoundary: false, contentStartIndex: 0 };
+  }
+  const endsWithBoundary = /\r?\n\s*\r?\n\s*$/u.test(cleanedRaw);
+  const reasoningParagraphs = paragraphs.length === 1 && endsWithBoundary ? paragraphs : paragraphs.slice(0, -1);
+  const reasoning = reasoningParagraphs.join("\n\n");
+  const content = paragraphs.length > reasoningParagraphs.length ? paragraphs.at(-1) ?? "" : "";
+  const contentStartIndex = Math.max(0, cleanedRaw.length - content.length);
+  return { content, reasoning, hasBoundary: true, contentStartIndex };
 }
 
 function stripHarmonyMarkers(text: string): string {

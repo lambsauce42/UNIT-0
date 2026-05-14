@@ -5,6 +5,8 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { ChatStore } from "../src/main/chatStore";
+import type { ChatTimelineBlock } from "../src/shared/types";
 
 function makeDataDir(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), "unit-0-e2e-"));
@@ -200,6 +202,23 @@ async function layoutRatio(page: Page, workspaceId: string, splitId: string): Pr
         return visit(payload.state.workspaces[targetWorkspaceId]?.layout ?? null);
       }),
     { workspaceId, splitId }
+  );
+}
+
+async function renderedOpenCodeTimelineKinds(page: Page): Promise<string[]> {
+  return page.getByTestId("chat-message-assistant").last().evaluate((message) =>
+    Array.from(message.querySelectorAll(".codex-reasoning-block, .codex-assistant-message-block, .codex-tool-card")).map((node) => {
+      if (node.classList.contains("codex-reasoning-block")) {
+        return "reasoning";
+      }
+      if (node.classList.contains("codex-assistant-message-block")) {
+        return "assistant";
+      }
+      if (node.classList.contains("codex-tool-card")) {
+        return "tool";
+      }
+      return "unknown";
+    })
   );
 }
 
@@ -447,6 +466,115 @@ test("renders global chat state and persists local model selection", async () =>
   await app.close();
 });
 
+test("chat renders OpenCode streaming timeline blocks in DOM order", async () => {
+  const dataDir = makeDataDir();
+  const store = new ChatStore(path.join(dataDir, "unit0.sqlite"));
+  let app: ElectronApplication | null = null;
+  try {
+    const state = store.loadState();
+    store.createMessage(state.selectedThreadId, "user", "render OpenCode stream", "complete");
+    const assistant = store.createMessage(state.selectedThreadId, "assistant", "", "streaming", {
+      label: "gpt-oss-test",
+      sourceLabel: "Built-in"
+    });
+    app = await launchApp(dataDir);
+    const page = await firstWindow(app);
+    await expect(page.getByTestId("chat-message-assistant")).toHaveCount(1);
+    const rendered = page.getByTestId("chat-message-assistant").last();
+    const publishFrame = async (content: string, reasoning: string, timelineBlocks: ChatTimelineBlock[], status: "streaming" | "complete" = "streaming") => {
+      store.replaceMessageReasoning(assistant.id, reasoning);
+      store.replaceMessageContent(assistant.id, content);
+      store.updateMessageTimelineBlocks(assistant.id, timelineBlocks);
+      store.updateMessageStatus(assistant.id, status);
+      await page.evaluate(() => window.unitApi.chat.updateAppSettings({ settings: {} }));
+    };
+
+    const reasoningBlock: ChatTimelineBlock = {
+      kind: "reasoning",
+      id: "opencode-reasoning",
+      status: "updated",
+      text: "Plan ",
+      initiallyExpanded: true
+    };
+    await publishFrame("", "Plan ", [reasoningBlock]);
+    await expect(rendered.locator(".codex-reasoning-block .reasoning-panel")).toContainText("Plan");
+    await expect(rendered.locator(".codex-assistant-message-block")).toHaveCount(0);
+    await expect(rendered.locator(".codex-tool-card")).toHaveCount(0);
+    expect(await renderedOpenCodeTimelineKinds(page)).toEqual(["reasoning"]);
+
+    const firstAnswerBlock: ChatTimelineBlock = {
+      kind: "assistant_message",
+      id: "opencode-answer",
+      status: "updated",
+      text: "First visible answer. "
+    };
+    await publishFrame("First visible answer. ", "Plan work.", [
+      { ...reasoningBlock, status: "completed", text: "Plan work." },
+      firstAnswerBlock
+    ]);
+    await expect(rendered.locator(".codex-assistant-message-block")).toHaveText("First visible answer.");
+    expect(await renderedOpenCodeTimelineKinds(page)).toEqual(["reasoning", "assistant"]);
+
+    const toolBlock: ChatTimelineBlock = {
+      kind: "tool",
+      id: "opencode-tool",
+      toolName: "command",
+      status: "running",
+      command: "pwd",
+      directory: "C:\\Workspace",
+      initiallyExpanded: true
+    };
+    await publishFrame("First visible answer. ", "Plan work.", [
+      { ...reasoningBlock, status: "completed", text: "Plan work." },
+      { ...firstAnswerBlock, status: "completed" },
+      toolBlock
+    ]);
+    await expect(rendered.locator(".codex-tool-card")).toContainText("pwd");
+    expect(await renderedOpenCodeTimelineKinds(page)).toEqual(["reasoning", "assistant", "tool"]);
+
+    const secondReasoningBlock: ChatTimelineBlock = {
+      kind: "reasoning",
+      id: "opencode-reasoning:segment-1",
+      status: "updated",
+      text: "Check result.",
+      initiallyExpanded: true
+    };
+    await publishFrame("First visible answer. ", "Plan work.Check result.", [
+      { ...reasoningBlock, status: "completed", text: "Plan work." },
+      { ...firstAnswerBlock, status: "completed" },
+      { ...toolBlock, status: "completed", output: "C:\\Workspace" },
+      secondReasoningBlock
+    ]);
+    await expect(rendered.locator(".codex-reasoning-block").nth(1)).toContainText("Check result.");
+    expect(await renderedOpenCodeTimelineKinds(page)).toEqual(["reasoning", "assistant", "tool", "reasoning"]);
+
+    const secondAnswerBlock: ChatTimelineBlock = {
+      kind: "assistant_message",
+      id: "opencode-answer:segment-1",
+      status: "completed",
+      text: "After tool."
+    };
+    await publishFrame("First visible answer. After tool.", "Plan work.Check result.", [
+      { ...reasoningBlock, status: "completed", text: "Plan work." },
+      { ...firstAnswerBlock, status: "completed" },
+      { ...toolBlock, status: "completed", output: "C:\\Workspace" },
+      { ...secondReasoningBlock, status: "completed" },
+      secondAnswerBlock
+    ], "complete");
+    await expect(rendered.locator(".codex-assistant-message-block").nth(0)).toHaveText("First visible answer.");
+    await expect(rendered.locator(".codex-assistant-message-block").nth(1)).toHaveText("After tool.");
+    expect(await renderedOpenCodeTimelineKinds(page)).toEqual(["reasoning", "assistant", "tool", "reasoning", "assistant"]);
+    await expect(rendered).not.toContainText("Hidden tail");
+    await expect(rendered).not.toContainText("Hidden reasoning");
+  } finally {
+    if (app) {
+      await app.close();
+    }
+    store.close();
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
 test("chat OpenCode mode runs through real local model harness", async () => {
   test.setTimeout(300_000);
   const modelPath = process.env.UNIT0_E2E_OPENCODE_LOCAL_MODEL || "C:\\Users\\Max\\Models\\gpt-oss-20b-GGUF\\gpt-oss-20b-mxfp4.gguf";
@@ -474,12 +602,12 @@ test("chat OpenCode mode runs through real local model harness", async () => {
         runtimeSettings: {
           nCtx: 16384,
           nGpuLayers: localGpuLayers,
-          maxTokens: 128,
+          maxTokens: 256,
           temperature: 0.2,
-          systemPrompt: "Keep the answer short."
+          systemPrompt: "For this test, answer in exactly two paragraphs. The first paragraph is one short reasoning sentence. The second paragraph is only the final answer."
         }
       });
-      const submit = window.unitApi.chat.submit({ text: "Use analysis for one short reason, then reply with exactly: opencode-ok" });
+      const submit = window.unitApi.chat.submit({ text: "First paragraph: one short reason that the required final answer is opencode-ok. Second paragraph: exactly opencode-ok and nothing else." });
       const frames: Array<{ content: string; reasoning: string; timelineKinds: string[]; status: string; generationStatus: string }> = [];
       const startedAt = Date.now();
       while (Date.now() - startedAt < 240_000) {
@@ -500,7 +628,7 @@ test("chat OpenCode mode runs through real local model harness", async () => {
         if (snapshot.generation.status === "error" || assistant?.status === "error") {
           break;
         }
-        await new Promise((resolve) => setTimeout(resolve, 100));
+        await new Promise((resolve) => setTimeout(resolve, 25));
       }
       await submit;
       return { finalState: await window.unitApi.chat.bootstrap(), frames };
@@ -514,7 +642,7 @@ test("chat OpenCode mode runs through real local model harness", async () => {
       const assistant = state.messages.filter((message) => message.role === "assistant").at(-1);
       expect(state.generation.status).toBe("idle");
       expect(assistant?.status).toBe("complete");
-      expect(assistant?.content?.trim().length).toBeGreaterThan(0);
+      expect(assistant?.content?.trim()).toBe("opencode-ok");
       expect(assistant?.reasoning?.trim().length).toBeGreaterThan(0);
       finalAssistantReasoning = assistant?.reasoning?.trim() ?? "";
       expect(assistant?.timelineBlocks?.some((block) => block.kind === "status" && block.code === "opencode_failed")).not.toBe(true);
@@ -522,10 +650,23 @@ test("chat OpenCode mode runs through real local model harness", async () => {
       expect(assistant?.content ?? "").not.toContain("<|");
       expect(assistant?.reasoning ?? "").not.toContain("<|");
     }).toPass({ timeout: 240_000 });
+    const finalAssistant = finalState.messages.filter((message) => message.role === "assistant").at(-1);
+    const finalKinds = finalAssistant?.timelineBlocks?.map((block) => block.kind) ?? [];
+    expect(finalKinds.indexOf("assistant_message")).toBeGreaterThanOrEqual(0);
+    if (finalKinds.includes("reasoning")) {
+      expect(finalKinds.indexOf("assistant_message")).toBeGreaterThan(finalKinds.indexOf("reasoning"));
+    }
     const firstReasoningFrame = e2eResult.frames.findIndex((frame) => frame.reasoning.trim().length > 0 || frame.timelineKinds.includes("reasoning"));
-    const firstAnswerFrame = e2eResult.frames.findIndex((frame) => frame.content.trim().length > 0 || frame.timelineKinds.includes("assistant_message"));
+    const firstAnswerFrame = e2eResult.frames.findIndex((frame) => frame.content.trim().length > 0);
     expect(firstReasoningFrame).toBeGreaterThanOrEqual(0);
-    expect(firstAnswerFrame).toBeGreaterThan(firstReasoningFrame);
+    expect(firstAnswerFrame).toBeGreaterThanOrEqual(0);
+    expect(firstAnswerFrame).toBeGreaterThanOrEqual(firstReasoningFrame);
+    if (firstAnswerFrame === firstReasoningFrame) {
+      const firstVisibleKinds = e2eResult.frames[firstAnswerFrame].timelineKinds;
+      expect(firstVisibleKinds).toContain("reasoning");
+      expect(firstVisibleKinds).toContain("assistant_message");
+      expect(firstVisibleKinds.indexOf("reasoning")).toBeLessThan(firstVisibleKinds.indexOf("assistant_message"));
+    }
     for (const frame of e2eResult.frames) {
       expect(frame.content).not.toContain("<|return|>");
       expect(frame.reasoning).not.toContain("<|return|>");
@@ -535,8 +676,9 @@ test("chat OpenCode mode runs through real local model harness", async () => {
       expect(answerFrames[index]).toContain(answerFrames[index - 1]);
     }
     const rendered = page.getByTestId("chat-message-assistant").last();
-    await expect(rendered.locator("details.reasoning-shell")).toHaveCount(1);
-    const body = rendered.locator(".assistant-content-block");
+    expect(await rendered.locator("details.reasoning-shell").count()).toBeGreaterThan(0);
+    const body = rendered.locator(".codex-assistant-message-block").last();
+    await expect(body).toHaveText("opencode-ok");
     await expect(body).not.toContainText("<|return|>");
     await expect(body).not.toContainText("We need");
     await expect(body).not.toContainText("User says");

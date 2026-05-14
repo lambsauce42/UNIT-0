@@ -527,10 +527,7 @@ export interface TabDragSession {
   finishing: boolean;
 }
 
-export type TileResizeMode = "adjacent" | "cascade";
-
 export interface UnitSettings {
-  tileResizeMode: TileResizeMode;
   expandedSidebarWidthRatio: number;
 }
 
@@ -614,11 +611,6 @@ export interface CloseWorkspacePayload {
 
 export interface UpdateUnitSettingsPayload {
   settings: Partial<UnitSettings>;
-}
-
-export interface UpdateLayoutRatiosPayload {
-  workspaceId: string;
-  ratios: Record<string, number>;
 }
 
 export interface ReplaceWorkspaceLayoutPayload {
@@ -870,7 +862,6 @@ export interface UnitApi {
     openWorkspaceTab: (payload: OpenWorkspaceTabPayload) => Promise<void>;
     renameWorkspace: (payload: RenameWorkspacePayload) => Promise<void>;
     closeWorkspace: (payload: CloseWorkspacePayload) => Promise<void>;
-    updateLayoutRatios: (payload: UpdateLayoutRatiosPayload) => Promise<void>;
     replaceLayout: (payload: ReplaceWorkspaceLayoutPayload) => Promise<void>;
     applyTemplate: (payload: ApplyWorkspaceTemplatePayload) => Promise<Workspace>;
   };

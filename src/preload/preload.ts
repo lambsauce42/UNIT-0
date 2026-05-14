@@ -66,7 +66,6 @@ import type {
   SelectFilesPayload,
   ShelveAppletInstancePayload,
   UnshelveAppletInstancePayload,
-  UpdateLayoutRatiosPayload,
   UpdateAppletSessionStatePayload,
   UpdateTabDragPayload,
   WriteFilePayload
@@ -104,8 +103,6 @@ const api: UnitApi = {
     openWorkspaceTab: (payload: OpenWorkspaceTabPayload) => ipcRenderer.invoke("workspaces:openWorkspaceTab", payload),
     renameWorkspace: (payload: RenameWorkspacePayload) => ipcRenderer.invoke("workspaces:renameWorkspace", payload),
     closeWorkspace: (payload: CloseWorkspacePayload) => ipcRenderer.invoke("workspaces:closeWorkspace", payload),
-    updateLayoutRatios: (payload: UpdateLayoutRatiosPayload) =>
-      ipcRenderer.invoke("workspaces:updateLayoutRatios", payload),
     replaceLayout: (payload: ReplaceWorkspaceLayoutPayload) => ipcRenderer.invoke("workspaces:replaceLayout", payload),
     applyTemplate: (payload: ApplyWorkspaceTemplatePayload) => ipcRenderer.invoke("workspaces:applyTemplate", payload)
   },

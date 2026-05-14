@@ -351,31 +351,7 @@ button {
 .settings-body {
   display: grid;
   min-height: 0;
-  grid-template-columns: 168px minmax(0, 1fr);
-}
-
-.settings-tabs {
-  display: grid;
-  align-content: start;
-  gap: 4px;
-  padding: 10px;
-  border-right: 1px solid var(--border-subtle);
-  background: var(--bg-panel-soft);
-}
-
-.settings-tabs button {
-  height: 32px;
-  padding: 0 10px;
-  border: 0;
-  border-radius: 4px;
-  background: transparent;
-  color: var(--text-secondary);
-  text-align: left;
-}
-
-.settings-tabs button.active {
-  background: var(--bg-hover);
-  color: var(--text-primary);
+  grid-template-columns: minmax(0, 1fr);
 }
 
 .settings-panel {
@@ -385,63 +361,6 @@ button {
   grid-template-rows: auto minmax(0, 1fr);
   gap: 12px;
   padding: 14px;
-}
-
-.settings-form-panel {
-  align-content: start;
-  grid-template-rows: auto;
-}
-
-.settings-section {
-  display: grid;
-  gap: 12px;
-  max-width: 560px;
-}
-
-.settings-section h3 {
-  margin: 0;
-  color: var(--text-primary);
-  font-size: 13px;
-}
-
-.settings-radio-list {
-  display: grid;
-  gap: 8px;
-}
-
-.settings-radio-list label {
-  display: grid;
-  grid-template-columns: 16px minmax(0, 1fr);
-  gap: 10px;
-  align-items: start;
-  padding: 10px;
-  border: 1px solid var(--border-subtle);
-  border-radius: 6px;
-  background: var(--bg-panel-soft);
-}
-
-.settings-radio-list input {
-  width: 14px;
-  height: 14px;
-  margin: 2px 0 0;
-  accent-color: var(--accent-strong);
-}
-
-.settings-radio-list span {
-  display: grid;
-  gap: 3px;
-  min-width: 0;
-}
-
-.settings-radio-list strong {
-  color: var(--text-primary);
-  font-size: 13px;
-}
-
-.settings-radio-list small {
-  color: var(--text-muted);
-  font-size: 12px;
-  line-height: 1.35;
 }
 
 .about-product {

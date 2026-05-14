@@ -66,7 +66,6 @@ import type {
   TabHostState,
   UnitState,
   UpdateUnitSettingsPayload,
-  UpdateLayoutRatiosPayload,
   UpdateAppletSessionStatePayload,
   UpdateTabDragPayload,
   Workspace,
@@ -403,14 +402,6 @@ class TabRegistry {
     }
     this.persistPrimaryHost();
     return { closeWindowIds: this.emptyDetachedWindowIds(), deletedSessionIds: result.deletedSessionIds };
-  }
-
-  updateLayoutRatios(payload: UpdateLayoutRatiosPayload): void {
-    const workspace = this.workspaces[payload.workspaceId];
-    if (!workspace || this.dragSession) {
-      throw new Error(`Cannot update layout ratios for workspace ${payload.workspaceId}`);
-    }
-    this.workspaces[payload.workspaceId] = this.store.updateLayoutRatios(payload);
   }
 
   replaceLayout(payload: ReplaceWorkspaceLayoutPayload): void {
@@ -1590,10 +1581,6 @@ app.whenReady().then(() => {
     for (const windowId of result.closeWindowIds) {
       windows.get(windowId)?.close();
     }
-    broadcastState();
-  });
-  ipcMain.handle("workspaces:updateLayoutRatios", (_event, payload: UpdateLayoutRatiosPayload) => {
-    registry.updateLayoutRatios(payload);
     broadcastState();
   });
   ipcMain.handle("workspaces:replaceLayout", (_event, payload: ReplaceWorkspaceLayoutPayload) => {
