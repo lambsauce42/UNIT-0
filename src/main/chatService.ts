@@ -89,6 +89,17 @@ function mergeStreamingTimelineBlock(
       initiallyExpanded: block.initiallyExpanded ?? prior.initiallyExpanded
     };
   }
+  if (prior.kind === "question" && block.kind === "question") {
+    return {
+      ...prior,
+      ...block,
+      title: block.title ?? prior.title,
+      question: block.question ?? prior.question,
+      questions: block.questions ?? prior.questions,
+      answers: block.answers ?? prior.answers,
+      requestMethod: block.requestMethod ?? prior.requestMethod
+    };
+  }
   const existing = prior as ChatTimelineBlock & { initiallyExpanded?: boolean };
   const next = block as ChatTimelineBlock & { initiallyExpanded?: boolean };
   return {
@@ -1377,6 +1388,8 @@ export class ChatService {
     const timelineBlocks: ChatTimelineBlock[] = [];
     const assistantTextById = new Map<string, string>();
     const reasoningTextById = new Map<string, string>();
+    const assistantTextStream: Array<{ id: string; text: string }> = [];
+    const reasoningTextStream: Array<{ id: string; text: string }> = [];
     try {
       const project = this.store.loadState().projects.find((item) => item.id === options.thread.projectId);
       if (!project?.directory) {
@@ -1407,7 +1420,7 @@ export class ChatService {
         if (options.runCancelled()) {
           break;
         }
-        this.applyOpenCodeEvent(options.assistantMessageId, options.thread.id, event, timelineBlocks, assistantTextById, reasoningTextById);
+        this.applyOpenCodeEvent(options.assistantMessageId, options.thread.id, event, timelineBlocks, assistantTextById, reasoningTextById, assistantTextStream, reasoningTextStream);
       }
       if (!options.runCancelled()) {
         this.assertOpenCodeStreamProducedVisibleOutput(options.assistantMessageId, nativeGptOss);
@@ -1463,7 +1476,9 @@ export class ChatService {
     event: OpenCodeRuntimeEvent,
     timelineBlocks: ChatTimelineBlock[],
     assistantTextById: Map<string, string>,
-    reasoningTextById: Map<string, string>
+    reasoningTextById: Map<string, string>,
+    assistantTextStream: Array<{ id: string; text: string }>,
+    reasoningTextStream: Array<{ id: string; text: string }>
   ): void {
     if (event.type === "session.started") {
       this.store.updateThreadSettings(threadId, { openCodeSessionId: event.sessionId });
@@ -1475,10 +1490,12 @@ export class ChatService {
         completeOpenCodeReasoningBlocks(timelineBlocks);
         if (event.replace) {
           assistantTextById.set(event.id, event.text);
-          this.store.replaceMessageContent(assistantMessageId, [...assistantTextById.values()].join(""));
+          replaceOpenCodeStreamEntries(assistantTextStream, event.id, event.text);
+          this.store.replaceMessageContent(assistantMessageId, assistantTextStream.map((entry) => entry.text).join(""));
         } else {
           this.store.appendToMessage(assistantMessageId, event.text);
           assistantTextById.set(event.id, `${assistantTextById.get(event.id) ?? ""}${event.text}`);
+          assistantTextStream.push({ id: event.id, text: event.text });
         }
         const timelineId = event.replace
           ? prepareOpenCodeTimelineForReplace(timelineBlocks, "assistant_message", event.id)
@@ -1499,10 +1516,12 @@ export class ChatService {
         const reasoningDelta = event.replace ? event.text : reasoningText.slice(reasoningTextById.get(event.id)?.length ?? 0);
         if (event.replace) {
           reasoningTextById.set(event.id, event.text);
-          this.store.replaceMessageReasoning(assistantMessageId, [...reasoningTextById.values()].join(""));
+          replaceOpenCodeStreamEntries(reasoningTextStream, event.id, event.text);
+          this.store.replaceMessageReasoning(assistantMessageId, reasoningTextStream.map((entry) => entry.text).join(""));
         } else if (reasoningDelta) {
           this.store.appendToMessageReasoning(assistantMessageId, reasoningDelta);
           reasoningTextById.set(event.id, reasoningText);
+          reasoningTextStream.push({ id: event.id, text: reasoningDelta });
         }
         if (reasoningDelta || event.replace) {
           const timelineId = event.replace
@@ -1539,21 +1558,23 @@ export class ChatService {
         throw new Error("OpenCode final snapshot contained malformed GPT-OSS channel delimiters.");
       }
       const streamedContentSegments = event.messageId
-        ? [...assistantTextById.entries()].filter(([id]) => openCodeMessageIdFromEventId(id) === event.messageId).map(([, text]) => text)
-        : [...assistantTextById.values()];
+        ? assistantTextStream.filter((entry) => openCodeMessageIdFromEventId(entry.id) === event.messageId).map((entry) => entry.text)
+        : assistantTextStream.map((entry) => entry.text);
+      const streamedContentForSnapshot = event.messageId ? streamedContentSegments.join("") : existingContent;
       const snapshotMatchesStreamedContent = event.messageId
-        ? streamedContentSegments.includes(event.content)
+        ? event.content === streamedContentForSnapshot
         : event.content === existingContent || streamedContentSegments.includes(event.content);
-      if (event.strict && existingContent && !snapshotMatchesStreamedContent) {
+      if (event.strict && (event.messageId ? streamedContentForSnapshot : existingContent) && !snapshotMatchesStreamedContent) {
         throw new Error("OpenCode streamed final answer did not match the final snapshot.");
       }
       const streamedReasoningSegments = event.messageId
-        ? [...reasoningTextById.entries()].filter(([id]) => openCodeMessageIdFromEventId(id) === event.messageId).map(([, text]) => text)
-        : [...reasoningTextById.values()];
+        ? reasoningTextStream.filter((entry) => openCodeMessageIdFromEventId(entry.id) === event.messageId).map((entry) => entry.text)
+        : reasoningTextStream.map((entry) => entry.text);
+      const streamedReasoningForSnapshot = event.messageId ? streamedReasoningSegments.join("") : existingReasoning;
       const snapshotMatchesStreamedReasoning = event.messageId
-        ? streamedReasoningSegments.includes(event.reasoning)
+        ? event.reasoning === streamedReasoningForSnapshot
         : event.reasoning === existingReasoning || streamedReasoningSegments.includes(event.reasoning);
-      if (event.strict && event.reasoning && existingReasoning && !snapshotMatchesStreamedReasoning) {
+      if (event.strict && (event.messageId ? streamedReasoningForSnapshot : event.reasoning && existingReasoning) && !snapshotMatchesStreamedReasoning) {
         throw new Error("OpenCode streamed reasoning did not match the final snapshot.");
       }
       this.store.replaceMessageReasoning(assistantMessageId, existingReasoning);
@@ -2033,6 +2054,15 @@ export class ChatService {
   }
 
   async timelineAction(payload: ChatTimelineActionPayload): Promise<ChatState> {
+    const currentMessage = this.store.loadState().messages.find((message) => message.id === payload.messageId);
+    const currentBlock = currentMessage?.timelineBlocks?.find((block) => block.id === payload.blockId);
+    const openCodeQuestionAnswers = currentBlock?.kind === "question" && currentBlock.requestMethod === "opencode" && payload.action === "answer"
+      ? questionActionAnswers(currentBlock, payload)
+      : {};
+    const pendingOpenCodeQuestionAnswers = Object.keys(openCodeQuestionAnswers).length ? openCodeQuestionAnswers : null;
+    if (pendingOpenCodeQuestionAnswers) {
+      await this.openCodeRuntime.answerUserInput(payload.blockId, pendingOpenCodeQuestionAnswers);
+    }
     this.store.updateMessageTimelineBlock(payload.messageId, payload.blockId, (block) => {
       if (block.kind === "approval") {
         if (payload.action === "approve" || payload.action === "deny") {
@@ -2052,15 +2082,18 @@ export class ChatService {
         };
       }
       if (block.kind === "question") {
-        if (payload.action === "answer" && payload.answer) {
-          const questionId = block.questions?.[0]?.id ?? payload.blockId;
-          this.codexRuntime.answerUserInput(payload.blockId, { [questionId]: payload.answer });
+        if (payload.action === "answer") {
+          const answers = pendingOpenCodeQuestionAnswers ?? questionActionAnswers(block, payload);
+          if (block.requestMethod !== "opencode") {
+            this.codexRuntime.answerUserInput(payload.blockId, answers);
+          }
         }
+        const answers = questionActionAnswers(block, payload);
         return {
           ...block,
           status: "completed",
-          question: payload.answer ? `${block.question ?? ""}\n\nAnswer: ${payload.answer}` : block.question,
-          answers: payload.answer ? { ...(block.answers ?? {}), [block.questions?.[0]?.id ?? payload.blockId]: payload.answer } : block.answers
+          question: block.question,
+          answers: Object.keys(answers).length ? { ...(block.answers ?? {}), ...answers } : block.answers
         };
       }
       if (block.kind === "status" && (payload.action === "retry" || payload.action === "retry_new_thread")) {
@@ -2806,6 +2839,28 @@ function extensionForMimeType(mimeType: string): string {
 
 function openCodeMessageIdFromEventId(id: string): string {
   return id.split(":")[0] ?? "";
+}
+
+function replaceOpenCodeStreamEntries(entries: Array<{ id: string; text: string }>, id: string, text: string): void {
+  const firstIndex = entries.findIndex((entry) => entry.id === id);
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    if (entries[index]?.id === id) {
+      entries.splice(index, 1);
+    }
+  }
+  entries.splice(firstIndex >= 0 ? firstIndex : entries.length, 0, { id, text });
+}
+
+function questionActionAnswers(block: Extract<ChatTimelineBlock, { kind: "question" }>, payload: ChatTimelineActionPayload): Record<string, string> {
+  if (payload.answers) {
+    return Object.fromEntries(Object.entries(payload.answers).map(([id, answer]) => [id, answer.trim()]).filter(([, answer]) => answer));
+  }
+  const answer = payload.answer?.trim();
+  if (!answer) {
+    return {};
+  }
+  const questionId = block.questions?.[0]?.id ?? payload.blockId;
+  return { [questionId]: answer };
 }
 
 function sanitizeAttachmentName(name: string): string {

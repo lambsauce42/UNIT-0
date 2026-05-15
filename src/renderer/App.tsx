@@ -3923,6 +3923,7 @@ const FILE_TREE_ROOT_ID = "__workspace_root__";
 const FILE_TREE_DEFAULT_WIDTH = 236;
 const FILE_TREE_MIN_WIDTH = 168;
 const FILE_TREE_MAX_WIDTH = 520;
+const FILE_TREE_COLLAPSE_HOVER_SUPPRESS_MS = 220;
 
 function clampFileTreeWidth(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value)
@@ -3934,10 +3935,13 @@ function FileViewerSurface({ session }: { session: AppletSession }) {
   const fileViewerRef = useRef<HTMLDivElement | null>(null);
   const treeHostRef = useRef<HTMLDivElement | null>(null);
   const treeMotionTimerRef = useRef<number | null>(null);
+  const treeHoverSuppressTimerRef = useRef<number | null>(null);
   const treeResizeRef = useRef<{
     pointerId: number;
     startClientX: number;
     startWidth: number;
+    pendingWidth: number;
+    frameId: number | null;
   } | null>(null);
   const selectedFileRef = useRef<ReadFileResult | null>(null);
   const persistedSelectedFileIdRef = useRef("");
@@ -4097,6 +4101,13 @@ function FileViewerSurface({ session }: { session: AppletSession }) {
       if (treeMotionTimerRef.current !== null) {
         window.clearTimeout(treeMotionTimerRef.current);
       }
+      if (treeHoverSuppressTimerRef.current !== null) {
+        window.clearTimeout(treeHoverSuppressTimerRef.current);
+      }
+      const treeResize = treeResizeRef.current;
+      if (treeResize?.frameId !== null && treeResize?.frameId !== undefined) {
+        window.cancelAnimationFrame(treeResize.frameId);
+      }
     };
   }, []);
 
@@ -4109,6 +4120,15 @@ function FileViewerSurface({ session }: { session: AppletSession }) {
       treeMotionTimerRef.current = null;
       setTreeMotionActive(false);
     }, 180);
+  }, []);
+
+  const suppressTreeHoverExpansion = useCallback(() => {
+    if (treeHoverSuppressTimerRef.current !== null) {
+      window.clearTimeout(treeHoverSuppressTimerRef.current);
+    }
+    treeHoverSuppressTimerRef.current = window.setTimeout(() => {
+      treeHoverSuppressTimerRef.current = null;
+    }, FILE_TREE_COLLAPSE_HOVER_SUPPRESS_MS);
   }, []);
 
   useEffect(() => {
@@ -4260,16 +4280,23 @@ function FileViewerSurface({ session }: { session: AppletSession }) {
     await persistFileViewerState({ fileTreeWidth: clampFileTreeWidth(nextWidth) });
   }, [persistFileViewerState]);
 
+  const applyTreeResizeWidth = useCallback((nextWidth: number) => {
+    fileViewerRef.current?.style.setProperty("--file-tree-width", `${nextWidth}px`);
+  }, []);
+
   const beginTreeResize = useCallback((event: ReactPointerEvent<HTMLElement>) => {
     if (!fileTreeExpanded || event.button !== 0) {
       return;
     }
     event.preventDefault();
     event.currentTarget.setPointerCapture(event.pointerId);
+    fileViewerRef.current?.classList.add("file-tree-resizing");
     treeResizeRef.current = {
       pointerId: event.pointerId,
       startClientX: event.clientX,
-      startWidth: fileTreeWidth
+      startWidth: fileTreeWidth,
+      pendingWidth: fileTreeWidth,
+      frameId: null
     };
   }, [fileTreeExpanded, fileTreeWidth]);
 
@@ -4278,8 +4305,20 @@ function FileViewerSurface({ session }: { session: AppletSession }) {
     if (!drag || event.pointerId !== drag.pointerId) {
       return;
     }
-    setLocalTreeWidth(clampFileTreeWidth(drag.startWidth + event.clientX - drag.startClientX));
-  }, []);
+    event.preventDefault();
+    drag.pendingWidth = clampFileTreeWidth(drag.startWidth + event.clientX - drag.startClientX);
+    if (drag.frameId !== null) {
+      return;
+    }
+    drag.frameId = window.requestAnimationFrame(() => {
+      const currentDrag = treeResizeRef.current;
+      if (!currentDrag) {
+        return;
+      }
+      currentDrag.frameId = null;
+      applyTreeResizeWidth(currentDrag.pendingWidth);
+    });
+  }, [applyTreeResizeWidth]);
 
   const finishTreeResize = useCallback((event: ReactPointerEvent<HTMLElement>) => {
     const drag = treeResizeRef.current;
@@ -4287,24 +4326,32 @@ function FileViewerSurface({ session }: { session: AppletSession }) {
       return;
     }
     const nextWidth = clampFileTreeWidth(drag.startWidth + event.clientX - drag.startClientX);
+    if (drag.frameId !== null) {
+      window.cancelAnimationFrame(drag.frameId);
+    }
     treeResizeRef.current = null;
+    fileViewerRef.current?.classList.remove("file-tree-resizing");
+    applyTreeResizeWidth(nextWidth);
     setLocalTreeWidth(nextWidth);
     void persistTreeWidth(nextWidth).catch((error: unknown) => setStatus({ state: "error", message: errorMessage(error) }));
-  }, [persistTreeWidth]);
+  }, [applyTreeResizeWidth, persistTreeWidth]);
 
   const toggleTreePinned = useCallback(() => {
     const nextPinned = !fileTreePinned;
-    setTreeAutoExpanded(false);
+    setTreeAutoExpanded(!nextPinned);
     void persistFileViewerState({
       fileTreePinned: nextPinned,
-      fileTreeCollapsed: !nextPinned
+      fileTreeCollapsed: false
     }).catch((error: unknown) => setStatus({ state: "error", message: errorMessage(error) }));
   }, [fileTreePinned, persistFileViewerState]);
 
   const collapseFileTree = useCallback(() => {
+    if (!fileTreePinned) {
+      suppressTreeHoverExpansion();
+    }
     setTreeAutoExpanded(false);
     void persistFileViewerState({ fileTreeCollapsed: true }).catch((error: unknown) => setStatus({ state: "error", message: errorMessage(error) }));
-  }, [persistFileViewerState]);
+  }, [fileTreePinned, persistFileViewerState, suppressTreeHoverExpansion]);
 
   const expandFileTreeFromHandle = useCallback(() => {
     if (!fileTreePinned) {
@@ -4315,7 +4362,7 @@ function FileViewerSurface({ session }: { session: AppletSession }) {
   }, [fileTreePinned, persistFileViewerState]);
 
   const enterTreeExpandHandle = useCallback(() => {
-    if (!fileTreePinned) {
+    if (!fileTreePinned && treeHoverSuppressTimerRef.current === null) {
       setTreeAutoExpanded(true);
     }
   }, [fileTreePinned]);
@@ -6035,8 +6082,8 @@ function ChatSurface() {
                   autoExpandDisclosures={chatState.appSettings.autoExpandCodexDisclosures}
                   copiedCodeBlockIds={copiedCodeBlockIds}
                   message={message}
-                  onTimelineAction={async (blockId, action, answer) => {
-                    await runChatAction(() => window.unitApi.chat.timelineAction({ messageId: message.id, blockId, action, answer }));
+                  onTimelineAction={async (blockId, action, answer, answers) => {
+                    await runChatAction(() => window.unitApi.chat.timelineAction({ messageId: message.id, blockId, action, answer, answers }));
                   }}
                 />
               ))
@@ -8051,7 +8098,12 @@ function initialSettingsPresetEmbeddingModelPath(dialog: ChatDialogState, state:
     : "";
 }
 
-type ChatTimelineActionHandler = (blockId: string, action: "approve" | "deny" | "answer" | "retry" | "retry_new_thread", answer?: string) => Promise<void>;
+type ChatTimelineActionHandler = (
+  blockId: string,
+  action: "approve" | "deny" | "answer" | "retry" | "retry_new_thread",
+  answer?: string,
+  answers?: Record<string, string>
+) => Promise<void>;
 
 function preserveClosestChatScroll(origin: HTMLElement, mutate: () => void) {
   const scrollHost = origin.closest(".chat-thread") as HTMLElement | null;
@@ -8491,7 +8543,7 @@ function ChatTimelineBlockView({
   copiedCodeBlockIds: ReadonlySet<string>;
   onTimelineAction: ChatTimelineActionHandler;
 }) {
-  const [answer, setAnswer] = useState("");
+  const [questionAnswers, setQuestionAnswers] = useState<Record<string, string>>({});
   if (block.kind === "assistant_message") {
     const html = renderChatMarkdownHtml(block.text, block.id, copiedCodeBlockIds);
     return html ? (
@@ -8613,38 +8665,77 @@ function ChatTimelineBlockView({
       </div>
     );
   }
-  if (block.kind === "approval" || block.kind === "question") {
+  if (block.kind === "question") {
+    const questions = block.questions?.length ? block.questions : [{ id: block.id, label: block.question ?? block.title, options: undefined }];
+    const visibleAnswers = block.answers ? Object.entries(block.answers).filter(([, value]) => value.trim()) : [];
+    const allQuestionsAnswered = questions.every((question) => questionAnswers[question.id]?.trim());
+    const setQuestionAnswer = (questionId: string, value: string) => {
+      setQuestionAnswers((current) => ({ ...current, [questionId]: value }));
+    };
     return (
-      <div className="codex-event-card codex-approval-card">
-        <div className="codex-event-card-header">
-          <span className="codex-event-title">{block.kind === "approval" ? block.title : block.title}</span>
-          <span className="codex-event-badge" data-status={block.status}>{formatTimelineStatus(block.status)}</span>
-        </div>
-        {"question" in block && block.question ? <div className="codex-event-text">{block.question}</div> : null}
-        {"details" in block && block.details ? <div className="codex-event-text">{block.details}</div> : null}
-        {block.kind === "approval" && block.status === "requested" ? (
-          <div className="codex-event-actions">
-            <button type="button" className="codex-event-action" onClick={() => void onTimelineAction(block.id, "approve")}>Approve</button>
-            <button type="button" className="codex-event-action" data-variant="danger" onClick={() => void onTimelineAction(block.id, "deny")}>Deny</button>
+      <section className="codex-question-block" data-status={block.status}>
+        <div className="codex-question-title">{block.title}</div>
+        {block.question ? <div className="codex-question-text">{block.question}</div> : null}
+        {visibleAnswers.length ? (
+          <div className="codex-question-answers">
+            {visibleAnswers.map(([questionId, submittedAnswer]) => (
+              <div key={`${block.id}:answer:${questionId}`} className="codex-question-answer">{submittedAnswer}</div>
+            ))}
           </div>
         ) : null}
-        {block.kind === "question" && block.status === "requested" ? (
-          <div className="codex-event-answer-form">
-            <textarea
-              aria-label="Question answer"
-              value={answer}
-              onChange={(event) => setAnswer(event.currentTarget.value)}
-            />
-            <div className="codex-event-actions">
+        {block.status === "requested" ? (
+          <div className="codex-question-answer-form">
+            {questions.map((question, index) => (
+              <div className="codex-question-field" key={question.id}>
+                {questions.length > 1 ? <div className="codex-question-field-label">{question.label}</div> : null}
+                {question.options?.length ? (
+                  <div className="codex-question-options">
+                    {question.options.map((option) => (
+                      <button
+                        key={`${question.id}:${option}`}
+                        type="button"
+                        className="codex-question-option"
+                        onClick={() => setQuestionAnswer(question.id, option)}
+                      >
+                        {option}
+                      </button>
+                    ))}
+                  </div>
+                ) : null}
+                <textarea
+                  aria-label={questions.length > 1 ? `Question ${index + 1} answer` : "Question answer"}
+                  value={questionAnswers[question.id] ?? ""}
+                  onChange={(event) => setQuestionAnswer(question.id, event.currentTarget.value)}
+                />
+              </div>
+            ))}
+            <div className="codex-question-actions">
               <button
                 type="button"
                 className="codex-event-action"
-                disabled={!answer.trim()}
-                onClick={() => void onTimelineAction(block.id, "answer", answer.trim())}
+                disabled={!allQuestionsAnswered}
+                onClick={() => void onTimelineAction(block.id, "answer", undefined, questionAnswers)}
               >
                 Answer
               </button>
             </div>
+          </div>
+        ) : null}
+      </section>
+    );
+  }
+  if (block.kind === "approval") {
+    return (
+      <div className="codex-event-card codex-approval-card">
+        <div className="codex-event-card-header">
+          <span className="codex-event-title">{block.title}</span>
+          <span className="codex-event-badge" data-status={block.status}>{formatTimelineStatus(block.status)}</span>
+        </div>
+        {block.details ? <div className="codex-event-text">{block.details}</div> : null}
+        {block.status === "requested" ? (
+          <div className="codex-event-actions">
+            <button type="button" className="codex-event-action" onClick={() => void onTimelineAction(block.id, "approve")}>Approve</button>
+            <button type="button" className="codex-event-action" data-variant="danger" onClick={() => void onTimelineAction(block.id, "deny")}>Deny</button>
           </div>
         ) : null}
       </div>

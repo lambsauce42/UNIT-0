@@ -107,7 +107,8 @@ test("real OpenCode GPT-OSS proxy streams valid final tokens before upstream com
     await run;
 
     expect(events.filter((event) => event.type === "assistant.delta").map((event) => event.text).join("")).toBe("ok");
-    expect(events.find((event) => event.type === "final.snapshot")).toMatchObject({ type: "final.snapshot", content: "ok", malformed: undefined });
+    expect(events.find((event) => event.type === "final.snapshot")).toMatchObject({ type: "final.snapshot", content: "ok", strict: true, malformed: undefined });
+    expect(events.find((event) => event.type === "final.snapshot" && event.messageId)).toBeTruthy();
     expect(events.some((event) => event.type === "error")).toBe(false);
   } finally {
     runtime.close();
@@ -243,6 +244,71 @@ test("real OpenCode GPT-OSS proxy executes and renders tool calls once", async (
     const snapshot = events.find((event) => event.type === "final.snapshot");
     expect(snapshot).toMatchObject({ type: "final.snapshot", malformed: undefined });
     expect(snapshot && "content" in snapshot ? snapshot.content : "").toContain("benchmark_report.md");
+  } finally {
+    runtime.close();
+    await fakeLlama.close();
+    fs.rmSync(projectDir, { recursive: true, force: true });
+  }
+});
+
+test("real OpenCode GPT-OSS proxy renders question tool calls as questions", async () => {
+  test.setTimeout(120_000);
+  const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-opencode-runtime-question-"));
+  const fakeLlama = await startFakeRawCompletionServer([
+    [
+      "<|channel|>analysis<|message|>Need a grep pattern.",
+      "<|end|><|start|>assistant<|channel|>commentary to=question code<|message|>",
+      "{\"questions\":[{\"question\":\"What pattern should I grep for?\",\"header\":\"Pattern\",\"options\":[{\"label\":\"TODO\",\"description\":\"Search for TODO markers\"}],\"custom\":true}]}",
+      "<|call|>"
+    ],
+    [
+      "<|channel|>analysis<|message|>User picked TODO.",
+      "<|end|><|start|>assistant<|channel|>final<|message|>",
+      "I will grep for TODO.",
+      "<|return|>"
+    ]
+  ]);
+  const runtime = new RealOpenCodeRuntime();
+  try {
+    const events: OpenCodeRuntimeEvent[] = [];
+    const run = collectOpenCodeEvents(runtime, {
+      cwd: projectDir,
+      prompt: "can you use gep once?",
+      modelLabel: "fake-gpt-oss",
+      nativeGptOss: true,
+      endpoint: {
+        baseUrl: fakeLlama.url,
+        modelId: "fake-gpt-oss",
+        rawCompletionUrl: `${fakeLlama.url}/completion`
+      },
+      settings: baseSettings,
+      permissionMode: "full_access"
+    }, (event) => events.push(event));
+
+    await expect.poll(() => events.find((event) => event.type === "timeline" && event.block.kind === "question")).toBeTruthy();
+    const questionEvent = events.find((event) => event.type === "timeline" && event.block.kind === "question");
+    expect(questionEvent).toMatchObject({
+      type: "timeline",
+      eventType: "item.started",
+      block: {
+        kind: "question",
+        title: "Pattern",
+        question: "What pattern should I grep for?",
+        requestMethod: "opencode"
+      }
+    });
+    expect(events.some((event) => event.type === "timeline" && event.block.kind === "tool")).toBe(false);
+    const requestId = questionEvent && questionEvent.type === "timeline" ? questionEvent.block.id : "";
+    const firstQuestionId = questionEvent && questionEvent.type === "timeline" && questionEvent.block.kind === "question"
+      ? questionEvent.block.questions?.[0]?.id ?? ""
+      : "";
+    await runtime.answerUserInput(requestId, { [firstQuestionId]: "TODO" });
+    await run;
+
+    expect(events.some((event) => event.type === "timeline" && event.block.kind === "tool")).toBe(false);
+    expect(events.filter((event) => event.type === "assistant.delta").map((event) => event.text).join("")).toBe("I will grep for TODO.");
+    expect(events.find((event) => event.type === "final.snapshot")).toMatchObject({ type: "final.snapshot", content: "I will grep for TODO.", malformed: undefined });
+    expect(events.some((event) => event.type === "error")).toBe(false);
   } finally {
     runtime.close();
     await fakeLlama.close();

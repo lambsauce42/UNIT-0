@@ -179,6 +179,7 @@ class ScriptedRemoteRuntime extends RemoteHostRuntime {
 class ScriptedOpenCodeRuntime implements OpenCodeRuntime {
   readonly calls: OpenCodeRunOptions[] = [];
   readonly approvals: Array<{ permissionId: string; decision: "approve" | "deny" }> = [];
+  readonly userInputs: Array<{ requestId: string; answers: Record<string, string> }> = [];
 
   constructor(private readonly turns: OpenCodeRuntimeEvent[][] = []) {}
 
@@ -195,6 +196,10 @@ class ScriptedOpenCodeRuntime implements OpenCodeRuntime {
     this.approvals.push({ permissionId, decision });
   }
 
+  async answerUserInput(requestId: string, answers: Record<string, string>): Promise<void> {
+    this.userInputs.push({ requestId, answers });
+  }
+
   cancelActiveRequest(): void {}
 
   close(): void {}
@@ -208,6 +213,8 @@ class IncompleteOpenCodeRuntime implements OpenCodeRuntime {
   }
 
   async answerApproval(): Promise<void> {}
+
+  async answerUserInput(): Promise<void> {}
 
   cancelActiveRequest(): void {}
 
@@ -1014,6 +1021,8 @@ test("fails unmarked multi-paragraph OpenCode GPT-OSS text instead of guessing c
 
     async answerApproval(): Promise<void> {}
 
+    async answerUserInput(): Promise<void> {}
+
     cancelActiveRequest(): void {}
 
     close(): void {}
@@ -1284,6 +1293,8 @@ test("does not mine OpenCode answers from reasoning-channel text", async () => {
     }
 
     async answerApproval(): Promise<void> {}
+
+    async answerUserInput(): Promise<void> {}
 
     cancelActiveRequest(): void {}
 
@@ -1674,6 +1685,99 @@ test("validates strict OpenCode final snapshots against streamed message segment
     const assistant = state.messages.find((message) => message.role === "assistant");
     expect(assistant?.content).toBe("FirstSecond");
     expect(assistant?.status).toBe("complete");
+  } finally {
+    service.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("validates strict OpenCode snapshots against concatenated message parts", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-opencode-multipart-snapshot-test-"));
+  const modelPath = path.join(dir, "model.gguf");
+  fs.writeFileSync(modelPath, "");
+  const store = new ChatStore(path.join(dir, "chat.sqlite"));
+  const openCodeRuntime = new ScriptedOpenCodeRuntime([[
+    { type: "reasoning.delta", id: "msg_1:rsn_1", status: "updated", text: "Think " },
+    { type: "reasoning.delta", id: "msg_1:rsn_2", status: "updated", text: "first." },
+    { type: "assistant.delta", id: "msg_1:prt_1", status: "updated", text: "Hello " },
+    { type: "assistant.delta", id: "msg_1:prt_2", status: "updated", text: "world." },
+    { type: "final.snapshot", content: "Hello world.", reasoning: "Think first.", strict: true, messageId: "msg_1" },
+    { type: "turn.completed" }
+  ]]);
+  const service = new ChatService(store, new EndpointOnlyLlamaRuntime(), new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined, new TestEmbeddingRuntime(), openCodeRuntime);
+  try {
+    let state = store.loadState();
+    store.updateProjectSettings(state.selectedProjectId, "OpenCode Multipart Snapshot Project", dir);
+    store.addLocalModel(modelPath);
+    state = store.loadState();
+    store.updateThreadSettings(state.selectedThreadId, {
+      builtinAgenticFramework: "opencode",
+      builtinModelId: state.selectedModelId
+    });
+
+    await service.submit({ text: "multipart message" });
+    await expect.poll(() => service.state().generation.status).toBe("idle");
+
+    state = store.loadState();
+    const assistant = state.messages.find((message) => message.role === "assistant");
+    expect(assistant?.content).toBe("Hello world.");
+    expect(assistant?.reasoning).toBe("Think first.");
+    expect(assistant?.status).toBe("complete");
+  } finally {
+    service.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("answers OpenCode question blocks through the OpenCode runtime", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-opencode-question-action-test-"));
+  const modelPath = path.join(dir, "model.gguf");
+  fs.writeFileSync(modelPath, "");
+  const store = new ChatStore(path.join(dir, "chat.sqlite"));
+  const openCodeRuntime = new ScriptedOpenCodeRuntime([[
+    {
+      type: "timeline",
+      eventType: "item.started",
+      block: {
+        kind: "question",
+        id: "que_test",
+        status: "requested",
+        title: "Pattern",
+        question: "What pattern should I grep for?",
+        questions: [{ id: "que_test:0", label: "What pattern should I grep for?", options: ["TODO"], allowsCustomAnswer: true }],
+        requestMethod: "opencode"
+      }
+    }
+  ]]);
+  const service = new ChatService(store, new EndpointOnlyLlamaRuntime(), new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined, new TestEmbeddingRuntime(), openCodeRuntime);
+  try {
+    let state = store.loadState();
+    store.updateProjectSettings(state.selectedProjectId, "OpenCode Question Action Project", dir);
+    store.addLocalModel(modelPath);
+    state = store.loadState();
+    store.updateThreadSettings(state.selectedThreadId, {
+      builtinAgenticFramework: "opencode",
+      builtinModelId: state.selectedModelId
+    });
+
+    state = store.loadState();
+    const assistant = store.createMessage(state.selectedThreadId, "assistant", "", "streaming", {
+      timelineBlocks: [{
+        kind: "question",
+        id: "que_test",
+        status: "requested",
+        title: "Pattern",
+        question: "What pattern should I grep for?",
+        questions: [{ id: "que_test:0", label: "What pattern should I grep for?", options: ["TODO"], allowsCustomAnswer: true }],
+        requestMethod: "opencode"
+      }]
+    });
+    const question = assistant.timelineBlocks?.find((block) => block.kind === "question");
+    expect(question).toBeTruthy();
+
+    await service.timelineAction({ messageId: assistant.id, blockId: "que_test", action: "answer", answer: "TODO" });
+
+    expect(openCodeRuntime.userInputs).toEqual([{ requestId: "que_test", answers: { "que_test:0": "TODO" } }]);
   } finally {
     service.close();
     fs.rmSync(dir, { recursive: true, force: true });

@@ -74,7 +74,7 @@ export type ChatTimelineBlock =
   | { kind: "diff"; id: string; status?: string; summary: string; branchName?: string; preview?: string; addedLines?: number; deletedLines?: number; filesChanged?: number; changes?: ChatTimelineFileChange[]; initiallyExpanded?: boolean }
   | { kind: "status"; id: string; level: string; message: string; code?: string; details?: string; initiallyExpanded?: boolean }
   | { kind: "plan"; id: string; status: string; explanation?: string; markdown?: string; steps?: Array<{ status: string; text: string }> }
-  | { kind: "question"; id: string; status: string; title: string; question?: string; questions?: Array<{ id: string; label: string; options?: string[]; allowsCustomAnswer?: boolean }>; answers?: Record<string, string> }
+  | { kind: "question"; id: string; status: string; title: string; question?: string; questions?: Array<{ id: string; label: string; options?: string[]; allowsCustomAnswer?: boolean }>; answers?: Record<string, string>; requestMethod?: string }
   | { kind: "delegated"; id: string; status: string; summary: string }
   | { kind: "compaction"; id: string; status: string };
 
@@ -452,6 +452,7 @@ export interface ChatTimelineActionPayload {
   blockId: string;
   action: "approve" | "deny" | "answer" | "retry" | "retry_new_thread";
   answer?: string;
+  answers?: Record<string, string>;
 }
 
 export interface AppletInstance {

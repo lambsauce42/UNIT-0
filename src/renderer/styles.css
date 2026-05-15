@@ -1893,6 +1893,11 @@ button {
   transition: grid-template-columns 180ms ease;
 }
 
+.file-viewer.file-tree-resizing {
+  transition: none;
+  user-select: none;
+}
+
 .file-viewer[data-tree-expanded="0"] {
   grid-template-columns: 0 minmax(0, 1fr);
 }
@@ -2127,6 +2132,10 @@ button {
   cursor: col-resize;
   transform: translateX(-50%);
   transition: left 180ms ease;
+}
+
+.file-viewer.file-tree-resizing .file-tree-resizer {
+  transition: none;
 }
 
 .file-tree-resizer:hover,
@@ -4209,6 +4218,99 @@ button {
 .codex-event-action:disabled {
   opacity: 0.45;
   cursor: default;
+}
+
+.codex-question-block {
+  display: grid;
+  gap: 8px;
+  padding: 2px 0 6px 14px;
+  border-left: 1px solid #334154;
+  color: #dbe5ef;
+}
+
+.codex-question-title {
+  color: #aebacf;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.codex-question-text {
+  color: #edf3f8;
+  font-size: 13px;
+  font-weight: 650;
+  line-height: 1.45;
+  white-space: pre-wrap;
+}
+
+.codex-question-answer {
+  color: #a8d5b6;
+  font-size: 12px;
+  font-weight: 650;
+  line-height: 1.45;
+}
+
+.codex-question-answers,
+.codex-question-answer-form {
+  display: grid;
+  gap: 8px;
+  max-width: 620px;
+}
+
+.codex-question-field {
+  display: grid;
+  gap: 6px;
+}
+
+.codex-question-field-label {
+  color: #b9c6d5;
+  font-size: 12px;
+  font-weight: 650;
+  line-height: 1.45;
+}
+
+.codex-question-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.codex-question-option {
+  min-height: 24px;
+  padding: 0 9px;
+  border: 1px solid #31455a;
+  border-radius: 7px;
+  background: #121b26;
+  color: #d8e3ee;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.codex-question-option:hover {
+  border-color: #4d6c89;
+  background: #19283a;
+}
+
+.codex-question-answer-form textarea {
+  min-height: 64px;
+  resize: vertical;
+  border: 1px solid #253241;
+  border-radius: 8px;
+  background: #0c1218;
+  color: #dce6ef;
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.45;
+  padding: 9px 10px;
+}
+
+.codex-question-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
 }
 
 .codex-event-answer-form {

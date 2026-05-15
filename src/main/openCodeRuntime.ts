@@ -104,6 +104,12 @@ type PendingPermission = {
   cwd: string;
 };
 
+type PendingQuestion = {
+  serverUrl: string;
+  cwd: string;
+  questionIds: string[];
+};
+
 type OpenCodeHarmonyState = {
   parser: GptOssChannelParser;
   rawText: string;
@@ -137,6 +143,7 @@ const openCodeReasoningSeen = new WeakMap<Map<string, OpenCodeHarmonyState>, { v
 export interface OpenCodeRuntime {
   runTurn(options: OpenCodeRunOptions): AsyncIterable<OpenCodeRuntimeEvent>;
   answerApproval(permissionId: string, decision: "approve" | "deny"): Promise<void>;
+  answerUserInput(requestId: string, answers: Record<string, string>): Promise<void>;
   cancelActiveRequest(): void;
   close(): void;
 }
@@ -148,6 +155,7 @@ export class RealOpenCodeRuntime implements OpenCodeRuntime {
   private activeCwd = "";
   private activeServer: OpenCodeServer | null = null;
   private readonly pendingPermissions = new Map<string, PendingPermission>();
+  private readonly pendingQuestions = new Map<string, PendingQuestion>();
 
   async *runTurn(options: OpenCodeRunOptions): AsyncIterable<OpenCodeRuntimeEvent> {
     const abortController = new AbortController();
@@ -197,11 +205,19 @@ export class RealOpenCodeRuntime implements OpenCodeRuntime {
         if ((event.type === "assistant.delta" || event.type === "reasoning.delta") && event.id) {
           latestAssistantMessageId = messageIdFromPartId(event.id);
         }
-        if (event.type === "timeline" && event.block.kind === "approval" && server) {
-          this.pendingPermissions.set(event.block.id, {
-            serverUrl: server.url,
-            cwd: options.cwd
-          });
+        if (event.type === "timeline" && server) {
+          if (event.block.kind === "approval") {
+            this.pendingPermissions.set(event.block.id, {
+              serverUrl: server.url,
+              cwd: options.cwd
+            });
+          } else if (event.block.kind === "question") {
+            this.pendingQuestions.set(event.block.id, {
+              serverUrl: server.url,
+              cwd: options.cwd,
+              questionIds: event.block.questions?.map((question) => question.id) ?? []
+            });
+          }
         }
         for (const normalizedEvent of normalizeOpenCodeHarmonyEvent(event, harmonyStates, normalizeGptOss, providerEndpoint?.markerSecret)) {
           eventQueue.push({ kind: "event", event: normalizedEvent });
@@ -311,6 +327,25 @@ export class RealOpenCodeRuntime implements OpenCodeRuntime {
     });
   }
 
+  async answerUserInput(requestId: string, answers: Record<string, string>): Promise<void> {
+    const pending = this.pendingQuestions.get(requestId);
+    if (!pending) {
+      throw new Error(`Unknown OpenCode question id: ${requestId}`);
+    }
+    const answerIds = pending.questionIds.length ? pending.questionIds : Object.keys(answers);
+    const orderedAnswers = answerIds.map((id) => {
+      const answer = answers[id]?.trim();
+      return answer ? [answer] : [];
+    });
+    await openCodeJson<boolean>(pending.serverUrl, `/question/${encodeURIComponent(requestId)}/reply`, {
+      method: "POST",
+      cwd: pending.cwd,
+      body: { answers: orderedAnswers },
+      emptyOk: true
+    });
+    this.pendingQuestions.delete(requestId);
+  }
+
   cancelActiveRequest(): void {
     if (this.activeServerUrl && this.activeSessionId) {
       void openCodeJson<boolean>(this.activeServerUrl, `/session/${encodeURIComponent(this.activeSessionId)}/abort`, {
@@ -329,6 +364,7 @@ export class RealOpenCodeRuntime implements OpenCodeRuntime {
       this.activeServer = null;
     }
     this.pendingPermissions.clear();
+    this.pendingQuestions.clear();
   }
 }
 
@@ -815,6 +851,10 @@ function openCodeProxyToolCompletedRuntimeEvent(toolCall: OpenCodeProxyToolCallR
   };
 }
 
+function isOpenCodeQuestionToolCall(toolCall: { name?: string }): boolean {
+  return toolCall.name === "question";
+}
+
 function openCodeToolStartMarker(toolCall: OpenCodeProxyToolCallRecord): string {
   return `[[UNIT0_TOOL_START:${Buffer.from(JSON.stringify(toolCall), "utf8").toString("base64url")}]]`;
 }
@@ -1220,6 +1260,46 @@ export function* mapOpenCodeEvent(raw: Record<string, unknown>, onErrorEvent: (m
     }
     return;
   }
+  if (type === "question.asked") {
+    const sessionId = String(properties.sessionID ?? "");
+    const requestId = String(properties.id ?? randomUUID());
+    const questions = parseOpenCodeQuestions(properties.questions, requestId);
+    yield {
+      type: "timeline",
+      eventType: "item.started",
+      block: {
+        kind: "question",
+        id: requestId,
+        status: "requested",
+        title: openCodeQuestionTitle(properties.questions) ?? "OpenCode question",
+        question: questions.map((question) => question.label).join("\n"),
+        questions,
+        requestMethod: "opencode"
+      },
+      sessionId
+    };
+    return;
+  }
+  if (type === "question.replied" || type === "question.rejected") {
+    const sessionId = String(properties.sessionID ?? "");
+    const requestId = String(properties.requestID ?? "");
+    if (requestId) {
+      yield {
+        type: "timeline",
+        eventType: "item.completed",
+        block: {
+          kind: "question",
+          id: requestId,
+          status: "completed",
+          title: type === "question.replied" ? "Question answered" : "Question rejected",
+          answers: openCodeQuestionAnswers(properties.answers, requestId),
+          requestMethod: "opencode"
+        },
+        sessionId
+      };
+    }
+    return;
+  }
   if (type === "session.idle") {
     yield { type: "turn.completed", sessionId: String(properties.sessionID ?? "") };
     return;
@@ -1246,6 +1326,9 @@ function partToRuntimeEvent(part: OpenCodePart, delta?: string, sessionId = "", 
     return update.text || update.replace ? { type: "reasoning.delta", id: partId, status: "updated", text: update.text, replace: update.replace || undefined } : null;
   }
   if (part.type === "tool") {
+    if (part.tool === "question") {
+      return null;
+    }
     const state = part.state ?? {};
     const status = mapToolStatus(String(state.status ?? ""));
     const input = isRecord(state.input) ? state.input : {};
@@ -1299,6 +1382,50 @@ function partToRuntimeEvent(part: OpenCodePart, delta?: string, sessionId = "", 
     };
   }
   return null;
+}
+
+function parseOpenCodeQuestions(value: unknown, requestId: string): Array<{ id: string; label: string; options?: string[]; allowsCustomAnswer?: boolean }> {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.flatMap((raw, index) => {
+    if (!isRecord(raw)) {
+      return [];
+    }
+    const label = typeof raw.question === "string" ? raw.question.trim() : "";
+    if (!label) {
+      return [];
+    }
+    const options = Array.isArray(raw.options)
+      ? raw.options.map((option) => isRecord(option) ? String(option.label ?? "") : String(option)).map((option) => option.trim()).filter(Boolean)
+      : [];
+    return [{
+      id: `${requestId}:${index}`,
+      label,
+      options,
+      allowsCustomAnswer: raw.custom !== false
+    }];
+  });
+}
+
+function openCodeQuestionTitle(value: unknown): string | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+  const first = value.find(isRecord);
+  const header = first && typeof first.header === "string" ? first.header.trim() : "";
+  return header || undefined;
+}
+
+function openCodeQuestionAnswers(value: unknown, requestId: string): Record<string, string> | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+  const entries = value.map((answer, index) => {
+    const labels = Array.isArray(answer) ? answer.map((item) => String(item).trim()).filter(Boolean) : [];
+    return [`${requestId}:${index}`, labels.join(", ")] as const;
+  }).filter(([, answer]) => answer);
+  return entries.length ? Object.fromEntries(entries) : undefined;
 }
 
 function partSnapshotDelta(partSnapshots: OpenCodePartSnapshotState | undefined, key: string, text: string | undefined): OpenCodePartTextUpdate | undefined {
@@ -1428,7 +1555,9 @@ export function normalizeOpenCodeHarmonyEvent(event: OpenCodeRuntimeEvent, state
         const seenToolIds = openCodeSeenToolMarkerIds(states);
         if (!seenToolIds.has(segment.toolCall.id)) {
           seenToolIds.add(segment.toolCall.id);
-          events.push(openCodeProxyToolStartedRuntimeEvent(segment.toolCall, event.sessionId));
+          if (!isOpenCodeQuestionToolCall(segment.toolCall)) {
+            events.push(openCodeProxyToolStartedRuntimeEvent(segment.toolCall, event.sessionId));
+          }
         }
       } else if (segment.type === "toolComplete") {
         if (!openCodeSeenToolMarkerIds(states).has(segment.toolCall.id)) {
@@ -1437,7 +1566,9 @@ export function normalizeOpenCodeHarmonyEvent(event: OpenCodeRuntimeEvent, state
         const completedToolIds = openCodeSeenCompletedToolMarkerIds(states);
         if (!completedToolIds.has(segment.toolCall.id)) {
           completedToolIds.add(segment.toolCall.id);
-          events.push(openCodeProxyToolCompletedRuntimeEvent(segment.toolCall, event.sessionId));
+          if (!isOpenCodeQuestionToolCall(segment.toolCall)) {
+            events.push(openCodeProxyToolCompletedRuntimeEvent(segment.toolCall, event.sessionId));
+          }
         }
       } else if (segment.type === "content") {
         const from = event.replace ? segment.start : Math.max(segment.start, state.streamedFlattenedContentLength);
@@ -1727,7 +1858,7 @@ function parseDelimitedPlainOpenCodeText(text: string, markerSecret = ""): {
   }
   return {
     reasoning,
-    content: content.replace(/^\s+/u, ""),
+    content,
     hasMarker: true,
     malformed,
     toolStarts,
