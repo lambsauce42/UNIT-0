@@ -3178,7 +3178,9 @@ button {
   border-radius: 999px;
   background: rgba(20, 24, 29, 0.96);
   color: #dbe3ec;
-  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.32);
+  box-shadow:
+    0 1px 0 rgba(255, 255, 255, 0.04) inset,
+    0 6px 10px rgba(0, 0, 0, 0.34);
   opacity: 0;
   pointer-events: none;
   transform: translate(-50%, 6px);
@@ -5619,6 +5621,7 @@ button {
 .chat-rename-dialog label {
   display: grid;
   gap: 6px;
+  min-width: 0;
 }
 
 .chat-settings-dialog label span,
@@ -5632,7 +5635,10 @@ button {
 .chat-settings-dialog input,
 .chat-thread-settings-dialog input,
 .chat-rename-dialog input {
+  width: 100%;
+  min-width: 0;
   height: 38px;
+  box-sizing: border-box;
   border: 1px solid #2c3744;
   border-radius: 6px;
   background: rgba(23, 29, 36, 0.45);
@@ -5852,7 +5858,7 @@ button {
 }
 
 .chat-settings-row-four {
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
 }
 
 .chat-embedding-field {

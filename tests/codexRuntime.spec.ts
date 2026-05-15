@@ -5,6 +5,8 @@ import {
   codexAppServerItemEvents,
   codexItemToTimelineBlock,
   codexRateLimitsFromResponse,
+  codexTurnStartPayload,
+  effectiveCodexApprovalPolicy,
   MockCodexRuntime,
   parseCodexJsonLine
 } from "../src/main/codexRuntime";
@@ -298,10 +300,58 @@ test("builds codex exec command without executing Codex in unit tests", () => {
       "model_reasoning_effort=high",
       "--image",
       "C:\\screens\\mock.png",
-      "-c",
-      "approval_policy=on-failure",
       "--dangerously-bypass-approvals-and-sandbox",
       "hello"
     ]
+  });
+  expect(buildCodexExecCommand({
+    cwd: process.cwd(),
+    prompt: "hello",
+    model: "gpt-5.3-codex",
+    reasoningEffort: "medium",
+    permissionMode: "default_permissions",
+    approvalMode: "on-request",
+    planModeEnabled: false
+  }).args).not.toContain("--dangerously-bypass-approvals-and-sandbox");
+});
+
+test("normalizes full access approval policy for app-server payloads", () => {
+  expect(effectiveCodexApprovalPolicy({
+    permissionMode: "full_access",
+    approvalMode: "on-failure"
+  })).toBe("never");
+  expect(effectiveCodexApprovalPolicy({
+    permissionMode: "default_permissions",
+    approvalMode: "on-request"
+  })).toBe("on-request");
+  expect(effectiveCodexApprovalPolicy({
+    permissionMode: "default_permissions",
+    approvalMode: "default"
+  })).toBeUndefined();
+  expect(codexTurnStartPayload("thread-1", {
+    cwd: process.cwd(),
+    prompt: "hello",
+    model: "gpt-5.3-codex",
+    reasoningEffort: "medium",
+    permissionMode: "full_access",
+    approvalMode: "on-request",
+    planModeEnabled: false
+  })).toMatchObject({
+    threadId: "thread-1",
+    approvalPolicy: "never",
+    sandboxPolicy: { type: "dangerFullAccess" }
+  });
+  expect(codexTurnStartPayload("thread-1", {
+    cwd: process.cwd(),
+    prompt: "hello",
+    model: "gpt-5.3-codex",
+    reasoningEffort: "medium",
+    permissionMode: "default_permissions",
+    approvalMode: "on-request",
+    planModeEnabled: false
+  })).toMatchObject({
+    threadId: "thread-1",
+    approvalPolicy: "on-request",
+    sandboxPolicy: undefined
   });
 });

@@ -1471,6 +1471,164 @@ test("chat settings dialogs fit inside applets and use app-styled dropdowns", as
   await app.close();
 });
 
+test("thread settings access selector persists OpenCode full access for approvals", async () => {
+  test.setTimeout(90_000);
+  const dataDir = makeDataDir();
+  const modelPath = path.join(dataDir, "model.gguf");
+  fs.writeFileSync(modelPath, "");
+  let app = await launchApp(dataDir);
+  let page = await firstWindow(app);
+  await expect(page.getByTestId("chat-surface")).toBeVisible();
+
+  let state = await page.evaluate(async (localModelPath) => {
+    const current = await window.unitApi.chat.bootstrap();
+    const withModel = await window.unitApi.chat.addLocalModel({ path: localModelPath });
+    const presetState = await window.unitApi.chat.saveSettingsPreset({
+      label: "OpenCode Access Preset",
+      runtimeSettings: { temperature: 0.2 },
+      providerMode: "builtin",
+      builtinModelId: withModel.selectedModelId,
+      builtinAgenticFramework: "opencode"
+    });
+    const preset = presetState.settingsPresets.find((item) => item.label === "OpenCode Access Preset");
+    if (!preset) {
+      throw new Error("Missing OpenCode access preset");
+    }
+    await window.unitApi.chat.applySettingsPreset({ threadId: current.selectedThreadId, presetId: preset.id });
+    return window.unitApi.chat.updateThreadSettings({
+      threadId: current.selectedThreadId,
+      providerMode: "builtin",
+      builtinAgenticFramework: "opencode",
+      builtinModelId: withModel.selectedModelId,
+      permissionMode: "default_permissions",
+      runtimeSettings: { permissionMode: "default_permissions" }
+    });
+  }, modelPath);
+  const thread = state.threads.find((item) => item.id === state.selectedThreadId)!;
+  const accessPreset = state.settingsPresets.find((item) => item.label === "OpenCode Access Preset")!;
+  expect(thread.permissionMode).toBe("default_permissions");
+  expect(thread.runtimeSettings.permissionMode).toBe("default_permissions");
+  expect(thread.selectedSettingsPresetId).toBe(accessPreset.id);
+
+  await page.getByTestId(`chat-thread-${thread.id}`).hover();
+  await page.getByLabel(`More actions for ${thread.title}`).dispatchEvent("pointerdown", {
+    bubbles: true,
+    cancelable: true,
+    pointerType: "mouse"
+  });
+  await page.getByRole("menuitem", { name: "Thread Settings" }).click();
+  const dialog = page.getByRole("dialog", { name: "Thread settings" });
+  await expect(dialog).toBeVisible();
+  await dialog.getByLabel("Thread permissions").click();
+  await page.getByRole("listbox", { name: "Thread permissions" }).getByRole("option", { name: "Full access" }).dispatchEvent("click", {
+    bubbles: true,
+    cancelable: true
+  });
+  await dialog.getByRole("button", { name: "Save" }).click();
+
+  state = await page.evaluate(() => window.unitApi.chat.bootstrap());
+  expect(state.threads.find((item) => item.id === state.selectedThreadId)).toMatchObject({
+    selectedSettingsPresetId: accessPreset.id,
+    permissionMode: "full_access",
+    codexApprovalMode: "never",
+    runtimeSettings: { permissionMode: "full_access" }
+  });
+
+  await page.getByTestId(`chat-thread-${thread.id}`).hover();
+  await page.getByLabel(`More actions for ${thread.title}`).dispatchEvent("pointerdown", {
+    bubbles: true,
+    cancelable: true,
+    pointerType: "mouse"
+  });
+  await page.getByRole("menuitem", { name: "Thread Settings" }).click();
+  await expect(dialog).toBeVisible();
+  await dialog.getByLabel("Thread provider").click();
+  await page.getByRole("listbox", { name: "Thread provider" }).getByRole("option", { name: "Codex" }).dispatchEvent("click", {
+    bubbles: true,
+    cancelable: true
+  });
+  await dialog.getByRole("button", { name: "Save" }).click();
+
+  state = await page.evaluate(() => window.unitApi.chat.bootstrap());
+  expect(state.threads.find((item) => item.id === state.selectedThreadId)).toMatchObject({
+    providerMode: "codex",
+    permissionMode: "full_access",
+    codexApprovalMode: "never",
+    runtimeSettings: { permissionMode: "full_access" }
+  });
+
+  await page.getByTestId(`chat-thread-${thread.id}`).hover();
+  await page.getByLabel(`More actions for ${thread.title}`).dispatchEvent("pointerdown", {
+    bubbles: true,
+    cancelable: true,
+    pointerType: "mouse"
+  });
+  await page.getByRole("menuitem", { name: "Thread Settings" }).click();
+  await expect(dialog).toBeVisible();
+  await dialog.getByLabel("Thread Codex access").click();
+  await page.getByRole("listbox", { name: "Thread Codex access" }).getByRole("option", { name: "Default" }).dispatchEvent("click", {
+    bubbles: true,
+    cancelable: true
+  });
+  await dialog.getByLabel("Thread provider").click();
+  await page.getByRole("listbox", { name: "Thread provider" }).getByRole("option", { name: "Built-in model" }).dispatchEvent("click", {
+    bubbles: true,
+    cancelable: true
+  });
+  await dialog.getByRole("button", { name: "Save" }).click();
+
+  state = await page.evaluate(() => window.unitApi.chat.bootstrap());
+  expect(state.threads.find((item) => item.id === state.selectedThreadId)).toMatchObject({
+    providerMode: "builtin",
+    permissionMode: "default_permissions",
+    codexApprovalMode: "default",
+    runtimeSettings: { permissionMode: "default_permissions" }
+  });
+  await app.close();
+
+  app = await launchApp(dataDir);
+  page = await firstWindow(app);
+  state = await page.evaluate(() => window.unitApi.chat.bootstrap());
+  expect(state.threads.find((item) => item.id === state.selectedThreadId)).toMatchObject({
+    permissionMode: "default_permissions",
+    codexApprovalMode: "default",
+    runtimeSettings: { permissionMode: "default_permissions" }
+  });
+  state = await page.evaluate(async (presetId) => {
+    const current = await window.unitApi.chat.bootstrap();
+    await window.unitApi.chat.applySettingsPreset({ threadId: current.selectedThreadId, presetId });
+    return window.unitApi.chat.updateThreadSettings({
+      threadId: current.selectedThreadId,
+      permissionMode: "default_permissions",
+      runtimeSettings: { permissionMode: "default_permissions" }
+    });
+  }, accessPreset.id);
+  expect(state.threads.find((item) => item.id === state.selectedThreadId)).toMatchObject({
+    selectedSettingsPresetId: accessPreset.id,
+    permissionMode: "default_permissions",
+    codexApprovalMode: "default",
+    runtimeSettings: { permissionMode: "default_permissions" }
+  });
+  const footerAccessButton = page.locator(".chat-composer-footer .chat-footer-button").filter({ hasText: "Default" }).first();
+  await expect(footerAccessButton).toBeVisible();
+  await footerAccessButton.dispatchEvent("pointerdown", {
+    bubbles: true,
+    cancelable: true,
+    pointerType: "mouse"
+  });
+  await page.getByRole("menuitemradio", { name: "Full access" }).click();
+  state = await page.evaluate(() => window.unitApi.chat.bootstrap());
+  expect(state.threads.find((item) => item.id === state.selectedThreadId)).toMatchObject({
+    selectedSettingsPresetId: accessPreset.id,
+    permissionMode: "full_access",
+    codexApprovalMode: "never",
+    runtimeSettings: { permissionMode: "full_access" }
+  });
+  await expect(page.locator(".chat-composer-footer .chat-footer-button").filter({ hasText: "Full access" }).first()).toBeVisible();
+
+  await app.close();
+});
+
 test("chat Codex mode uses mocked events and provider-aware menus", async () => {
   const app = await launchApp();
   const page = await firstWindow(app);

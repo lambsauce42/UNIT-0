@@ -6,12 +6,13 @@ import { createRequire } from "node:module";
 import net from "node:net";
 import path from "node:path";
 import type { ChatPermissionMode, ChatRuntimeSettings, ChatTimelineBlock } from "../shared/types.js";
-import { GptOssChannelParser, renderGptOssOpenCodeSystemPrompt, type LocalLlamaOpenAiEndpoint } from "./localLlamaRuntime.js";
+import { GptOssChannelParser, renderGptOssOpenCodeSystemPrompt, type GptOssChannelParserResult, type LocalLlamaOpenAiEndpoint } from "./localLlamaRuntime.js";
 
 const requireFromOpenCodeRuntime = createRequire(__filename);
 const OPENCODE_PROVIDER_ID = "unit0-local";
 const OPENCODE_MODEL_ID = "unit0-model";
 const OPENCODE_DEBUG_LOG = process.env.UNIT0_OPENCODE_DEBUG_LOG;
+const OPENCODE_MIN_COMPLETION_TOKENS = 64;
 
 export type OpenCodeRunOptions = {
   cwd: string;
@@ -132,6 +133,7 @@ type OpenCodeReasoningSourceState = {
 type OpenCodeDelimitedSegment =
   | { type: "reasoning"; text: string; start: number; end: number }
   | { type: "content"; text: string; start: number; end: number }
+  | { type: "commentary"; text: string; start: number; end: number }
   | { type: "toolStart"; toolCall: OpenCodeProxyToolCallRecord }
   | { type: "toolComplete"; toolCall: OpenCodeProxyToolCallRecord };
 
@@ -394,7 +396,7 @@ class AsyncEventQueue {
   }
 }
 
-function openCodeConfig(options: OpenCodeConfigOptions): OpenCodeConfig {
+export function openCodeConfig(options: OpenCodeConfigOptions): OpenCodeConfig {
   return {
     $schema: "https://opencode.ai/config.json",
     autoupdate: false,
@@ -441,8 +443,10 @@ function openCodePrompt(options: OpenCodeRunOptions): string {
   return options.prompt;
 }
 
-function openCodePermissions(permissionMode: ChatPermissionMode): Record<string, unknown> {
-  const bash = permissionMode === "full_access" ? "allow" : "ask";
+function openCodePermissions(permissionMode: ChatPermissionMode): unknown {
+  if (permissionMode === "full_access") {
+    return "allow";
+  }
   return {
     read: "allow",
     edit: "allow",
@@ -451,8 +455,11 @@ function openCodePermissions(permissionMode: ChatPermissionMode): Record<string,
     list: "allow",
     todowrite: "allow",
     task: "allow",
-    bash,
-    external_directory: permissionMode === "full_access" ? "allow" : "ask",
+    skill: "allow",
+    lsp: "allow",
+    doom_loop: "ask",
+    bash: "ask",
+    external_directory: "ask",
     webfetch: "ask",
     websearch: "ask",
     question: "allow"
@@ -542,6 +549,9 @@ async function handleGptOssOpenCodeProxyRequest(
   upstreamAbortControllers.add(upstreamAbortController);
   response.once("close", () => upstreamAbortController.abort());
   const requestRawCompletion = async (rawPrompt: string, nPredict: number): Promise<ReadableStream<Uint8Array>> => {
+    if (nPredict <= 0) {
+      throw new Error("OpenCode GPT-OSS prompt exceeded the local model context window.");
+    }
     const upstream = await fetch(options.endpoint.rawCompletionUrl!, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -623,10 +633,11 @@ async function streamGptOssOpenCodeProxyResponse(
   let parser = new GptOssChannelParser({ defaultChannel: "analysis", toolRecipients });
   let rawGeneratedText = "";
   let content = "";
-  const markerState = { sentAnalysis: false, sentFinal: false, sentToolCompletion: false };
+  const markerState = { sentAnalysis: false, sentCommentary: false, sentFinal: false, sentToolCompletion: false };
   let finishedWithToolCall = false;
   let toolCallFinishPending = false;
   let sawReasoning = false;
+  let sawCommentaryContent = false;
   let sawFinalContent = false;
   const pendingChunks: Record<string, unknown>[] = [];
   const completionId = `chatcmpl-${randomUUID()}`;
@@ -645,13 +656,17 @@ async function streamGptOssOpenCodeProxyResponse(
     writeDelta({ content: openCodeToolCompleteMarker(completedToolCall) });
     markerState.sentToolCompletion = true;
   }
-  const applyParsedDelta = (delta: { content: string; reasoning: string; toolCallContent?: string }) => {
+  const applyParsedDelta = (delta: GptOssChannelParserResult) => {
     if (delta.reasoning) {
       const prefix = markerState.sentAnalysis ? "" : "[[UNIT0_ANALYSIS]]";
       markerState.sentAnalysis = true;
       toolSink.sawReasoning = true;
       sawReasoning = true;
       writeDelta({ content: `${prefix}${delta.reasoning}` });
+    }
+    if (delta.commentary) {
+      sawCommentaryContent = true;
+      writeOpenCodeProxyCommentaryDelta(writeDelta, delta.commentary, markerState);
     }
     if (delta.toolCallContent) {
       const result = writeOpenCodeProxyContentOrToolDelta(writeDelta, delta.toolCallContent, markerState, toolSink, toolRecipients, true);
@@ -682,8 +697,7 @@ async function streamGptOssOpenCodeProxyResponse(
     applyParsedDelta(parser.finish());
   };
   await consumeBody(body);
-  const endedWithReturn = /<\|return\|>\s*$/u.test(rawGeneratedText);
-  if (sawReasoning && !sawFinalContent && !finishedWithToolCall && endedWithReturn) {
+  for (let continuationAttempts = 0; continuationAttempts < 4 && sawReasoning && !sawCommentaryContent && !sawFinalContent && !finishedWithToolCall; continuationAttempts += 1) {
     parser = new GptOssChannelParser({ defaultChannel: "final", toolRecipients });
     await consumeBody(await continueToFinal(rawGeneratedText));
   }
@@ -712,10 +726,26 @@ function gptOssOpenCodeFinalContinuationMaxTokens(settings: ChatRuntimeSettings)
   return Math.max(64, Math.min(settings.maxTokens, 512));
 }
 
+function writeOpenCodeProxyCommentaryDelta(
+  writeDelta: (delta: Record<string, unknown>, finishReason?: string) => void,
+  content: string,
+  markerState: { sentAnalysis: boolean; sentCommentary: boolean; sentFinal: boolean; sentToolCompletion: boolean }
+): void {
+  if (markerState.sentFinal) {
+    throw new Error("OpenCode GPT-OSS emitted commentary after final output.");
+  }
+  if (!markerState.sentAnalysis && !markerState.sentToolCompletion) {
+    throw new Error("OpenCode GPT-OSS emitted commentary before streamed reasoning.");
+  }
+  const prefix = markerState.sentCommentary ? "" : "[[UNIT0_COMMENTARY]]";
+  markerState.sentCommentary = true;
+  writeDelta({ content: `${prefix}${content}` });
+}
+
 function writeOpenCodeProxyContentOrToolDelta(
   writeDelta: (delta: Record<string, unknown>, finishReason?: string) => void,
   content: string,
-  markerState: { sentAnalysis: boolean; sentFinal: boolean; sentToolCompletion: boolean },
+  markerState: { sentAnalysis: boolean; sentCommentary: boolean; sentFinal: boolean; sentToolCompletion: boolean },
   toolSink: OpenCodeProxyToolEventSink,
   toolRecipients: string[],
   allowToolCall: boolean
@@ -901,9 +931,9 @@ function emitCompletedOpenCodeProxyToolEvents(body: unknown, toolSink: OpenCodeP
   }
 }
 
-function renderGptOssOpenCodeProxyPrompt(body: unknown, options: OpenCodeRunOptions): string {
+export function renderGptOssOpenCodeProxyPrompt(body: unknown, options: OpenCodeRunOptions): string {
   const messages = isRecord(body) && Array.isArray(body.messages) ? body.messages : [];
-  const parts = [
+  const parts: OpenCodeProxyPromptPart[] = [
     `<|start|>system<|message|>${renderGptOssOpenCodeSystemPrompt(options.settings)}<|end|>`,
     `<|start|>developer<|message|># Environment\nWorking directory: ${escapeGptOssTranscriptText(options.cwd)}\nPlatform: win32<|end|>`,
     options.settings.systemPrompt.trim() ? `<|start|>developer<|message|>${escapeGptOssTranscriptText(options.settings.systemPrompt.trim())}<|end|>` : "",
@@ -923,13 +953,71 @@ function renderGptOssOpenCodeProxyPrompt(body: unknown, options: OpenCodeRunOpti
     if (role === "assistant") {
       parts.push(...renderOpenCodeProxyAssistantTranscript(message, content));
     } else if (role === "tool") {
-      parts.push(`<|start|>developer<|message|># OpenCode Tool Result\n${escapeGptOssTranscriptText(content)}<|end|>`);
+      parts.push({ kind: "toolResult", content });
     } else {
       parts.push(`<|start|>${role === "system" ? "developer" : "user"}<|message|>${escapeGptOssTranscriptText(content)}<|end|>`);
     }
   }
   parts.push("<|start|>assistant");
-  return parts.join("");
+  return renderOpenCodeProxyPromptParts(parts, options.settings);
+}
+
+type OpenCodeProxyPromptPart = string | { kind: "toolResult"; content: string };
+
+function renderOpenCodeProxyPromptParts(parts: OpenCodeProxyPromptPart[], settings: ChatRuntimeSettings): string {
+  const toolResultPrefix = "<|start|>developer<|message|># OpenCode Tool Result\n";
+  const toolResultSuffix = "<|end|>";
+  const rendered = parts.map((part) => typeof part === "string"
+    ? part
+    : {
+        prefix: toolResultPrefix,
+        content: escapeGptOssTranscriptText(part.content),
+        suffix: toolResultSuffix
+      });
+  const promptBudget = gptOssOpenCodePromptBudgetCharacters(settings);
+  const fixedLength = rendered.reduce((total, part) =>
+    total + (typeof part === "string" ? part.length : part.prefix.length + part.suffix.length), 0);
+  if (fixedLength > promptBudget) {
+    throw new Error("OpenCode GPT-OSS prompt overhead exceeded the local model context window.");
+  }
+  let remainingToolResultChars = promptBudget - fixedLength;
+  const toolResultIndexes = rendered
+    .map((part, index) => typeof part === "string" ? -1 : index)
+    .filter((index) => index >= 0)
+    .reverse();
+  const contentByIndex = new Map<number, string>();
+  for (const index of toolResultIndexes) {
+    const part = rendered[index];
+    if (typeof part === "string") {
+      continue;
+    }
+    const content = fitOpenCodeToolResultContent(part.content, remainingToolResultChars);
+    contentByIndex.set(index, content);
+    remainingToolResultChars -= content.length;
+  }
+  return rendered.map((part, index) => {
+    if (typeof part === "string") {
+      return part;
+    }
+    return `${part.prefix}${contentByIndex.get(index) ?? ""}${part.suffix}`;
+  }).join("");
+}
+
+function fitOpenCodeToolResultContent(content: string, maxCharacters: number): string {
+  if (maxCharacters <= 0) {
+    return "";
+  }
+  if (content.length <= maxCharacters) {
+    return content;
+  }
+  const marker = "\n\n[OpenCode tool result truncated to fit the local model context window.]\n\n";
+  if (maxCharacters <= marker.length) {
+    return marker.slice(0, maxCharacters);
+  }
+  const retained = maxCharacters - marker.length;
+  const headLength = Math.ceil(retained / 2);
+  const tailLength = Math.floor(retained / 2);
+  return `${content.slice(0, headLength)}${marker}${content.slice(content.length - tailLength)}`;
 }
 
 function renderOpenCodeProxyToolInstructions(body: unknown): string {
@@ -1026,11 +1114,21 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function gptOssOpenCodeRequestMaxTokens(prompt: string, settings: ChatRuntimeSettings): number {
+export function gptOssOpenCodeRequestMaxTokens(prompt: string, settings: ChatRuntimeSettings): number {
   const estimatedPromptTokens = Math.ceil(prompt.length / 3);
   const remainingContextTokens = Math.max(0, settings.nCtx - estimatedPromptTokens);
   const configuredMaxTokens = settings.maxTokens > 0 ? settings.maxTokens : remainingContextTokens;
   return Math.min(configuredMaxTokens, remainingContextTokens);
+}
+
+function gptOssOpenCodePromptBudgetCharacters(settings: ChatRuntimeSettings): number {
+  const configuredMaxTokens = settings.maxTokens > 0 ? settings.maxTokens : settings.nCtx;
+  const reservedCompletionTokens = Math.min(
+    Math.max(OPENCODE_MIN_COMPLETION_TOKENS, configuredMaxTokens),
+    Math.max(OPENCODE_MIN_COMPLETION_TOKENS, settings.nCtx - 1)
+  );
+  const promptTokens = Math.max(1, settings.nCtx - reservedCompletionTokens);
+  return promptTokens * 3;
 }
 
 async function readOpenCodeProxyServerSentEvents(body: ReadableStream<Uint8Array>, onPayload: (payload: string) => void): Promise<void> {
@@ -1570,7 +1668,7 @@ export function normalizeOpenCodeHarmonyEvent(event: OpenCodeRuntimeEvent, state
             events.push(openCodeProxyToolCompletedRuntimeEvent(segment.toolCall, event.sessionId));
           }
         }
-      } else if (segment.type === "content") {
+      } else if (segment.type === "content" || segment.type === "commentary") {
         const from = event.replace ? segment.start : Math.max(segment.start, state.streamedFlattenedContentLength);
         const contentDelta = segment.text.slice(from - segment.start);
         state.streamedFlattenedContentLength = Math.max(state.streamedFlattenedContentLength, segment.end);
@@ -1605,6 +1703,12 @@ export function normalizeOpenCodeHarmonyEvent(event: OpenCodeRuntimeEvent, state
       }
       events.push(reasoningEvent);
     }
+  }
+  if (parsed.commentary) {
+    if (!openCodeGlobalReasoningSeen(states).value) {
+      return [{ type: "error", message: "OpenCode GPT-OSS emitted commentary before streamed reasoning." }];
+    }
+    events.push({ ...event, text: parsed.commentary, replace: event.replace || undefined });
   }
   if (parsed.content) {
     if (!openCodeGlobalReasoningSeen(states).value) {
@@ -1745,7 +1849,7 @@ export function parseOpenCodeHarmonySnapshot(text: string): { content: string; r
   const first = parser.push(text);
   const last = parser.finish();
   return {
-    content: `${first.content}${last.content}`,
+    content: `${first.commentary ?? ""}${first.content}${last.commentary ?? ""}${last.content}`,
     reasoning: `${first.reasoning}${last.reasoning}`
   };
 }
@@ -1766,8 +1870,9 @@ function parseDelimitedPlainOpenCodeText(text: string, markerSecret = ""): {
   segments: OpenCodeDelimitedSegment[];
 } {
   const analysisMarker = "[[UNIT0_ANALYSIS]]";
+  const commentaryMarker = "[[UNIT0_COMMENTARY]]";
   const finalMarker = "[[UNIT0_FINAL]]";
-  const markerPattern = /\[\[UNIT0_(ANALYSIS|FINAL|TOOL_START:([A-Za-z0-9_-]+)|TOOL_COMPLETE:([A-Za-z0-9_-]+))\]\]/gu;
+  const markerPattern = /\[\[UNIT0_(ANALYSIS|COMMENTARY|FINAL|TOOL_START:([A-Za-z0-9_-]+)|TOOL_COMPLETE:([A-Za-z0-9_-]+))\]\]/gu;
   const withoutPartialMarkers = stripTrailingPartialOpenCodeMarker(plainGptOssTextWithoutProtocolMarkers(text));
   const markers = [...withoutPartialMarkers.matchAll(markerPattern)];
   const toolStarts: OpenCodeProxyToolCallRecord[] = [];
@@ -1780,8 +1885,10 @@ function parseDelimitedPlainOpenCodeText(text: string, markerSecret = ""): {
   let content = "";
   let cursor = 0;
   let inAnalysis = false;
+  let inCommentary = false;
   let inFinal = false;
   let sawAnalysis = false;
+  let sawCommentary = false;
   let sawToolComplete = false;
   let sawFinal = false;
   let malformed = false;
@@ -1801,6 +1908,12 @@ function parseDelimitedPlainOpenCodeText(text: string, markerSecret = ""): {
       if (precedingText) {
         segments.push({ type: "reasoning", text: precedingText, start, end: reasoning.length });
       }
+    } else if (inCommentary) {
+      const start = content.length;
+      content += precedingText;
+      if (precedingText) {
+        segments.push({ type: "commentary", text: precedingText, start, end: content.length });
+      }
     } else if (precedingText.trim()) {
       malformed = true;
     }
@@ -1810,18 +1923,29 @@ function parseDelimitedPlainOpenCodeText(text: string, markerSecret = ""): {
         malformed = true;
       }
       inAnalysis = true;
+      inCommentary = false;
       sawAnalysis = true;
-    } else if (kind === "FINAL") {
-      if ((!sawAnalysis && !sawToolComplete) || sawFinal) {
+    } else if (kind === "COMMENTARY") {
+      if (inFinal || (!sawAnalysis && !sawToolComplete)) {
         malformed = true;
       }
       inAnalysis = false;
+      inCommentary = true;
+      sawCommentary = true;
+    } else if (kind === "FINAL") {
+      if ((!sawAnalysis && !sawCommentary && !sawToolComplete) || sawFinal) {
+        malformed = true;
+      }
+      inAnalysis = false;
+      inCommentary = false;
       inFinal = true;
       sawFinal = true;
     } else if (kind.startsWith("TOOL_START:")) {
       if (inFinal) {
         malformed = true;
       }
+      inAnalysis = false;
+      inCommentary = false;
       const decoded = decodeOpenCodeToolStartMarker(marker[2] ?? "");
       if (decoded && (!markerSecret || decoded.secret === markerSecret)) {
         toolStarts.push(decoded);
@@ -1831,6 +1955,8 @@ function parseDelimitedPlainOpenCodeText(text: string, markerSecret = ""): {
       if (inFinal) {
         malformed = true;
       }
+      inAnalysis = false;
+      inCommentary = false;
       const decoded = decodeOpenCodeToolStartMarker(marker[3] ?? "");
       if (decoded && (!markerSecret || decoded.secret === markerSecret)) {
         toolCompletes.push(decoded);
@@ -1852,6 +1978,12 @@ function parseDelimitedPlainOpenCodeText(text: string, markerSecret = ""): {
     reasoning += tail;
     if (tail) {
       segments.push({ type: "reasoning", text: tail, start, end: reasoning.length });
+    }
+  } else if (inCommentary) {
+    const start = content.length;
+    content += tail;
+    if (tail) {
+      segments.push({ type: "commentary", text: tail, start, end: content.length });
     }
   } else if (tail.trim()) {
     malformed = true;
@@ -1876,7 +2008,7 @@ function stripTrailingPartialOpenCodeMarker(text: string): string {
   if (partialToolCompleteIndex >= 0 && text.indexOf("]]", partialToolCompleteIndex) < 0) {
     return text.slice(0, partialToolCompleteIndex);
   }
-  const markers = ["[[UNIT0_ANALYSIS]]", "[[UNIT0_FINAL]]", "[[UNIT0_TOOL_START:", "[[UNIT0_TOOL_COMPLETE:"];
+  const markers = ["[[UNIT0_ANALYSIS]]", "[[UNIT0_COMMENTARY]]", "[[UNIT0_FINAL]]", "[[UNIT0_TOOL_START:", "[[UNIT0_TOOL_COMPLETE:"];
   for (const marker of markers) {
     for (let length = Math.min(marker.length - 1, text.length); length > 0; length -= 1) {
       if (marker.startsWith(text.slice(-length))) {

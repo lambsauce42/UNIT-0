@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import { DatabaseSync } from "node:sqlite";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -10,8 +11,59 @@ function makeStore(): { store: ChatStore; dir: string; dbPath: string } {
   return { store: new ChatStore(dbPath), dir, dbPath };
 }
 
+function validStoredPresetFixture(): Record<string, unknown> {
+  return {
+    id: "custom::valid",
+    label: "Valid",
+    runtimeSettings: { nCtx: 4096, maxTokens: 4096, reasoningEffort: "medium" },
+    providerMode: "builtin",
+    iconName: "settings",
+    builtinModelId: "",
+    builtinAgenticFramework: "chat",
+    documentAnalysisEmbeddingModelPath: "",
+    codexModelId: "gpt-5.3-codex",
+    codexReasoningEffort: "medium",
+    builtIn: false,
+    editable: true,
+    deletable: true
+  };
+}
+
+function storedPresetFromJson(raw: string, id: string): Record<string, unknown> | undefined {
+  const parsed = JSON.parse(raw) as Array<Record<string, unknown>>;
+  return parsed.find((preset) => preset.id === id);
+}
+
+function hiddenFastOverridePayload(): Record<string, unknown> {
+  return {
+    id: "builtin::fast",
+    label: "Custom Fast",
+    runtimeSettings: {
+      nCtx: 8192,
+      maxTokens: 8192,
+      reasoningEffort: "medium",
+      temperature: 1,
+      repeatPenalty: 1,
+      trimReserveTokens: 2000,
+      trimReservePercent: 15,
+      trimAmountTokens: 4000,
+      trimAmountPercent: 30
+    },
+    providerMode: "builtin",
+    iconName: "bolt",
+    builtinModelId: "",
+    builtinAgenticFramework: "opencode",
+    documentAnalysisEmbeddingModelPath: "",
+    codexModelId: "gpt-5.3-codex-spark",
+    codexReasoningEffort: "high",
+    builtIn: true,
+    editable: true,
+    deletable: true
+  };
+}
+
 test("seeds a default global chat project and thread", () => {
-  const { store } = makeStore();
+  const { store, dbPath } = makeStore();
   const state = store.loadState();
 
   expect(state.projects).toHaveLength(1);
@@ -27,9 +79,17 @@ test("seeds a default global chat project and thread", () => {
     codexModelId: "gpt-5.3-codex",
     codexReasoningEffort: "medium",
     permissionMode: "full_access",
-    codexApprovalMode: "default",
+    codexApprovalMode: "never",
     planModeEnabled: false
   });
+  const db = new DatabaseSync(dbPath);
+  const row = db
+    .prepare("SELECT permission_mode, codex_approval_mode, runtime_settings_json FROM chat_threads WHERE id = ?")
+    .get(state.selectedThreadId) as { permission_mode: string; codex_approval_mode: string; runtime_settings_json: string };
+  db.close();
+  expect(row.permission_mode).toBe("full_access");
+  expect(row.codex_approval_mode).toBe("never");
+  expect(JSON.parse(row.runtime_settings_json)).toMatchObject({ permissionMode: "full_access" });
   store.close();
 });
 
@@ -130,8 +190,178 @@ test("imports legacy PySide history into a fresh SQLite chat store", () => {
       ["m-assistant", "assistant", "world", "Qwen", "Built-in"]
     ]);
     expect(state.appSettings.expandedProjectIds).toEqual(["legacy-project"]);
+    const db = new DatabaseSync(path.join(dir, "unit0.sqlite"));
+    const row = db
+      .prepare("SELECT permission_mode, codex_approval_mode, runtime_settings_json FROM chat_threads WHERE id = ?")
+      .get("legacy-thread") as { permission_mode: string; codex_approval_mode: string; runtime_settings_json: string };
+    db.close();
+    expect(row.permission_mode).toBe("default_permissions");
+    expect(row.codex_approval_mode).toBe("on-request");
+    expect(JSON.parse(row.runtime_settings_json)).toMatchObject({ permissionMode: "default_permissions" });
     store.close();
   } finally {
+    if (previousHistoryPath === undefined) {
+      delete process.env.UNIT_0_HISTORY_PATH;
+    } else {
+      process.env.UNIT_0_HISTORY_PATH = previousHistoryPath;
+    }
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("imports legacy Codex never approval without overriding explicit runtime access", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit-0-chat-legacy-never-"));
+  const historyPath = path.join(dir, "history.json");
+  const previousHistoryPath = process.env.UNIT_0_HISTORY_PATH;
+  process.env.UNIT_0_HISTORY_PATH = historyPath;
+  fs.writeFileSync(historyPath, JSON.stringify({
+    projects: [{ id: "legacy-project", name: "Legacy Project", created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-02T00:00:00Z" }],
+    conversations: [{
+      id: "legacy-thread",
+      project_id: "legacy-project",
+      title: "Legacy Thread",
+      created_at: "2026-01-03T00:00:00Z",
+      updated_at: "2026-01-04T00:00:00Z",
+      messages: [],
+      settings: {
+        provider_mode: "codex",
+        builtin: { inference_settings: { permission_mode: "default_permissions" } },
+        codex: { approval_mode: "never" }
+      }
+    }],
+    current_conversation_id: "legacy-thread",
+    selected_project_id: "legacy-project"
+  }));
+
+  let store: ChatStore | undefined;
+  try {
+    const dbPath = path.join(dir, "unit0.sqlite");
+    store = new ChatStore(dbPath);
+    const state = store.loadState();
+    expect(state.threads[0]).toMatchObject({
+      providerMode: "codex",
+      permissionMode: "default_permissions",
+      codexApprovalMode: "default",
+      runtimeSettings: { permissionMode: "default_permissions" }
+    });
+    const db = new DatabaseSync(dbPath);
+    const row = db
+      .prepare("SELECT permission_mode, codex_approval_mode, runtime_settings_json FROM chat_threads WHERE id = ?")
+      .get("legacy-thread") as { permission_mode: string; codex_approval_mode: string; runtime_settings_json: string };
+    db.close();
+    expect(row.permission_mode).toBe("default_permissions");
+    expect(row.codex_approval_mode).toBe("default");
+    expect(JSON.parse(row.runtime_settings_json)).toMatchObject({ permissionMode: "default_permissions" });
+    store.close();
+  } finally {
+    if (previousHistoryPath === undefined) {
+      delete process.env.UNIT_0_HISTORY_PATH;
+    } else {
+      process.env.UNIT_0_HISTORY_PATH = previousHistoryPath;
+    }
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("imports legacy Codex approval as default access when runtime access is missing", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit-0-chat-legacy-missing-access-"));
+  const historyPath = path.join(dir, "history.json");
+  const previousHistoryPath = process.env.UNIT_0_HISTORY_PATH;
+  process.env.UNIT_0_HISTORY_PATH = historyPath;
+  fs.writeFileSync(historyPath, JSON.stringify({
+    projects: [{ id: "legacy-project", name: "Legacy Project", created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-02T00:00:00Z" }],
+    conversations: [{
+      id: "legacy-thread",
+      project_id: "legacy-project",
+      title: "Legacy Thread",
+      created_at: "2026-01-03T00:00:00Z",
+      updated_at: "2026-01-04T00:00:00Z",
+      messages: [],
+      settings: {
+        provider_mode: "codex",
+        builtin: { inference_settings: { n_ctx: 4096 } },
+        codex: { approval_mode: "on_request" }
+      }
+    }],
+    current_conversation_id: "legacy-thread",
+    selected_project_id: "legacy-project"
+  }));
+
+  let store: ChatStore | undefined;
+  try {
+    const dbPath = path.join(dir, "unit0.sqlite");
+    store = new ChatStore(dbPath);
+    const state = store.loadState();
+    expect(state.threads[0]).toMatchObject({
+      providerMode: "codex",
+      permissionMode: "default_permissions",
+      codexApprovalMode: "on-request",
+      runtimeSettings: { permissionMode: "default_permissions" }
+    });
+    const db = new DatabaseSync(dbPath);
+    const row = db
+      .prepare("SELECT permission_mode, codex_approval_mode, runtime_settings_json FROM chat_threads WHERE id = ?")
+      .get("legacy-thread") as { permission_mode: string; codex_approval_mode: string; runtime_settings_json: string };
+    db.close();
+    expect(row.permission_mode).toBe("default_permissions");
+    expect(row.codex_approval_mode).toBe("on-request");
+    expect(JSON.parse(row.runtime_settings_json)).toMatchObject({ permissionMode: "default_permissions" });
+  } finally {
+    store?.close();
+    if (previousHistoryPath === undefined) {
+      delete process.env.UNIT_0_HISTORY_PATH;
+    } else {
+      process.env.UNIT_0_HISTORY_PATH = previousHistoryPath;
+    }
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("imports legacy Codex never approval as default access when runtime access is missing", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit-0-chat-legacy-missing-never-access-"));
+  const historyPath = path.join(dir, "history.json");
+  const previousHistoryPath = process.env.UNIT_0_HISTORY_PATH;
+  process.env.UNIT_0_HISTORY_PATH = historyPath;
+  fs.writeFileSync(historyPath, JSON.stringify({
+    projects: [{ id: "legacy-project", name: "Legacy Project", created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-02T00:00:00Z" }],
+    conversations: [{
+      id: "legacy-thread",
+      project_id: "legacy-project",
+      title: "Legacy Thread",
+      created_at: "2026-01-03T00:00:00Z",
+      updated_at: "2026-01-04T00:00:00Z",
+      messages: [],
+      settings: {
+        provider_mode: "codex",
+        builtin: { inference_settings: { n_ctx: 4096 } },
+        codex: { approval_mode: "never" }
+      }
+    }],
+    current_conversation_id: "legacy-thread",
+    selected_project_id: "legacy-project"
+  }));
+
+  let store: ChatStore | undefined;
+  try {
+    const dbPath = path.join(dir, "unit0.sqlite");
+    store = new ChatStore(dbPath);
+    const state = store.loadState();
+    expect(state.threads[0]).toMatchObject({
+      providerMode: "codex",
+      permissionMode: "default_permissions",
+      codexApprovalMode: "default",
+      runtimeSettings: { permissionMode: "default_permissions" }
+    });
+    const db = new DatabaseSync(dbPath);
+    const row = db
+      .prepare("SELECT permission_mode, codex_approval_mode, runtime_settings_json FROM chat_threads WHERE id = ?")
+      .get("legacy-thread") as { permission_mode: string; codex_approval_mode: string; runtime_settings_json: string };
+    db.close();
+    expect(row.permission_mode).toBe("default_permissions");
+    expect(row.codex_approval_mode).toBe("default");
+    expect(JSON.parse(row.runtime_settings_json)).toMatchObject({ permissionMode: "default_permissions" });
+  } finally {
+    store?.close();
     if (previousHistoryPath === undefined) {
       delete process.env.UNIT_0_HISTORY_PATH;
     } else {
@@ -404,15 +634,26 @@ test("persists settings presets and applies provider/framework state", () => {
     label: "Codex preset",
     runtimeSettings: {},
     providerMode: "codex",
-    iconName: "code"
+    iconName: "code",
+    codexModelId: "gpt-5.3-codex-spark",
+    codexReasoningEffort: "high"
   });
   expect(codexPreset.iconName).toBe("openai");
+  expect("permissionMode" in preset.runtimeSettings).toBe(false);
+  const rawPresetDb = new DatabaseSync(dbPath);
+  const rawPresetRow = rawPresetDb
+    .prepare("SELECT value FROM chat_settings WHERE key = 'settings_presets_json'")
+    .get() as { value: string };
+  rawPresetDb.close();
+  expect(rawPresetRow.value).not.toContain("permissionMode");
   store.applySettingsPreset(threadId, preset.id);
   state = store.loadState();
   expect(state.runtimeSettings.nCtx).toBe(8192);
   expect(state.runtimeSettings.permissionMode).toBe("full_access");
   expect(state.threads.find((thread) => thread.id === threadId)).toMatchObject({
     selectedSettingsPresetId: preset.id,
+    permissionMode: "full_access",
+    codexApprovalMode: "never",
     builtinAgenticFramework: "document_analysis",
     documentAnalysisEmbeddingModelPath: "C:\\Models\\embed.gguf"
   });
@@ -420,8 +661,11 @@ test("persists settings presets and applies provider/framework state", () => {
   state = store.loadState();
   expect(state.threads.find((thread) => thread.id === threadId)).toMatchObject({
     selectedSettingsPresetId: openCodePreset.id,
+    permissionMode: "full_access",
+    codexApprovalMode: "never",
     builtinAgenticFramework: "opencode"
   });
+  expect(state.runtimeSettings.permissionMode).toBe("full_access");
   store.updateThreadSettings(threadId, { builtinAgenticFramework: "chat" });
   state = store.loadState();
   expect(state.threads.find((thread) => thread.id === threadId)?.selectedSettingsPresetId).toBe("custom::default");
@@ -441,10 +685,38 @@ test("persists settings presets and applies provider/framework state", () => {
   expect(state.threads.find((thread) => thread.id === threadId)?.selectedSettingsPresetId).toBe("custom::default");
 
   store.updateThreadSettings(threadId, {
+    permissionMode: "full_access",
+    runtimeSettings: { permissionMode: "full_access" }
+  });
+  store.applySettingsPreset(threadId, codexPreset.id);
+  state = store.loadState();
+  expect(state.threads.find((thread) => thread.id === threadId)).toMatchObject({
+    selectedSettingsPresetId: codexPreset.id,
+    providerMode: "codex",
+    codexModelId: "gpt-5.3-codex-spark",
+    codexReasoningEffort: "high",
+    permissionMode: "full_access",
+    codexApprovalMode: "never",
+    runtimeSettings: { permissionMode: "full_access" }
+  });
+  expect(state.runtimeSettings.permissionMode).toBe("full_access");
+
+  store.updateThreadSettings(threadId, {
     providerMode: "codex",
     permissionMode: "default_permissions",
     codexApprovalMode: "default"
   });
+  store.applySettingsPreset(threadId, codexPreset.id);
+  state = store.loadState();
+  expect(state.threads.find((thread) => thread.id === threadId)).toMatchObject({
+    selectedSettingsPresetId: codexPreset.id,
+    providerMode: "codex",
+    codexModelId: "gpt-5.3-codex-spark",
+    codexReasoningEffort: "high",
+    permissionMode: "default_permissions",
+    codexApprovalMode: "default"
+  });
+  expect(state.runtimeSettings.permissionMode).toBe("default_permissions");
   store.applySettingsPreset(threadId, openCodePreset.id);
   state = store.loadState();
   expect(state.threads.find((thread) => thread.id === threadId)).toMatchObject({
@@ -454,6 +726,16 @@ test("persists settings presets and applies provider/framework state", () => {
     codexApprovalMode: "default"
   });
   expect(state.runtimeSettings.permissionMode).toBe("default_permissions");
+  store.updateThreadSettings(threadId, {
+    permissionMode: "full_access",
+    runtimeSettings: { permissionMode: "full_access" }
+  });
+  state = store.loadState();
+  expect(state.threads.find((thread) => thread.id === threadId)).toMatchObject({
+    selectedSettingsPresetId: openCodePreset.id,
+    permissionMode: "full_access",
+    codexApprovalMode: "never"
+  });
 
   store.deleteSettingsPreset("builtin::fast");
   expect(store.loadState().settingsPresets.some((item) => item.id === "builtin::fast")).toBe(false);
@@ -463,6 +745,253 @@ test("persists settings presets and applies provider/framework state", () => {
   expect(restarted.loadState().settingsPresets.some((item) => item.id === "builtin::fast")).toBe(false);
   expect(restarted.loadState().settingsPresets.some((item) => item.label === "Document preset")).toBe(true);
   restarted.close();
+});
+
+test("repairs legacy preset access at rest without applying it", () => {
+  const { store, dbPath } = makeStore();
+  store.close();
+  const legacyPreset = {
+    id: "custom::legacy-access",
+    label: "Legacy Access",
+    permissionMode: "full_access",
+    codexApprovalMode: "never",
+    runtimeSettings: { nCtx: 4096, permissionMode: "default_permissions" },
+    providerMode: "builtin",
+    iconName: "settings",
+    builtinModelId: "",
+    builtinAgenticFramework: "chat",
+    documentAnalysisEmbeddingModelPath: "",
+    codexModelId: "",
+    codexReasoningEffort: "medium",
+    builtIn: false,
+    editable: true,
+    deletable: true
+  };
+  const db = new DatabaseSync(dbPath);
+  db.prepare("INSERT OR REPLACE INTO chat_settings (key, value) VALUES (?, ?)")
+    .run("settings_presets_json", JSON.stringify([legacyPreset]));
+  db.prepare("DELETE FROM chat_settings WHERE key = ?").run("settings_presets_access_separated");
+  db.close();
+
+  const repairedStore = new ChatStore(dbPath);
+  const state = repairedStore.loadState();
+  const repairedPreset = state.settingsPresets.find((preset) => preset.id === legacyPreset.id);
+  expect(repairedPreset).toBeTruthy();
+  expect(repairedPreset).toMatchObject({
+    codexModelId: "gpt-5.3-codex",
+    runtimeSettings: { nCtx: 4096 }
+  });
+  expect("permissionMode" in (repairedPreset?.runtimeSettings ?? {})).toBe(false);
+  const repairedDb = new DatabaseSync(dbPath);
+  const repairedRow = repairedDb
+    .prepare("SELECT value FROM chat_settings WHERE key = 'settings_presets_json'")
+    .get() as { value: string };
+  repairedDb.close();
+  expect(repairedRow.value).not.toContain("permissionMode");
+  expect(repairedRow.value).not.toContain("codexApprovalMode");
+  repairedStore.close();
+});
+
+test("rejects malformed settings preset storage instead of masking it", () => {
+  const { store, dbPath } = makeStore();
+  const selectedThreadId = store.loadState().selectedThreadId;
+  for (const malformed of [
+    "{ permissionMode: full_access, codexApprovalMode: never",
+    JSON.stringify({ permissionMode: "full_access", codexApprovalMode: "never" }),
+    JSON.stringify(["bad"]),
+    JSON.stringify([{}]),
+    JSON.stringify([{ id: "custom::bad", label: "Bad" }]),
+    JSON.stringify([{ ...validStoredPresetFixture(), id: "" }]),
+    JSON.stringify([{ ...validStoredPresetFixture(), label: " " }]),
+    JSON.stringify([{ ...validStoredPresetFixture(), codexModelId: "unknown-model" }]),
+    JSON.stringify([{ id: "custom::bad", label: "Bad", runtimeSettings: "bad" }]),
+    JSON.stringify([{ id: 42, label: "Bad", runtimeSettings: {} }]),
+    JSON.stringify([{ id: "custom::bad", label: "Bad", providerMode: "bad", runtimeSettings: {} }]),
+    JSON.stringify([{ id: "custom::bad", label: "Bad", runtimeSettings: { nCtx: "bad" } }]),
+    JSON.stringify([{ id: "custom::bad", label: "Bad", runtimeSettings: { nCtx: 0 } }]),
+    JSON.stringify([{ id: "custom::bad", label: "Bad", runtimeSettings: { maxTokens: -1 } }]),
+    JSON.stringify([{ id: "custom::bad", label: "Bad", runtimeSettings: { temperature: -0.1 } }]),
+    JSON.stringify([{ id: "custom::bad", label: "Bad", runtimeSettings: { repeatPenalty: 0 } }]),
+    JSON.stringify([{ id: "custom::bad", label: "Bad", runtimeSettings: { trimReservePercent: 101 } }]),
+    JSON.stringify([{ id: "custom::bad", label: "Bad", runtimeSettings: { trimAmountPercent: -1 } }]),
+    JSON.stringify([{ id: "custom::bad", label: "Bad", runtimeSettings: { reasoningEffort: "xhigh" } }]),
+    JSON.stringify([{ id: "custom::bad", label: "Bad", permissionMode: "full_access", runtimeSettings: {} }]),
+    JSON.stringify([{ id: "custom::bad", label: "Bad", codexApprovalMode: "never", runtimeSettings: {} }]),
+    JSON.stringify([{ id: "custom::bad", label: "Bad", runtimeSettings: { permissionMode: "full_access" } }])
+  ]) {
+    const db = new DatabaseSync(dbPath);
+    db.prepare("INSERT OR REPLACE INTO chat_settings (key, value) VALUES (?, ?)")
+      .run("settings_presets_json", malformed);
+    db.close();
+
+    expect(() => store.loadState()).toThrow(/settings presets are malformed/);
+    const stateDb = new DatabaseSync(dbPath);
+    const threadRow = stateDb
+      .prepare("SELECT permission_mode, codex_approval_mode FROM chat_threads WHERE id = ?")
+      .get(selectedThreadId) as { permission_mode: string; codex_approval_mode: string };
+    stateDb.close();
+    expect(threadRow.permission_mode).toBe("full_access");
+    expect(threadRow.codex_approval_mode).toBe("never");
+  }
+  store.close();
+});
+
+test("malformed preset storage does not mark legacy preset access migration complete", () => {
+  const { store, dbPath } = makeStore();
+  store.close();
+  for (const malformed of [
+    JSON.stringify({ permissionMode: "full_access" }),
+    JSON.stringify(["bad"]),
+    JSON.stringify([{ ...validStoredPresetFixture(), permissionMode: "full_access" }, "bad"])
+  ]) {
+    const db = new DatabaseSync(dbPath);
+    db.prepare("INSERT OR REPLACE INTO chat_settings (key, value) VALUES (?, ?)")
+      .run("settings_presets_json", malformed);
+    db.prepare("DELETE FROM chat_settings WHERE key = ?").run("settings_presets_access_separated");
+    db.prepare("DELETE FROM chat_settings WHERE key = ?").run("settings_presets_codex_model_normalized");
+    db.close();
+
+    let migratedStore: ChatStore | undefined;
+    expect(() => {
+      migratedStore = new ChatStore(dbPath);
+    }).not.toThrow();
+    expect(() => migratedStore?.loadState()).toThrow(/settings presets are malformed/);
+    migratedStore?.close();
+    const flaggedDb = new DatabaseSync(dbPath);
+    const flagRow = flaggedDb.prepare("SELECT value FROM chat_settings WHERE key = ?")
+      .get("settings_presets_access_separated") as { value: string } | undefined;
+    const codexFlagRow = flaggedDb.prepare("SELECT value FROM chat_settings WHERE key = ?")
+      .get("settings_presets_codex_model_normalized") as { value: string } | undefined;
+    const rawRow = flaggedDb.prepare("SELECT value FROM chat_settings WHERE key = 'settings_presets_json'").get() as { value: string };
+    flaggedDb.close();
+    expect(flagRow).toBeUndefined();
+    expect(codexFlagRow).toBeUndefined();
+    expect(rawRow.value).toBe(malformed);
+  }
+
+  const repairedPreset = {
+    id: "custom::legacy-after-bad-storage",
+    label: "Legacy After Bad Storage",
+    permissionMode: "full_access",
+    codexApprovalMode: "never",
+    runtimeSettings: { nCtx: 4096, permissionMode: "default_permissions" },
+    providerMode: "builtin",
+    iconName: "settings",
+    builtinModelId: "",
+    builtinAgenticFramework: "chat",
+    documentAnalysisEmbeddingModelPath: "",
+    codexModelId: "",
+    codexReasoningEffort: "medium",
+    builtIn: false,
+    editable: true,
+    deletable: true
+  };
+  const repairDb = new DatabaseSync(dbPath);
+  repairDb.prepare("INSERT OR REPLACE INTO chat_settings (key, value) VALUES (?, ?)")
+    .run("settings_presets_json", JSON.stringify([repairedPreset]));
+  repairDb.close();
+
+  const repairedStore = new ChatStore(dbPath);
+  const preset = repairedStore.loadState().settingsPresets.find((candidate) => candidate.id === repairedPreset.id);
+  expect(preset).toMatchObject({
+    codexModelId: "gpt-5.3-codex",
+    runtimeSettings: { nCtx: 4096 }
+  });
+  expect("permissionMode" in (preset?.runtimeSettings ?? {})).toBe(false);
+  repairedStore.close();
+});
+
+test("legacy empty preset Codex model is repaired independently of access migration", () => {
+  const { store, dbPath } = makeStore();
+  store.close();
+  const legacyPreset = { ...validStoredPresetFixture(), id: "custom::legacy-empty-codex-model", codexModelId: "" };
+  const db = new DatabaseSync(dbPath);
+  db.prepare("INSERT OR REPLACE INTO chat_settings (key, value) VALUES (?, ?)")
+    .run("settings_presets_json", JSON.stringify([legacyPreset]));
+  db.prepare("INSERT OR REPLACE INTO chat_settings (key, value) VALUES (?, ?)")
+    .run("settings_presets_access_separated", "1");
+  db.prepare("DELETE FROM chat_settings WHERE key = ?").run("settings_presets_codex_model_normalized");
+  db.close();
+
+  const repairedStore = new ChatStore(dbPath);
+  const preset = repairedStore.loadState().settingsPresets.find((candidate) => candidate.id === legacyPreset.id);
+  expect(preset).toMatchObject({ codexModelId: "gpt-5.3-codex" });
+  const repairedDb = new DatabaseSync(dbPath);
+  const rawRow = repairedDb.prepare("SELECT value FROM chat_settings WHERE key = 'settings_presets_json'").get() as { value: string };
+  const flagRow = repairedDb.prepare("SELECT value FROM chat_settings WHERE key = ?")
+    .get("settings_presets_codex_model_normalized") as { value: string };
+  repairedDb.close();
+  expect(storedPresetFromJson(rawRow.value, legacyPreset.id)?.codexModelId).toBe("gpt-5.3-codex");
+  expect(flagRow.value).toBe("1");
+  repairedStore.close();
+});
+
+test("hiding a customized built-in settings preset does not prune its stored override", () => {
+  const { store, dbPath } = makeStore();
+  store.saveSettingsPreset({
+    id: "builtin::fast",
+    label: "Custom Fast",
+    runtimeSettings: { nCtx: 8192, maxTokens: 8192 },
+    providerMode: "builtin",
+    iconName: "bolt",
+    builtinAgenticFramework: "opencode",
+    codexModelId: "gpt-5.3-codex-spark",
+    codexReasoningEffort: "high"
+  });
+  store.deleteSettingsPreset("builtin::fast");
+  expect(store.loadState().settingsPresets.some((item) => item.id === "builtin::fast")).toBe(false);
+  const db = new DatabaseSync(dbPath);
+  const rawRow = db.prepare("SELECT value FROM chat_settings WHERE key = 'settings_presets_json'").get() as { value: string };
+  db.close();
+  expect(rawRow.value).toContain("Custom Fast");
+  expect(rawRow.value).toContain("builtin::fast");
+  expect(storedPresetFromJson(rawRow.value, "builtin::fast")).toMatchObject(hiddenFastOverridePayload());
+  store.saveSettingsPreset({
+    label: "Other preset",
+    runtimeSettings: { nCtx: 4096 },
+    providerMode: "builtin",
+    iconName: "settings",
+    builtinAgenticFramework: "chat",
+    codexReasoningEffort: "medium"
+  });
+  const afterSaveDb = new DatabaseSync(dbPath);
+  const afterSaveRow = afterSaveDb.prepare("SELECT value FROM chat_settings WHERE key = 'settings_presets_json'").get() as { value: string };
+  afterSaveDb.close();
+  expect(afterSaveRow.value).toContain("Custom Fast");
+  expect(afterSaveRow.value).toContain("Other preset");
+  expect(storedPresetFromJson(afterSaveRow.value, "builtin::fast")).toMatchObject(hiddenFastOverridePayload());
+  const otherPreset = store.loadState().settingsPresets.find((preset) => preset.label === "Other preset");
+  expect(otherPreset).toBeTruthy();
+  store.deleteSettingsPreset(otherPreset!.id);
+  const afterDeleteDb = new DatabaseSync(dbPath);
+  const afterDeleteRow = afterDeleteDb.prepare("SELECT value FROM chat_settings WHERE key = 'settings_presets_json'").get() as { value: string };
+  afterDeleteDb.close();
+  expect(afterDeleteRow.value).toContain("Custom Fast");
+  expect(afterDeleteRow.value).not.toContain("Other preset");
+  expect(storedPresetFromJson(afterDeleteRow.value, "builtin::fast")).toMatchObject(hiddenFastOverridePayload());
+  store.close();
+
+  const restarted = new ChatStore(dbPath);
+  expect(restarted.loadState().settingsPresets.some((item) => item.id === "builtin::fast")).toBe(false);
+  const restartedDb = new DatabaseSync(dbPath);
+  const restartedRawRow = restartedDb.prepare("SELECT value FROM chat_settings WHERE key = 'settings_presets_json'").get() as { value: string };
+  restartedDb.close();
+  expect(restartedRawRow.value).toContain("Custom Fast");
+  expect(restartedRawRow.value).toContain("builtin::fast");
+  expect(storedPresetFromJson(restartedRawRow.value, "builtin::fast")).toMatchObject(hiddenFastOverridePayload());
+  restarted.close();
+});
+
+test("rejects malformed hidden settings preset ids instead of resurrecting presets", () => {
+  const { store, dbPath } = makeStore();
+  for (const malformed of ["{ hidden", JSON.stringify({ id: "builtin::fast" }), JSON.stringify(["builtin::fast", 42])]) {
+    const db = new DatabaseSync(dbPath);
+    db.prepare("INSERT OR REPLACE INTO chat_settings (key, value) VALUES (?, ?)")
+      .run("hidden_settings_preset_ids_json", malformed);
+    db.close();
+    expect(() => store.loadState()).toThrow(/hidden chat settings preset ids are malformed/);
+  }
+  store.close();
 });
 
 test("persists per-thread built-in model, runtime settings, and expanded projects", () => {
@@ -499,9 +1028,475 @@ test("persists per-thread built-in model, runtime settings, and expanded project
   store.close();
 });
 
+test("thread permission mode is canonical over mismatched runtime access", () => {
+  const { store, dbPath } = makeStore();
+  const state = store.loadState();
+  const threadId = state.selectedThreadId;
+
+  store.updateThreadSettings(threadId, {
+    permissionMode: "default_permissions",
+    runtimeSettings: { permissionMode: "full_access" }
+  });
+  store.updateThreadSettings(threadId, { permissionMode: "full_access" });
+  let stateAfterAccess = store.loadState();
+  expect(stateAfterAccess.threads.find((thread) => thread.id === threadId)).toMatchObject({
+    permissionMode: "full_access",
+    codexApprovalMode: "never",
+    runtimeSettings: { permissionMode: "full_access" }
+  });
+  store.updateThreadSettings(threadId, { permissionMode: "default_permissions", runtimeSettings: { permissionMode: "full_access" } });
+  const next = store.loadState();
+  const db = new DatabaseSync(dbPath);
+  const row = db
+    .prepare("SELECT permission_mode, codex_approval_mode, runtime_settings_json FROM chat_threads WHERE id = ?")
+    .get(threadId) as { permission_mode: string; codex_approval_mode: string; runtime_settings_json: string };
+  db.close();
+
+  expect(next.threads.find((thread) => thread.id === threadId)).toMatchObject({
+    permissionMode: "default_permissions",
+    runtimeSettings: { permissionMode: "default_permissions" }
+  });
+  expect(next.runtimeSettings.permissionMode).toBe("default_permissions");
+  expect(row.permission_mode).toBe("default_permissions");
+  expect(row.codex_approval_mode).toBe("default");
+  expect(JSON.parse(row.runtime_settings_json)).toMatchObject({ permissionMode: "default_permissions" });
+
+  const rawDb = new DatabaseSync(dbPath);
+  rawDb.prepare("UPDATE chat_threads SET permission_mode = ?, codex_approval_mode = ?, runtime_settings_json = ? WHERE id = ?")
+    .run("full_access", "default", JSON.stringify({ ...JSON.parse(row.runtime_settings_json), permissionMode: "default_permissions" }), threadId);
+  rawDb.close();
+
+  store.updateThreadSettings(threadId, { openCodeSessionId: "session-after-raw-mismatch" });
+  const fixedDb = new DatabaseSync(dbPath);
+  const fixedRow = fixedDb
+    .prepare("SELECT permission_mode, codex_approval_mode, runtime_settings_json FROM chat_threads WHERE id = ?")
+    .get(threadId) as { permission_mode: string; codex_approval_mode: string; runtime_settings_json: string };
+  fixedDb.close();
+  expect(fixedRow.permission_mode).toBe("full_access");
+  expect(fixedRow.codex_approval_mode).toBe("never");
+  expect(JSON.parse(fixedRow.runtime_settings_json)).toMatchObject({
+    permissionMode: "full_access"
+  });
+
+  const rawRuntimeDb = new DatabaseSync(dbPath);
+  rawRuntimeDb.prepare("UPDATE chat_threads SET permission_mode = ?, codex_approval_mode = ?, runtime_settings_json = ? WHERE id = ?")
+    .run("default_permissions", "never", JSON.stringify({ ...JSON.parse(fixedRow.runtime_settings_json), permissionMode: "full_access" }), threadId);
+  rawRuntimeDb.close();
+
+  store.updateRuntimeSettings({ temperature: 0.31 });
+  const fixedRuntimeDb = new DatabaseSync(dbPath);
+  const fixedRuntimeRow = fixedRuntimeDb
+    .prepare("SELECT permission_mode, codex_approval_mode, runtime_settings_json FROM chat_threads WHERE id = ?")
+    .get(threadId) as { permission_mode: string; codex_approval_mode: string; runtime_settings_json: string };
+  fixedRuntimeDb.close();
+  expect(fixedRuntimeRow.permission_mode).toBe("default_permissions");
+  expect(fixedRuntimeRow.codex_approval_mode).toBe("default");
+  expect(JSON.parse(fixedRuntimeRow.runtime_settings_json)).toMatchObject({
+    permissionMode: "default_permissions",
+    temperature: 0.31
+  });
+
+  store.updateRuntimeSettings({ permissionMode: "full_access" });
+  const fullRuntimeDb = new DatabaseSync(dbPath);
+  const fullRuntimeRow = fullRuntimeDb
+    .prepare("SELECT permission_mode, codex_approval_mode, runtime_settings_json FROM chat_threads WHERE id = ?")
+    .get(threadId) as { permission_mode: string; codex_approval_mode: string; runtime_settings_json: string };
+  fullRuntimeDb.close();
+  expect(fullRuntimeRow.permission_mode).toBe("full_access");
+  expect(fullRuntimeRow.codex_approval_mode).toBe("never");
+  expect(JSON.parse(fullRuntimeRow.runtime_settings_json)).toMatchObject({ permissionMode: "full_access" });
+
+  const startupRawDb = new DatabaseSync(dbPath);
+  startupRawDb.prepare("UPDATE chat_threads SET permission_mode = ?, codex_approval_mode = ?, runtime_settings_json = ? WHERE id = ?")
+    .run("full_access", "default", JSON.stringify({ ...JSON.parse(fullRuntimeRow.runtime_settings_json), permissionMode: "default_permissions" }), threadId);
+  startupRawDb.close();
+  store.close();
+  const repairedStore = new ChatStore(dbPath);
+  const repairedDb = new DatabaseSync(dbPath);
+  const repairedRow = repairedDb
+    .prepare("SELECT permission_mode, codex_approval_mode, runtime_settings_json FROM chat_threads WHERE id = ?")
+    .get(threadId) as { permission_mode: string; codex_approval_mode: string; runtime_settings_json: string };
+  repairedDb.close();
+  expect(repairedRow.permission_mode).toBe("default_permissions");
+  expect(repairedRow.codex_approval_mode).toBe("default");
+  expect(JSON.parse(repairedRow.runtime_settings_json)).toMatchObject({ permissionMode: "default_permissions" });
+  repairedStore.close();
+});
+
+test("startup repair leaves malformed thread runtime settings untouched", () => {
+  const { store, dbPath } = makeStore();
+  const threadId = store.loadState().selectedThreadId;
+  store.close();
+  const malformedRuntime = "{ permissionMode: default_permissions";
+  const db = new DatabaseSync(dbPath);
+  db.prepare("UPDATE chat_threads SET permission_mode = ?, codex_approval_mode = ?, runtime_settings_json = ? WHERE id = ?")
+    .run("full_access", "never", malformedRuntime, threadId);
+  db.close();
+
+  const repairedStore = new ChatStore(dbPath);
+  expect(() => repairedStore.loadState()).toThrow(/thread runtime settings are malformed/);
+  const repairedDb = new DatabaseSync(dbPath);
+  const row = repairedDb
+    .prepare("SELECT permission_mode, codex_approval_mode, runtime_settings_json FROM chat_threads WHERE id = ?")
+    .get(threadId) as { permission_mode: string; codex_approval_mode: string; runtime_settings_json: string };
+  repairedDb.close();
+  expect(row.permission_mode).toBe("full_access");
+  expect(row.codex_approval_mode).toBe("never");
+  expect(row.runtime_settings_json).toBe(malformedRuntime);
+  repairedStore.close();
+});
+
+test("startup repair does not escalate explicit runtime default access with legacy never approval", () => {
+  const { store, dbPath } = makeStore();
+  const threadId = store.loadState().selectedThreadId;
+  store.close();
+  const rawRuntime = JSON.stringify({ nCtx: 4096, permissionMode: "default_permissions" });
+  const db = new DatabaseSync(dbPath);
+  db.prepare("UPDATE chat_threads SET permission_mode = ?, codex_approval_mode = ?, runtime_settings_json = ? WHERE id = ?")
+    .run("full_access", "never", rawRuntime, threadId);
+  db.close();
+
+  const repairedStore = new ChatStore(dbPath);
+  const repairedDb = new DatabaseSync(dbPath);
+  const row = repairedDb
+    .prepare("SELECT permission_mode, codex_approval_mode, runtime_settings_json FROM chat_threads WHERE id = ?")
+    .get(threadId) as { permission_mode: string; codex_approval_mode: string; runtime_settings_json: string };
+  repairedDb.close();
+  expect(row.permission_mode).toBe("default_permissions");
+  expect(row.codex_approval_mode).toBe("default");
+  expect(JSON.parse(row.runtime_settings_json)).toMatchObject({ nCtx: 4096, permissionMode: "default_permissions" });
+  repairedStore.close();
+});
+
+test("malformed global runtime settings fail loudly", () => {
+  const { store, dbPath } = makeStore();
+  store.close();
+  const malformedRuntime = "{ nCtx: 4096";
+  const db = new DatabaseSync(dbPath);
+  db.prepare("INSERT OR REPLACE INTO chat_settings (key, value) VALUES (?, ?)")
+    .run("runtime_settings_json", malformedRuntime);
+  db.close();
+
+  const restarted = new ChatStore(dbPath);
+  expect(() => restarted.loadState()).toThrow(/chat runtime settings are malformed/);
+  const rawDb = new DatabaseSync(dbPath);
+  const rawRow = rawDb.prepare("SELECT value FROM chat_settings WHERE key = ?")
+    .get("runtime_settings_json") as { value: string };
+  rawDb.close();
+  expect(rawRow.value).toBe(malformedRuntime);
+  restarted.close();
+});
+
+test("migration seeds new thread permission column from existing runtime access", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit-0-chat-store-migrate-"));
+  const dbPath = path.join(dir, "unit0.sqlite");
+  const db = new DatabaseSync(dbPath);
+  db.exec(`
+    CREATE TABLE chat_projects (
+      id TEXT PRIMARY KEY,
+      title TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      sort_order INTEGER NOT NULL
+    );
+    CREATE TABLE chat_threads (
+      id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL REFERENCES chat_projects(id) ON DELETE CASCADE,
+      title TEXT NOT NULL,
+      provider_mode TEXT NOT NULL DEFAULT 'builtin',
+      selected_settings_preset_id TEXT NOT NULL DEFAULT 'custom::default',
+      builtin_model_id TEXT NOT NULL DEFAULT '',
+      runtime_settings_json TEXT,
+      builtin_agentic_framework TEXT NOT NULL DEFAULT 'chat',
+      document_analysis_embedding_model_path TEXT NOT NULL DEFAULT '',
+      codex_model_id TEXT NOT NULL DEFAULT 'gpt-5.3-codex',
+      codex_reasoning_effort TEXT NOT NULL DEFAULT 'medium',
+      plan_mode_enabled INTEGER NOT NULL DEFAULT 0,
+      active_context_start_message_index INTEGER NOT NULL DEFAULT 0,
+      context_revision INTEGER NOT NULL DEFAULT 0,
+      context_markers_json TEXT NOT NULL DEFAULT '[]',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      sort_order INTEGER NOT NULL
+    );
+    CREATE TABLE chat_settings (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    );
+  `);
+  db.prepare("INSERT INTO chat_projects (id, title, created_at, updated_at, sort_order) VALUES (?, ?, ?, ?, ?)")
+    .run("project-old", "Old Project", "2026-01-01T00:00:00.000Z", "2026-01-01T00:00:00.000Z", 0);
+  db.prepare(`INSERT INTO chat_threads (
+    id, project_id, title, runtime_settings_json, created_at, updated_at, sort_order
+  ) VALUES (?, ?, ?, ?, ?, ?, ?)`)
+    .run(
+      "thread-old",
+      "project-old",
+      "Old Thread",
+      JSON.stringify({ nCtx: 4096, permissionMode: "default_permissions" }),
+      "2026-01-01T00:00:00.000Z",
+      "2026-01-01T00:00:00.000Z",
+      0
+    );
+  db.close();
+
+  const store = new ChatStore(dbPath);
+  const state = store.loadState();
+  expect(state.threads.find((thread) => thread.id === "thread-old")).toMatchObject({
+    permissionMode: "default_permissions",
+    codexApprovalMode: "default",
+    runtimeSettings: { permissionMode: "default_permissions" }
+  });
+  const migratedDb = new DatabaseSync(dbPath);
+  const row = migratedDb
+    .prepare("SELECT permission_mode, codex_approval_mode, runtime_settings_json FROM chat_threads WHERE id = ?")
+    .get("thread-old") as { permission_mode: string; codex_approval_mode: string; runtime_settings_json: string };
+  migratedDb.close();
+  expect(row.permission_mode).toBe("default_permissions");
+  expect(row.codex_approval_mode).toBe("default");
+  expect(JSON.parse(row.runtime_settings_json)).toMatchObject({ permissionMode: "default_permissions" });
+  store.close();
+});
+
+test("migration derives missing thread permission from existing Codex approval", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit-0-chat-store-migrate-approval-"));
+  const dbPath = path.join(dir, "unit0.sqlite");
+  const db = new DatabaseSync(dbPath);
+  db.exec(`
+    CREATE TABLE chat_projects (
+      id TEXT PRIMARY KEY,
+      title TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      sort_order INTEGER NOT NULL
+    );
+    CREATE TABLE chat_threads (
+      id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL REFERENCES chat_projects(id) ON DELETE CASCADE,
+      title TEXT NOT NULL,
+      provider_mode TEXT NOT NULL DEFAULT 'builtin',
+      selected_settings_preset_id TEXT NOT NULL DEFAULT 'custom::default',
+      builtin_model_id TEXT NOT NULL DEFAULT '',
+      runtime_settings_json TEXT,
+      builtin_agentic_framework TEXT NOT NULL DEFAULT 'chat',
+      document_analysis_embedding_model_path TEXT NOT NULL DEFAULT '',
+      codex_model_id TEXT NOT NULL DEFAULT 'gpt-5.3-codex',
+      codex_reasoning_effort TEXT NOT NULL DEFAULT 'medium',
+      codex_approval_mode TEXT NOT NULL DEFAULT 'on-request',
+      plan_mode_enabled INTEGER NOT NULL DEFAULT 0,
+      active_context_start_message_index INTEGER NOT NULL DEFAULT 0,
+      context_revision INTEGER NOT NULL DEFAULT 0,
+      context_markers_json TEXT NOT NULL DEFAULT '[]',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      sort_order INTEGER NOT NULL
+    );
+    CREATE TABLE chat_settings (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    );
+  `);
+  db.prepare("INSERT INTO chat_projects (id, title, created_at, updated_at, sort_order) VALUES (?, ?, ?, ?, ?)")
+    .run("project-old", "Old Project", "2026-01-01T00:00:00.000Z", "2026-01-01T00:00:00.000Z", 0);
+  db.prepare(`INSERT INTO chat_threads (
+    id, project_id, title, runtime_settings_json, codex_approval_mode, created_at, updated_at, sort_order
+  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+    .run(
+      "thread-old",
+      "project-old",
+      "Old Thread",
+      JSON.stringify({ nCtx: 4096 }),
+      "on-request",
+      "2026-01-01T00:00:00.000Z",
+      "2026-01-01T00:00:00.000Z",
+      0
+    );
+  db.close();
+
+  const store = new ChatStore(dbPath);
+  const state = store.loadState();
+  expect(state.threads.find((thread) => thread.id === "thread-old")).toMatchObject({
+    permissionMode: "default_permissions",
+    codexApprovalMode: "on-request",
+    runtimeSettings: { permissionMode: "default_permissions" }
+  });
+  const migratedDb = new DatabaseSync(dbPath);
+  const row = migratedDb
+    .prepare("SELECT permission_mode, codex_approval_mode, runtime_settings_json FROM chat_threads WHERE id = ?")
+    .get("thread-old") as { permission_mode: string; codex_approval_mode: string; runtime_settings_json: string };
+  migratedDb.close();
+  expect(row.permission_mode).toBe("default_permissions");
+  expect(row.codex_approval_mode).toBe("on-request");
+  expect(JSON.parse(row.runtime_settings_json)).toMatchObject({ permissionMode: "default_permissions" });
+  store.close();
+});
+
+test("migration does not infer full access from legacy Codex never approval", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit-0-chat-store-migrate-never-approval-"));
+  const dbPath = path.join(dir, "unit0.sqlite");
+  const db = new DatabaseSync(dbPath);
+  db.exec(`
+    CREATE TABLE chat_projects (
+      id TEXT PRIMARY KEY,
+      title TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      sort_order INTEGER NOT NULL
+    );
+    CREATE TABLE chat_threads (
+      id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL REFERENCES chat_projects(id) ON DELETE CASCADE,
+      title TEXT NOT NULL,
+      provider_mode TEXT NOT NULL DEFAULT 'builtin',
+      selected_settings_preset_id TEXT NOT NULL DEFAULT 'custom::default',
+      builtin_model_id TEXT NOT NULL DEFAULT '',
+      runtime_settings_json TEXT,
+      builtin_agentic_framework TEXT NOT NULL DEFAULT 'chat',
+      document_analysis_embedding_model_path TEXT NOT NULL DEFAULT '',
+      codex_model_id TEXT NOT NULL DEFAULT 'gpt-5.3-codex',
+      codex_reasoning_effort TEXT NOT NULL DEFAULT 'medium',
+      codex_approval_mode TEXT NOT NULL DEFAULT 'never',
+      plan_mode_enabled INTEGER NOT NULL DEFAULT 0,
+      active_context_start_message_index INTEGER NOT NULL DEFAULT 0,
+      context_revision INTEGER NOT NULL DEFAULT 0,
+      context_markers_json TEXT NOT NULL DEFAULT '[]',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      sort_order INTEGER NOT NULL
+    );
+    CREATE TABLE chat_settings (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    );
+  `);
+  db.prepare("INSERT INTO chat_projects (id, title, created_at, updated_at, sort_order) VALUES (?, ?, ?, ?, ?)")
+    .run("project-old", "Old Project", "2026-01-01T00:00:00.000Z", "2026-01-01T00:00:00.000Z", 0);
+  db.prepare(`INSERT INTO chat_threads (
+    id, project_id, title, runtime_settings_json, codex_approval_mode, created_at, updated_at, sort_order
+  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+    .run(
+      "thread-old",
+      "project-old",
+      "Old Thread",
+      JSON.stringify({ nCtx: 4096 }),
+      "never",
+      "2026-01-01T00:00:00.000Z",
+      "2026-01-01T00:00:00.000Z",
+      0
+    );
+  db.close();
+
+  const store = new ChatStore(dbPath);
+  const state = store.loadState();
+  expect(state.threads.find((thread) => thread.id === "thread-old")).toMatchObject({
+    permissionMode: "default_permissions",
+    codexApprovalMode: "default",
+    runtimeSettings: { permissionMode: "default_permissions" }
+  });
+  const migratedDb = new DatabaseSync(dbPath);
+  const row = migratedDb
+    .prepare("SELECT permission_mode, codex_approval_mode, runtime_settings_json FROM chat_threads WHERE id = ?")
+    .get("thread-old") as { permission_mode: string; codex_approval_mode: string; runtime_settings_json: string };
+  migratedDb.close();
+  expect(row.permission_mode).toBe("default_permissions");
+  expect(row.codex_approval_mode).toBe("default");
+  expect(JSON.parse(row.runtime_settings_json)).toMatchObject({ permissionMode: "default_permissions" });
+  store.close();
+});
+
+test("repair does not preserve schema-default full access without explicit runtime access", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit-0-chat-store-migrate-present-permission-"));
+  const dbPath = path.join(dir, "unit0.sqlite");
+  const db = new DatabaseSync(dbPath);
+  db.exec(`
+    CREATE TABLE chat_projects (
+      id TEXT PRIMARY KEY,
+      title TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      sort_order INTEGER NOT NULL
+    );
+    CREATE TABLE chat_threads (
+      id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL REFERENCES chat_projects(id) ON DELETE CASCADE,
+      title TEXT NOT NULL,
+      provider_mode TEXT NOT NULL DEFAULT 'builtin',
+      selected_settings_preset_id TEXT NOT NULL DEFAULT 'custom::default',
+      builtin_model_id TEXT NOT NULL DEFAULT '',
+      runtime_settings_json TEXT,
+      builtin_agentic_framework TEXT NOT NULL DEFAULT 'chat',
+      document_analysis_embedding_model_path TEXT NOT NULL DEFAULT '',
+      codex_model_id TEXT NOT NULL DEFAULT 'gpt-5.3-codex',
+      codex_reasoning_effort TEXT NOT NULL DEFAULT 'medium',
+      permission_mode TEXT NOT NULL DEFAULT 'full_access',
+      codex_approval_mode TEXT NOT NULL DEFAULT 'never',
+      plan_mode_enabled INTEGER NOT NULL DEFAULT 0,
+      active_context_start_message_index INTEGER NOT NULL DEFAULT 0,
+      context_revision INTEGER NOT NULL DEFAULT 0,
+      context_markers_json TEXT NOT NULL DEFAULT '[]',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      sort_order INTEGER NOT NULL
+    );
+    CREATE TABLE chat_settings (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    );
+  `);
+  db.prepare("INSERT INTO chat_projects (id, title, created_at, updated_at, sort_order) VALUES (?, ?, ?, ?, ?)")
+    .run("project-old", "Old Project", "2026-01-01T00:00:00.000Z", "2026-01-01T00:00:00.000Z", 0);
+  db.prepare(`INSERT INTO chat_threads (
+    id, project_id, title, runtime_settings_json, created_at, updated_at, sort_order
+  ) VALUES (?, ?, ?, ?, ?, ?, ?)`)
+    .run(
+      "thread-old",
+      "project-old",
+      "Old Thread",
+      JSON.stringify({ nCtx: 4096 }),
+      "2026-01-01T00:00:00.000Z",
+      "2026-01-01T00:00:00.000Z",
+      0
+    );
+  db.close();
+
+  const store = new ChatStore(dbPath);
+  const state = store.loadState();
+  expect(state.threads.find((thread) => thread.id === "thread-old")).toMatchObject({
+    permissionMode: "default_permissions",
+    codexApprovalMode: "default",
+    runtimeSettings: { permissionMode: "default_permissions" }
+  });
+  const repairedDb = new DatabaseSync(dbPath);
+  const row = repairedDb
+    .prepare("SELECT permission_mode, codex_approval_mode, runtime_settings_json FROM chat_threads WHERE id = ?")
+    .get("thread-old") as { permission_mode: string; codex_approval_mode: string; runtime_settings_json: string };
+  repairedDb.close();
+  expect(row.permission_mode).toBe("default_permissions");
+  expect(row.codex_approval_mode).toBe("default");
+  expect(JSON.parse(row.runtime_settings_json)).toMatchObject({ permissionMode: "default_permissions" });
+  store.close();
+});
+
 test("new threads inherit active provider and thread settings without runtime sessions", () => {
-  const { store } = makeStore();
+  const { store, dbPath } = makeStore();
   let state = store.loadState();
+  const project = store.createProject();
+  state = store.loadState();
+  const projectThread = state.threads.find((thread) => thread.projectId === project.id);
+  expect(projectThread).toMatchObject({
+    permissionMode: "full_access",
+    codexApprovalMode: "never",
+    runtimeSettings: { permissionMode: "full_access" }
+  });
+  const db = new DatabaseSync(dbPath);
+  const projectThreadRow = db
+    .prepare("SELECT permission_mode, codex_approval_mode, runtime_settings_json FROM chat_threads WHERE id = ?")
+    .get(projectThread!.id) as { permission_mode: string; codex_approval_mode: string; runtime_settings_json: string };
+  db.close();
+  expect(projectThreadRow.permission_mode).toBe("full_access");
+  expect(projectThreadRow.codex_approval_mode).toBe("never");
+  expect(JSON.parse(projectThreadRow.runtime_settings_json)).toMatchObject({ permissionMode: "full_access" });
+
   store.updateThreadSettings(state.selectedThreadId, {
     providerMode: "codex",
     selectedSettingsPresetId: "builtin::deep",
@@ -545,6 +1540,17 @@ test("new threads inherit active provider and thread settings without runtime se
     remoteHostIdentity: ""
   });
   expect(state.threads.find((thread) => thread.id === inherited.id)?.runtimeSettings.nCtx).toBe(16384);
+  const inheritedDb = new DatabaseSync(dbPath);
+  const inheritedRow = inheritedDb
+    .prepare("SELECT permission_mode, codex_approval_mode, runtime_settings_json FROM chat_threads WHERE id = ?")
+    .get(inherited.id) as { permission_mode: string; codex_approval_mode: string; runtime_settings_json: string };
+  inheritedDb.close();
+  expect(inheritedRow.permission_mode).toBe("default_permissions");
+  expect(inheritedRow.codex_approval_mode).toBe("on-request");
+  expect(JSON.parse(inheritedRow.runtime_settings_json)).toMatchObject({
+    permissionMode: "default_permissions",
+    nCtx: 16384
+  });
   store.close();
 });
 

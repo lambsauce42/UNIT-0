@@ -115,6 +115,31 @@ test("stops GPT-OSS channel parsing after terminal return and call markers", () 
   expect(toolParser.finish()).toEqual({ content: "", reasoning: "" });
 });
 
+test("parses GPT-OSS commentary prose separately from final and tool calls", () => {
+  const bareCommentaryParser = new GptOssChannelParser({ defaultChannel: "analysis", toolRecipients: ["glob"] });
+  expect(bareCommentaryParser.push("<|channel|>analysis<|message|>Need acknowledge.<|end|><|start|>assistant<|channel|>commentary<|message|>Ok<|return|>")).toEqual({
+    content: "",
+    reasoning: "Need acknowledge.",
+    commentary: "Ok"
+  });
+  expect(bareCommentaryParser.finish()).toEqual({ content: "", reasoning: "" });
+
+  const redundantCommentaryParser = new GptOssChannelParser({ defaultChannel: "analysis", toolRecipients: ["glob"] });
+  expect(redundantCommentaryParser.push("<|channel|>analysis<|message|>Need acknowledge.<|end|><|start|>assistant<|channel|>commentary to=commentary<|message|>Got it.<|return|>")).toEqual({
+    content: "",
+    reasoning: "Need acknowledge.",
+    commentary: "Got it."
+  });
+
+  const toolPreambleParser = new GptOssChannelParser({ defaultChannel: "analysis", toolRecipients: ["glob"] });
+  expect(toolPreambleParser.push('<|channel|>analysis<|message|>Need files.<|end|><|start|>assistant<|channel|>commentary<|message|>I will list files.<|end|><|start|>assistant<|channel|>commentary to=glob code<|message|>{"pattern":"*"}<|call|>')).toEqual({
+    content: '<tool_call>{"pattern":"*","tool":"glob"}</tool_call>',
+    reasoning: "Need files.",
+    commentary: "I will list files.",
+    toolCallContent: '<tool_call>{"pattern":"*","tool":"glob"}</tool_call>'
+  });
+});
+
 test("rejects malformed GPT-OSS constrained JSON instead of exposing it as text", () => {
   const finalParser = new GptOssChannelParser({ defaultChannel: "analysis" });
   expect(() => finalParser.push("<|channel|>commentary to=final <|constrain|>json<|message|>{not-json}<|return|>")).toThrow("malformed constrained final JSON");

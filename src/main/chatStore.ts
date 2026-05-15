@@ -180,6 +180,10 @@ const DEFAULT_APP_SETTINGS: ChatAppSettings = {
 };
 
 const DEFAULT_SETTINGS_PRESET_ID = "custom::default";
+const presetRuntimeSettings = (settings: Partial<ChatRuntimeSettings>): Omit<ChatRuntimeSettings, "permissionMode"> => {
+  const { permissionMode: _permissionMode, ...runtimeSettings } = normalizeRuntimeSettings(settings);
+  return runtimeSettings;
+};
 const DEFAULT_CODEX_PRESET_ICON_NAME = "openai";
 const SETTINGS_PRESET_ICON_NAMES = new Set([
   "sliders",
@@ -214,13 +218,13 @@ const DEFAULT_SETTINGS_PRESETS: ChatSettingsPreset[] = [
   {
     id: DEFAULT_SETTINGS_PRESET_ID,
     label: "Default",
-    runtimeSettings: DEFAULT_RUNTIME_SETTINGS,
+    runtimeSettings: presetRuntimeSettings(DEFAULT_RUNTIME_SETTINGS),
     providerMode: "builtin",
     iconName: "sliders",
     builtinModelId: "",
     builtinAgenticFramework: "chat",
     documentAnalysisEmbeddingModelPath: "",
-    codexModelId: "",
+    codexModelId: defaultCodexModelId(),
     codexReasoningEffort: "medium",
     builtIn: false,
     editable: true,
@@ -229,13 +233,13 @@ const DEFAULT_SETTINGS_PRESETS: ChatSettingsPreset[] = [
   {
     id: "builtin::fast",
     label: "Fast",
-    runtimeSettings: { ...DEFAULT_RUNTIME_SETTINGS, nCtx: 4096, maxTokens: 4096, reasoningEffort: "low" },
+    runtimeSettings: presetRuntimeSettings({ ...DEFAULT_RUNTIME_SETTINGS, nCtx: 4096, maxTokens: 4096, reasoningEffort: "low" }),
     providerMode: "builtin",
     iconName: "bolt",
     builtinModelId: "",
     builtinAgenticFramework: "chat",
     documentAnalysisEmbeddingModelPath: "",
-    codexModelId: "",
+    codexModelId: defaultCodexModelId(),
     codexReasoningEffort: "medium",
     builtIn: true,
     editable: true,
@@ -244,13 +248,13 @@ const DEFAULT_SETTINGS_PRESETS: ChatSettingsPreset[] = [
   {
     id: "builtin::deep",
     label: "Deep",
-    runtimeSettings: { ...DEFAULT_RUNTIME_SETTINGS, nCtx: 16384, maxTokens: 16384, reasoningEffort: "high" },
+    runtimeSettings: presetRuntimeSettings({ ...DEFAULT_RUNTIME_SETTINGS, nCtx: 16384, maxTokens: 16384, reasoningEffort: "high" }),
     providerMode: "builtin",
     iconName: "brain",
     builtinModelId: "",
     builtinAgenticFramework: "chat",
     documentAnalysisEmbeddingModelPath: "",
-    codexModelId: "",
+    codexModelId: defaultCodexModelId(),
     codexReasoningEffort: "medium",
     builtIn: true,
     editable: true,
@@ -271,6 +275,8 @@ export class ChatStore {
     this.markStreamingMessagesInterrupted();
     this.importLegacyHistoryIfEmpty();
     this.seedIfEmpty();
+    this.repairLegacySettingsPresetAccessState();
+    this.repairLegacySettingsPresetCodexModelState();
     this.migrateProjectActionButtonsToAppSettings();
   }
 
@@ -341,6 +347,7 @@ export class ChatStore {
     const selectedThreadId = this.setting("selected_thread_id") || threads.find((thread) => thread.projectId === selectedProjectId)?.id || threads[0]?.id || "";
     const selectedThread = threads.find((thread) => thread.id === selectedThreadId);
     const selectedModelId = selectedThread?.builtinModelId || this.setting("selected_model_id");
+    const globalRuntimeSettings = this.runtimeSettings();
     return {
       projects,
       threads,
@@ -353,7 +360,7 @@ export class ChatStore {
       selectedProjectId,
       selectedThreadId,
       selectedModelId,
-      runtimeSettings: selectedThread?.runtimeSettings ?? this.runtimeSettings(),
+      runtimeSettings: selectedThread?.runtimeSettings ?? globalRuntimeSettings,
       appSettings: this.appSettings(),
       queuedSubmissions: []
     };
@@ -383,7 +390,7 @@ export class ChatStore {
       codexModelId: defaultCodexModelId(),
       codexReasoningEffort: "medium",
       permissionMode: DEFAULT_RUNTIME_SETTINGS.permissionMode,
-      codexApprovalMode: "default",
+      codexApprovalMode: codexApprovalModeForAccessMode(DEFAULT_RUNTIME_SETTINGS.permissionMode),
       planModeEnabled: false,
       documentIndexId: "",
       codexLastSessionId: "",
@@ -404,8 +411,20 @@ export class ChatStore {
         .prepare("INSERT INTO chat_projects (id, title, directory, action_buttons_json, created_at, updated_at, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?)")
         .run(project.id, project.title, project.directory, JSON.stringify(project.actionButtons), project.createdAt, project.updatedAt, this.nextSortOrder("chat_projects"));
       this.db
-        .prepare("INSERT INTO chat_threads (id, project_id, title, created_at, updated_at, sort_order) VALUES (?, ?, ?, ?, ?, ?)")
-        .run(thread.id, thread.projectId, thread.title, thread.createdAt, thread.updatedAt, this.nextSortOrder("chat_threads"));
+        .prepare(`INSERT INTO chat_threads
+          (id, project_id, title, runtime_settings_json, permission_mode, codex_approval_mode, created_at, updated_at, sort_order)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+        .run(
+          thread.id,
+          thread.projectId,
+          thread.title,
+          JSON.stringify(thread.runtimeSettings),
+          thread.permissionMode,
+          thread.codexApprovalMode,
+          thread.createdAt,
+          thread.updatedAt,
+          this.nextSortOrder("chat_threads")
+        );
       this.setSettingInTransaction("selected_project_id", project.id);
       this.setSettingInTransaction("selected_thread_id", thread.id);
       this.db.exec("COMMIT");
@@ -461,7 +480,7 @@ export class ChatStore {
       codexModelId: templateThread?.codexModelId ?? defaultCodexModelId(),
       codexReasoningEffort: templateThread?.codexReasoningEffort ?? "medium",
       permissionMode: templateThread?.permissionMode ?? DEFAULT_RUNTIME_SETTINGS.permissionMode,
-      codexApprovalMode: templateThread?.codexApprovalMode ?? "default",
+      codexApprovalMode: syncedCodexApprovalMode(templateThread?.permissionMode ?? DEFAULT_RUNTIME_SETTINGS.permissionMode, templateThread?.codexApprovalMode ?? "default", false),
       planModeEnabled: templateThread?.planModeEnabled ?? false,
       documentIndexId: "",
       codexLastSessionId: "",
@@ -891,18 +910,38 @@ export class ChatStore {
   updateRuntimeSettings(settings: Partial<ChatRuntimeSettings>): void {
     const selectedThreadId = this.setting("selected_thread_id");
     const currentThread = selectedThreadId
-      ? this.db.prepare("SELECT runtime_settings_json FROM chat_threads WHERE id = ?").get(selectedThreadId) as { runtime_settings_json: string | null } | undefined
+      ? this.db.prepare("SELECT runtime_settings_json, permission_mode, codex_approval_mode FROM chat_threads WHERE id = ?").get(selectedThreadId) as { runtime_settings_json: string | null; permission_mode: string | null; codex_approval_mode: string | null } | undefined
       : undefined;
+    const currentPermissionMode = currentThread
+      ? normalizePermissionMode(currentThread.permission_mode, DEFAULT_RUNTIME_SETTINGS.permissionMode)
+      : undefined;
+    const currentCodexApprovalMode = normalizeCodexApprovalMode(currentThread?.codex_approval_mode, "default");
     const currentSettings = currentThread?.runtime_settings_json
-      ? normalizeRuntimeSettings(parseJsonObject(currentThread.runtime_settings_json) as Partial<ChatRuntimeSettings>)
+      ? { ...normalizeRuntimeSettings(parseJsonObject(currentThread.runtime_settings_json) as Partial<ChatRuntimeSettings>), permissionMode: currentPermissionMode ?? DEFAULT_RUNTIME_SETTINGS.permissionMode }
+      : currentThread
+        ? { ...this.runtimeSettings(), permissionMode: currentPermissionMode ?? DEFAULT_RUNTIME_SETTINGS.permissionMode }
       : this.runtimeSettings();
-    const nextSettings = normalizeRuntimeSettings({ ...currentSettings, ...settings });
+    const requestedPermissionMode = settings.permissionMode === undefined
+      ? undefined
+      : normalizePermissionMode(settings.permissionMode, currentSettings.permissionMode);
+    const effectivePermissionMode = requestedPermissionMode ?? currentPermissionMode ?? currentSettings.permissionMode;
+    const effectiveCodexApprovalMode = syncedCodexApprovalMode(effectivePermissionMode, currentCodexApprovalMode, requestedPermissionMode !== undefined);
+    const nextSettings = normalizeRuntimeSettings({ ...currentSettings, ...settings, permissionMode: effectivePermissionMode });
+    const nextSettingsJson = JSON.stringify(nextSettings);
     this.db.exec("BEGIN IMMEDIATE");
     try {
-      this.setSettingInTransaction("runtime_settings_json", JSON.stringify(nextSettings));
+      this.setSettingInTransaction("runtime_settings_json", nextSettingsJson);
       if (selectedThreadId) {
         const selectedSettingsPresetId = runtimeSettingsPatchInvalidatesPreset(settings) ? DEFAULT_SETTINGS_PRESET_ID : null;
-        this.db.prepare("UPDATE chat_threads SET selected_settings_preset_id = COALESCE(?, selected_settings_preset_id), runtime_settings_json = ?, updated_at = ? WHERE id = ?").run(selectedSettingsPresetId, JSON.stringify(nextSettings), timestamp(), selectedThreadId);
+        this.db.prepare(
+          `UPDATE chat_threads
+           SET selected_settings_preset_id = COALESCE(?, selected_settings_preset_id),
+               runtime_settings_json = ?,
+               permission_mode = ?,
+               codex_approval_mode = ?,
+               updated_at = ?
+           WHERE id = ?`
+        ).run(selectedSettingsPresetId, nextSettingsJson, effectivePermissionMode, effectiveCodexApprovalMode, timestamp(), selectedThreadId);
       }
       this.db.exec("COMMIT");
     } catch (error) {
@@ -946,19 +985,33 @@ export class ChatStore {
     const providerMode = settings.providerMode ? normalizeProviderMode(settings.providerMode, "builtin") : undefined;
     const selectedSettingsPresetId = settings.selectedSettingsPresetId === undefined ? undefined : normalizeSettingsPresetId(settings.selectedSettingsPresetId, this.settingsPresets());
     const builtinModelId = settings.builtinModelId === undefined ? undefined : settings.builtinModelId.trim();
-    const currentThreadSettings = row.runtime_settings_json
+    const currentPermissionMode = normalizePermissionMode(row.permission_mode, DEFAULT_RUNTIME_SETTINGS.permissionMode);
+    const parsedThreadSettings = row.runtime_settings_json
       ? normalizeRuntimeSettings(parseJsonObject(row.runtime_settings_json) as Partial<ChatRuntimeSettings>)
-      : this.runtimeSettings();
-    const runtimeSettingsValue = settings.runtimeSettings === undefined ? undefined : normalizeRuntimeSettings({ ...currentThreadSettings, ...settings.runtimeSettings });
-    const runtimeSettings = runtimeSettingsValue === undefined ? undefined : JSON.stringify(runtimeSettingsValue);
+      : undefined;
+    const currentThreadSettings = row.runtime_settings_json
+      ? { ...parsedThreadSettings!, permissionMode: currentPermissionMode }
+      : { ...this.runtimeSettings(), permissionMode: currentPermissionMode };
     const builtinAgenticFramework = settings.builtinAgenticFramework ? normalizeBuiltinAgenticFramework(settings.builtinAgenticFramework) : undefined;
     const documentAnalysisEmbeddingModelPath = settings.documentAnalysisEmbeddingModelPath === undefined ? undefined : settings.documentAnalysisEmbeddingModelPath.trim();
     const codexModelId = settings.codexModelId ? normalizeCodexModelId(settings.codexModelId) : undefined;
     const codexReasoningEffort = settings.codexReasoningEffort
       ? normalizeReasoningEffort(settings.codexReasoningEffort, "medium")
       : undefined;
-    const permissionMode = settings.permissionMode ? normalizePermissionMode(settings.permissionMode, DEFAULT_RUNTIME_SETTINGS.permissionMode) : undefined;
-    const codexApprovalMode = settings.codexApprovalMode ? normalizeCodexApprovalMode(settings.codexApprovalMode, "default") : undefined;
+    const requestedCodexApprovalMode = settings.codexApprovalMode ? normalizeCodexApprovalMode(settings.codexApprovalMode, "default") : undefined;
+    const permissionMode = settings.permissionMode
+      ? normalizePermissionMode(settings.permissionMode, DEFAULT_RUNTIME_SETTINGS.permissionMode)
+      : requestedCodexApprovalMode
+        ? accessModeForCodexApprovalMode(requestedCodexApprovalMode)
+        : undefined;
+    const effectivePermissionMode = permissionMode ?? currentPermissionMode;
+    const runtimeAccessMismatched = parsedThreadSettings !== undefined && parsedThreadSettings.permissionMode !== currentPermissionMode;
+    const runtimeSettingsValue = settings.runtimeSettings === undefined && permissionMode === undefined && !runtimeAccessMismatched
+      ? undefined
+      : { ...normalizeRuntimeSettings({ ...currentThreadSettings, ...(settings.runtimeSettings ?? {}) }), permissionMode: effectivePermissionMode };
+    const runtimeSettings = runtimeSettingsValue === undefined ? undefined : JSON.stringify(runtimeSettingsValue);
+    const currentCodexApprovalMode = normalizeCodexApprovalMode(row.codex_approval_mode, "default");
+    const codexApprovalMode = syncedCodexApprovalMode(effectivePermissionMode, requestedCodexApprovalMode ?? currentCodexApprovalMode, permissionMode !== undefined && requestedCodexApprovalMode === undefined);
     const planModeEnabled = settings.planModeEnabled === undefined ? undefined : (settings.planModeEnabled ? 1 : 0);
     const currentThread = threadFromRow({
       id: row.id,
@@ -1024,7 +1077,7 @@ export class ChatStore {
                codex_model_id = COALESCE(?, codex_model_id),
                codex_reasoning_effort = COALESCE(?, codex_reasoning_effort),
                permission_mode = COALESCE(?, permission_mode),
-               codex_approval_mode = COALESCE(?, codex_approval_mode),
+              codex_approval_mode = ?,
                plan_mode_enabled = COALESCE(?, plan_mode_enabled),
                document_index_id = COALESCE(?, document_index_id),
                codex_last_session_id = COALESCE(?, codex_last_session_id),
@@ -1036,7 +1089,7 @@ export class ChatStore {
                updated_at = ?
            WHERE id = ?`
         )
-        .run(providerMode ?? null, selectedSettingsPresetIdUpdate ?? null, builtinModelId ?? null, runtimeSettings ?? null, builtinAgenticFramework ?? null, documentAnalysisEmbeddingModelPath ?? null, codexModelId ?? null, codexReasoningEffort ?? null, permissionMode ?? null, codexApprovalMode ?? null, planModeEnabled ?? null, documentIndexId ?? null, codexLastSessionId ?? null, openCodeSessionId ?? null, remoteSessionId ?? null, remoteSlotId ?? null, remoteSettingsSignature ?? null, remoteHostIdentity ?? null, now, row.id);
+        .run(providerMode ?? null, selectedSettingsPresetIdUpdate ?? null, builtinModelId ?? null, runtimeSettings ?? null, builtinAgenticFramework ?? null, documentAnalysisEmbeddingModelPath ?? null, codexModelId ?? null, codexReasoningEffort ?? null, permissionMode ?? null, codexApprovalMode, planModeEnabled ?? null, documentIndexId ?? null, codexLastSessionId ?? null, openCodeSessionId ?? null, remoteSessionId ?? null, remoteSlotId ?? null, remoteSettingsSignature ?? null, remoteHostIdentity ?? null, now, row.id);
       this.db.prepare("UPDATE chat_projects SET updated_at = ? WHERE id = ?").run(now, row.project_id);
       this.db.exec("COMMIT");
     } catch (error) {
@@ -1068,25 +1121,19 @@ export class ChatStore {
     if (preset.providerMode === "builtin" && preset.builtinModelId) {
       this.selectModel(preset.builtinModelId);
     }
-    const { permissionMode: _permissionMode, ...runtimeSettingsWithoutAccess } = preset.runtimeSettings;
     const currentRuntimeSettings = thread.runtime_settings_json
       ? normalizeRuntimeSettings(parseJsonObject(thread.runtime_settings_json) as Partial<ChatRuntimeSettings>)
       : this.runtimeSettings();
-    const currentProviderMode = normalizeProviderMode(thread.provider_mode, "builtin");
-    const currentAccessMode = currentProviderMode === "codex"
-      ? accessModeForCodexApprovalMode(normalizeCodexApprovalMode(thread.codex_approval_mode, "default"))
-      : normalizePermissionMode(currentRuntimeSettings.permissionMode, DEFAULT_RUNTIME_SETTINGS.permissionMode);
+    const currentAccessMode = normalizePermissionMode(thread.permission_mode, currentRuntimeSettings.permissionMode);
     this.updateThreadSettings(thread.id, {
       providerMode: preset.providerMode,
       selectedSettingsPresetId: preset.id,
       builtinModelId: preset.builtinModelId,
-      runtimeSettings: { ...runtimeSettingsWithoutAccess, permissionMode: currentAccessMode },
+      runtimeSettings: { ...preset.runtimeSettings, permissionMode: currentAccessMode },
       builtinAgenticFramework: preset.builtinAgenticFramework,
       documentAnalysisEmbeddingModelPath: preset.documentAnalysisEmbeddingModelPath,
       codexModelId: preset.codexModelId || defaultCodexModelId(),
-      codexReasoningEffort: preset.codexReasoningEffort,
-      permissionMode: currentAccessMode,
-      codexApprovalMode: codexApprovalModeForAccessMode(currentAccessMode)
+      codexReasoningEffort: preset.codexReasoningEffort
     });
   }
 
@@ -1102,7 +1149,7 @@ export class ChatStore {
     codexModelId?: string;
     codexReasoningEffort?: ChatReasoningEffort;
   }): ChatSettingsPreset {
-    const currentPresets = this.settingsPresets();
+    const currentPresets = this.storedSettingsPresets();
     const rawId = preset.id?.trim();
     const existing = rawId ? currentPresets.find((candidate) => candidate.id === rawId) : undefined;
     if (existing && !existing.editable) {
@@ -1133,7 +1180,7 @@ export class ChatStore {
 
   deleteSettingsPreset(presetId: string): void {
     const normalizedId = presetId.trim();
-    const currentPresets = this.settingsPresets();
+    const currentPresets = this.storedSettingsPresets();
     const existing = currentPresets.find((candidate) => candidate.id === normalizedId);
     if (!existing) {
       throw new Error(`Chat settings preset does not exist: ${presetId}`);
@@ -1858,6 +1905,7 @@ export class ChatStore {
       this.db.exec("ALTER TABLE chat_projects ADD COLUMN action_buttons_json TEXT NOT NULL DEFAULT '[]'");
     }
     const threadColumns = this.db.prepare("PRAGMA table_info(chat_threads)").all() as Array<{ name: string }>;
+    const hadThreadPermissionModeColumn = threadColumns.some((column) => column.name === "permission_mode");
     const ensureThreadColumn = (name: string, definition: string) => {
       if (!threadColumns.some((column) => column.name === name)) {
         this.db.exec(`ALTER TABLE chat_threads ADD COLUMN ${definition}`);
@@ -1884,6 +1932,10 @@ export class ChatStore {
     ensureThreadColumn("active_context_start_message_index", "active_context_start_message_index INTEGER NOT NULL DEFAULT 0");
     ensureThreadColumn("context_revision", "context_revision INTEGER NOT NULL DEFAULT 0");
     ensureThreadColumn("context_markers_json", "context_markers_json TEXT NOT NULL DEFAULT '[]'");
+    if (!hadThreadPermissionModeColumn) {
+      this.seedMigratedThreadAccessState();
+    }
+    this.repairThreadAccessState();
     const messageColumns = this.db.prepare("PRAGMA table_info(chat_messages)").all() as Array<{ name: string }>;
     const ensureMessageColumn = (name: string, definition: string) => {
       if (!messageColumns.some((column) => column.name === name)) {
@@ -1902,6 +1954,67 @@ export class ChatStore {
     const documentChunkColumns = this.db.prepare("PRAGMA table_info(chat_document_index_chunks)").all() as Array<{ name: string }>;
     if (!documentChunkColumns.some((column) => column.name === "embedding_json")) {
       this.db.exec("ALTER TABLE chat_document_index_chunks ADD COLUMN embedding_json TEXT");
+    }
+  }
+
+  private repairThreadAccessState(): void {
+    const rows = this.db.prepare("SELECT id, runtime_settings_json, permission_mode, codex_approval_mode FROM chat_threads").all() as Array<{
+      id: string;
+      runtime_settings_json: string | null;
+      permission_mode: string | null;
+      codex_approval_mode: string | null;
+    }>;
+    const update = this.db.prepare("UPDATE chat_threads SET runtime_settings_json = ?, permission_mode = ?, codex_approval_mode = ? WHERE id = ?");
+    for (const row of rows) {
+      let rawRuntimeSettings: Partial<ChatRuntimeSettings> | undefined;
+      if (row.runtime_settings_json) {
+        try {
+          rawRuntimeSettings = JSON.parse(row.runtime_settings_json) as Partial<ChatRuntimeSettings>;
+        } catch {
+          continue;
+        }
+        if (!isRecord(rawRuntimeSettings)) {
+          continue;
+        }
+      }
+      const currentRuntimeSettings = rawRuntimeSettings
+        ? normalizeRuntimeSettings(rawRuntimeSettings)
+        : undefined;
+      const runtimeHasPermissionMode = rawRuntimeSettings !== undefined && Object.prototype.hasOwnProperty.call(rawRuntimeSettings, "permissionMode");
+      const runtimePermissionMode = runtimeHasPermissionMode
+        ? normalizePermissionMode(currentRuntimeSettings?.permissionMode, DEFAULT_RUNTIME_SETTINGS.permissionMode)
+        : undefined;
+      const storedPermissionMode = normalizePermissionMode(row.permission_mode, DEFAULT_RUNTIME_SETTINGS.permissionMode);
+      const permissionMode = runtimePermissionMode === "default_permissions" && row.permission_mode === "full_access"
+        ? runtimePermissionMode
+        : runtimeHasPermissionMode
+          ? storedPermissionMode
+          : "default_permissions";
+      const codexApprovalMode = syncedCodexApprovalMode(permissionMode, normalizeCodexApprovalMode(row.codex_approval_mode, "default"), false);
+      const runtimeSettingsJson = currentRuntimeSettings
+        ? JSON.stringify({ ...currentRuntimeSettings, permissionMode })
+        : null;
+      if (row.permission_mode !== permissionMode || row.codex_approval_mode !== codexApprovalMode || row.runtime_settings_json !== runtimeSettingsJson) {
+        update.run(runtimeSettingsJson, permissionMode, codexApprovalMode, row.id);
+      }
+    }
+  }
+
+  private seedMigratedThreadAccessState(): void {
+    const rows = this.db.prepare("SELECT id, runtime_settings_json, codex_approval_mode FROM chat_threads").all() as Array<{
+      id: string;
+      runtime_settings_json: string | null;
+      codex_approval_mode: string | null;
+    }>;
+    const update = this.db.prepare("UPDATE chat_threads SET permission_mode = ?, codex_approval_mode = ? WHERE id = ?");
+    for (const row of rows) {
+      const rawRuntimeSettings = row.runtime_settings_json
+        ? parseJsonObject(row.runtime_settings_json) as Partial<ChatRuntimeSettings>
+        : {};
+      const codexApprovalMode = normalizeCodexApprovalMode(row.codex_approval_mode, "default");
+      const fallbackPermissionMode = "default_permissions";
+      const permissionMode = normalizePermissionMode(rawRuntimeSettings.permissionMode, fallbackPermissionMode);
+      update.run(permissionMode, syncedCodexApprovalMode(permissionMode, codexApprovalMode, false), row.id);
     }
   }
 
@@ -2009,6 +2122,7 @@ export class ChatStore {
       );
       this.setSettingInTransaction("settings_presets_json", JSON.stringify(DEFAULT_SETTINGS_PRESETS));
       this.setSettingInTransaction("legacy_history_imported_path", imported.sourcePath);
+      this.repairThreadAccessState();
       this.db.exec("COMMIT");
     } catch (error) {
       this.db.exec("ROLLBACK");
@@ -2030,8 +2144,19 @@ export class ChatStore {
         .prepare("INSERT INTO chat_projects (id, title, directory, action_buttons_json, created_at, updated_at, sort_order) VALUES (?, ?, '', '[]', ?, ?, 0)")
         .run(projectId, "Project 1", now, now);
       this.db
-        .prepare("INSERT INTO chat_threads (id, project_id, title, created_at, updated_at, sort_order) VALUES (?, ?, ?, ?, ?, 0)")
-        .run(threadId, projectId, "Thread 1", now, now);
+        .prepare(`INSERT INTO chat_threads
+          (id, project_id, title, runtime_settings_json, permission_mode, codex_approval_mode, created_at, updated_at, sort_order)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)`)
+        .run(
+          threadId,
+          projectId,
+          "Thread 1",
+          JSON.stringify(DEFAULT_RUNTIME_SETTINGS),
+          DEFAULT_RUNTIME_SETTINGS.permissionMode,
+          codexApprovalModeForAccessMode(DEFAULT_RUNTIME_SETTINGS.permissionMode),
+          now,
+          now
+        );
       this.setSettingInTransaction("selected_project_id", projectId);
       this.setSettingInTransaction("selected_thread_id", threadId);
       this.setSettingInTransaction("runtime_settings_json", JSON.stringify(DEFAULT_RUNTIME_SETTINGS));
@@ -2051,9 +2176,12 @@ export class ChatStore {
     }
     try {
       const parsed = JSON.parse(raw) as Partial<ChatRuntimeSettings>;
+      if (!isRecord(parsed)) {
+        throw new Error("Stored chat runtime settings are malformed.");
+      }
       return normalizeRuntimeSettings(parsed);
     } catch {
-      return DEFAULT_RUNTIME_SETTINGS;
+      throw new Error("Stored chat runtime settings are malformed.");
     }
   }
 
@@ -2096,21 +2224,115 @@ export class ChatStore {
     this.setSetting("app_settings_json", JSON.stringify(normalizeAppSettings({ ...parsedSettings, actionButtons: firstButtons })));
   }
 
+  private repairLegacySettingsPresetAccessState(): void {
+    if (this.setting("settings_presets_access_separated") === "1") {
+      return;
+    }
+    const raw = this.setting("settings_presets_json");
+    if (!raw) {
+      this.setSetting("settings_presets_access_separated", "1");
+      return;
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw) as unknown;
+    } catch {
+      return;
+    }
+    if (!Array.isArray(parsed)) {
+      return;
+    }
+    let changed = false;
+    const repaired = parsed.map((preset) => {
+      if (!isRecord(preset)) {
+        return preset;
+      }
+      const {
+        permissionMode: _permissionMode,
+        codexApprovalMode: _codexApprovalMode,
+        runtimeSettings,
+        ...rest
+      } = preset;
+      if (_permissionMode !== undefined || _codexApprovalMode !== undefined) {
+        changed = true;
+      }
+      if (!isRecord(runtimeSettings)) {
+        return runtimeSettings === undefined ? rest : { ...rest, runtimeSettings };
+      }
+      const { permissionMode: _runtimePermissionMode, ...runtimeRest } = runtimeSettings;
+      if (_runtimePermissionMode !== undefined) {
+        changed = true;
+      }
+      return { ...rest, runtimeSettings: runtimeRest };
+    });
+    try {
+      validateStoredSettingsPresets(repaired, { allowLegacyEmptyCodexModelId: true });
+    } catch {
+      return;
+    }
+    if (changed) {
+      const normalized = normalizeSettingsPresets(repaired as ChatSettingsPreset[], []);
+      validateStoredSettingsPresets(normalized);
+      this.setSetting("settings_presets_json", JSON.stringify(normalized));
+    }
+    this.setSetting("settings_presets_access_separated", "1");
+  }
+
+  private repairLegacySettingsPresetCodexModelState(): void {
+    if (this.setting("settings_presets_codex_model_normalized") === "1") {
+      return;
+    }
+    const raw = this.setting("settings_presets_json");
+    if (!raw) {
+      this.setSetting("settings_presets_codex_model_normalized", "1");
+      return;
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw) as unknown;
+    } catch {
+      return;
+    }
+    if (!Array.isArray(parsed)) {
+      return;
+    }
+    try {
+      validateStoredSettingsPresets(parsed, { allowLegacyEmptyCodexModelId: true });
+    } catch {
+      return;
+    }
+    const needsRepair = parsed.some((preset) => isRecord(preset) && preset.codexModelId === "");
+    if (needsRepair) {
+      const normalized = normalizeSettingsPresets(parsed as ChatSettingsPreset[], []);
+      validateStoredSettingsPresets(normalized);
+      this.setSetting("settings_presets_json", JSON.stringify(normalized));
+    }
+    this.setSetting("settings_presets_codex_model_normalized", "1");
+  }
+
   private markStreamingMessagesInterrupted(): void {
     const now = timestamp();
     this.db.prepare("UPDATE chat_messages SET status = 'interrupted', updated_at = ? WHERE status = 'streaming'").run(now);
   }
 
   private settingsPresets(): ChatSettingsPreset[] {
+    return normalizeSettingsPresets(this.storedSettingsPresets(), this.hiddenSettingsPresetIds());
+  }
+
+  private storedSettingsPresets(): ChatSettingsPreset[] {
     const raw = this.setting("settings_presets_json");
     if (!raw) {
-      return normalizeSettingsPresets(DEFAULT_SETTINGS_PRESETS, this.hiddenSettingsPresetIds());
+      return normalizeSettingsPresets(DEFAULT_SETTINGS_PRESETS, []);
     }
     try {
       const parsed = JSON.parse(raw) as ChatSettingsPreset[];
-      return normalizeSettingsPresets(Array.isArray(parsed) ? parsed : [], this.hiddenSettingsPresetIds());
+      if (!Array.isArray(parsed)) {
+        throw new Error("Stored chat settings presets are malformed.");
+      }
+      validateStoredSettingsPresets(parsed);
+      return normalizeSettingsPresets(parsed, []);
     } catch {
-      return normalizeSettingsPresets(DEFAULT_SETTINGS_PRESETS, this.hiddenSettingsPresetIds());
+      throw new Error("Stored chat settings presets are malformed.");
     }
   }
 
@@ -2121,9 +2343,12 @@ export class ChatStore {
     }
     try {
       const parsed = JSON.parse(raw);
-      return Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === "string") : [];
+      if (!Array.isArray(parsed) || !parsed.every((item) => typeof item === "string")) {
+        throw new Error("Stored hidden chat settings preset ids are malformed.");
+      }
+      return parsed;
     } catch {
-      return [];
+      throw new Error("Stored hidden chat settings preset ids are malformed.");
     }
   }
 
@@ -2374,21 +2599,28 @@ function legacyThreadSettings(value: unknown): Omit<ChatThread, "id" | "projectI
   const payload = isRecord(value) ? value : {};
   const builtin = isRecord(payload.builtin) ? payload.builtin : {};
   const codex = isRecord(payload.codex) ? payload.codex : {};
-  const runtimeSettings = legacyRuntimeSettings(isRecord(builtin.inference_settings) ? builtin.inference_settings : {});
+  const builtinInferenceSettings = isRecord(builtin.inference_settings) ? builtin.inference_settings : {};
+  const runtimeSettings = legacyRuntimeSettings(builtinInferenceSettings);
   const providerMode = normalizeProviderMode(payload.provider_mode, "builtin");
+  const permissionMode = normalizePermissionMode(
+    builtinInferenceSettings.permission_mode,
+    "default_permissions"
+  );
+  const codexApprovalMode = syncedCodexApprovalMode(permissionMode, normalizeCodexApprovalMode(codex.approval_mode, "default"), false);
+  const syncedRuntimeSettings = { ...runtimeSettings, permissionMode };
   return {
     providerMode,
     selectedSettingsPresetId: typeof payload.selected_settings_preset_id === "string" && payload.selected_settings_preset_id.trim()
       ? payload.selected_settings_preset_id.trim()
       : DEFAULT_SETTINGS_PRESET_ID,
     builtinModelId: legacyText(builtin.selected_model_id),
-    runtimeSettings,
+    runtimeSettings: syncedRuntimeSettings,
     builtinAgenticFramework: legacyText(builtin.document_index_id) ? "document_analysis" : "chat",
     documentAnalysisEmbeddingModelPath: legacyText(builtin.document_analysis_embedding_model_path),
     codexModelId: normalizeCodexModelId(codex.selected_model_id),
     codexReasoningEffort: normalizeReasoningEffort(codex.selected_reasoning_effort, "medium"),
-    permissionMode: normalizePermissionMode(runtimeSettings.permissionMode, DEFAULT_RUNTIME_SETTINGS.permissionMode),
-    codexApprovalMode: normalizeCodexApprovalMode(codex.approval_mode, "default"),
+    permissionMode,
+    codexApprovalMode,
     planModeEnabled: Boolean(codex.plan_mode_enabled),
     documentIndexId: legacyText(builtin.document_index_id),
     codexLastSessionId: legacyText(codex.last_session_id),
@@ -2542,6 +2774,12 @@ function projectFromRow(row: ChatProjectRow): ChatProject {
 }
 
 function threadFromRow(row: ChatThreadRow): ChatThread {
+  const permissionMode = normalizePermissionMode(row.permission_mode, DEFAULT_RUNTIME_SETTINGS.permissionMode);
+  const rawRuntimeSettings = parseRequiredJsonObject(row.runtime_settings_json, "Stored thread runtime settings are malformed.") as Partial<ChatRuntimeSettings>;
+  const runtimeSettings = {
+    ...normalizeRuntimeSettings(rawRuntimeSettings),
+    permissionMode
+  };
   return {
     id: row.id,
     projectId: row.project_id,
@@ -2549,12 +2787,12 @@ function threadFromRow(row: ChatThreadRow): ChatThread {
     providerMode: normalizeProviderMode(row.provider_mode, "builtin"),
     selectedSettingsPresetId: row.selected_settings_preset_id || DEFAULT_SETTINGS_PRESET_ID,
     builtinModelId: row.builtin_model_id ?? "",
-    runtimeSettings: normalizeRuntimeSettings((parseJsonObject(row.runtime_settings_json) as Partial<ChatRuntimeSettings> | undefined) ?? DEFAULT_RUNTIME_SETTINGS),
+    runtimeSettings,
     builtinAgenticFramework: normalizeBuiltinAgenticFramework(row.builtin_agentic_framework),
     documentAnalysisEmbeddingModelPath: row.document_analysis_embedding_model_path ?? "",
     codexModelId: normalizeCodexModelId(row.codex_model_id),
     codexReasoningEffort: normalizeReasoningEffort(row.codex_reasoning_effort, "medium"),
-    permissionMode: normalizePermissionMode(row.permission_mode, DEFAULT_RUNTIME_SETTINGS.permissionMode),
+    permissionMode,
     codexApprovalMode: normalizeCodexApprovalMode(row.codex_approval_mode, "default"),
     planModeEnabled: row.plan_mode_enabled === 1,
     documentIndexId: row.document_index_id ?? "",
@@ -2670,7 +2908,7 @@ function threadSettingsChangeInvalidatesPreset(current: ChatThread, next: {
 }): boolean {
   return (next.providerMode !== undefined && next.providerMode !== current.providerMode)
     || (next.builtinModelId !== undefined && next.builtinModelId !== current.builtinModelId)
-    || (next.runtimeSettings !== undefined && JSON.stringify(next.runtimeSettings) !== JSON.stringify(current.runtimeSettings))
+    || (next.runtimeSettings !== undefined && JSON.stringify(presetRuntimeSettings(next.runtimeSettings)) !== JSON.stringify(presetRuntimeSettings(current.runtimeSettings)))
     || (next.builtinAgenticFramework !== undefined && next.builtinAgenticFramework !== current.builtinAgenticFramework)
     || (next.documentAnalysisEmbeddingModelPath !== undefined && next.documentAnalysisEmbeddingModelPath !== current.documentAnalysisEmbeddingModelPath)
     || (next.codexModelId !== undefined && next.codexModelId !== current.codexModelId)
@@ -2727,13 +2965,122 @@ function normalizeSettingsPresets(value: ChatSettingsPreset[], hiddenIds: string
   ].filter((preset) => !hidden.has(preset.id));
 }
 
+function validateStoredSettingsPresets(value: unknown[], options: { allowLegacyEmptyCodexModelId?: boolean } = {}): asserts value is ChatSettingsPreset[] {
+  const stringKeys = new Set(["id", "label", "providerMode", "iconName", "builtinModelId", "builtinAgenticFramework", "documentAnalysisEmbeddingModelPath", "codexModelId", "codexReasoningEffort"]);
+  const booleanKeys = new Set(["builtIn", "editable", "deletable"]);
+  const allowedKeys = new Set([...stringKeys, ...booleanKeys, "runtimeSettings"]);
+  for (const preset of value) {
+    if (!isRecord(preset)) {
+      throw new Error("Stored chat settings presets are malformed.");
+    }
+    if (preset.runtimeSettings !== undefined && !isRecord(preset.runtimeSettings)) {
+      throw new Error("Stored chat settings presets are malformed.");
+    }
+    for (const key of allowedKeys) {
+      if (preset[key] === undefined) {
+        throw new Error("Stored chat settings presets are malformed.");
+      }
+    }
+    for (const key of Object.keys(preset)) {
+      if (!allowedKeys.has(key)) {
+        throw new Error("Stored chat settings presets are malformed.");
+      }
+    }
+    for (const key of stringKeys) {
+      if (preset[key] !== undefined && typeof preset[key] !== "string") {
+        throw new Error("Stored chat settings presets are malformed.");
+      }
+    }
+    for (const key of booleanKeys) {
+      if (preset[key] !== undefined && typeof preset[key] !== "boolean") {
+        throw new Error("Stored chat settings presets are malformed.");
+      }
+    }
+    if (typeof preset.id !== "string" || typeof preset.label !== "string" || !preset.id.trim() || !preset.label.trim()) {
+      throw new Error("Stored chat settings presets are malformed.");
+    }
+    if (preset.providerMode !== undefined && preset.providerMode !== "builtin" && preset.providerMode !== "codex") {
+      throw new Error("Stored chat settings presets are malformed.");
+    }
+    const iconName = typeof preset.iconName === "string" ? preset.iconName.trim() : "";
+    if (iconName && !SETTINGS_PRESET_ICON_NAMES.has(iconName)) {
+      throw new Error("Stored chat settings presets are malformed.");
+    }
+    if (preset.builtinAgenticFramework !== undefined && preset.builtinAgenticFramework !== "chat" && preset.builtinAgenticFramework !== "document_analysis" && preset.builtinAgenticFramework !== "opencode") {
+      throw new Error("Stored chat settings presets are malformed.");
+    }
+    if (preset.codexReasoningEffort !== undefined && preset.codexReasoningEffort !== "low" && preset.codexReasoningEffort !== "medium" && preset.codexReasoningEffort !== "high" && preset.codexReasoningEffort !== "xhigh") {
+      throw new Error("Stored chat settings presets are malformed.");
+    }
+    if (options.allowLegacyEmptyCodexModelId && preset.codexModelId === "") {
+      // Legacy stored presets used an empty value to mean the default Codex model.
+    } else if (!DEFAULT_CODEX_MODELS.some((model) => model.id === preset.codexModelId)) {
+      throw new Error("Stored chat settings presets are malformed.");
+    }
+    if (isRecord(preset.runtimeSettings)) {
+      validateStoredPresetRuntimeSettings(preset.runtimeSettings);
+    }
+  }
+}
+
+function validateStoredPresetRuntimeSettings(value: Record<string, unknown>): void {
+  const positiveIntegerKeys = new Set(["nCtx", "maxTokens", "trimReserveTokens", "trimAmountTokens"]);
+  const integerKeys = new Set(["nGpuLayers"]);
+  const finiteNumberKeys = new Set(["temperature", "repeatPenalty", "trimReservePercent", "trimAmountPercent"]);
+  const numberKeys = new Set([...positiveIntegerKeys, ...integerKeys, ...finiteNumberKeys]);
+  const stringKeys = new Set(["reasoningEffort", "systemPrompt"]);
+  const allowedKeys = new Set([...numberKeys, ...stringKeys]);
+  for (const key of Object.keys(value)) {
+    if (!allowedKeys.has(key)) {
+      throw new Error("Stored chat settings presets are malformed.");
+    }
+  }
+  for (const key of positiveIntegerKeys) {
+    if (value[key] !== undefined && !positiveInteger(value[key], 0)) {
+      throw new Error("Stored chat settings presets are malformed.");
+    }
+  }
+  for (const key of integerKeys) {
+    if (value[key] !== undefined && !Number.isInteger(value[key])) {
+      throw new Error("Stored chat settings presets are malformed.");
+    }
+  }
+  for (const key of finiteNumberKeys) {
+    if (value[key] !== undefined && (typeof value[key] !== "number" || !Number.isFinite(value[key]))) {
+      throw new Error("Stored chat settings presets are malformed.");
+    }
+  }
+  const temperature = value.temperature;
+  if (typeof temperature === "number" && temperature < 0) {
+    throw new Error("Stored chat settings presets are malformed.");
+  }
+  const repeatPenalty = value.repeatPenalty;
+  if (typeof repeatPenalty === "number" && repeatPenalty <= 0) {
+    throw new Error("Stored chat settings presets are malformed.");
+  }
+  for (const key of ["trimReservePercent", "trimAmountPercent"]) {
+    const numberValue = value[key];
+    if (typeof numberValue === "number" && (numberValue < 0 || numberValue > 100)) {
+      throw new Error("Stored chat settings presets are malformed.");
+    }
+  }
+  for (const key of stringKeys) {
+    if (value[key] !== undefined && typeof value[key] !== "string") {
+      throw new Error("Stored chat settings presets are malformed.");
+    }
+  }
+  if (value.reasoningEffort !== undefined && value.reasoningEffort !== "low" && value.reasoningEffort !== "medium" && value.reasoningEffort !== "high") {
+    throw new Error("Stored chat settings presets are malformed.");
+  }
+}
+
 function normalizeSettingsPreset(value: Omit<Partial<ChatSettingsPreset>, "runtimeSettings"> & { id?: string; runtimeSettings?: Partial<ChatRuntimeSettings> }): ChatSettingsPreset {
   const providerMode = normalizeProviderMode(value.providerMode, "builtin");
   const id = typeof value.id === "string" && value.id.trim() ? value.id.trim() : `custom::${randomUUID()}`;
   return {
     id,
     label: typeof value.label === "string" && value.label.trim() ? normalizeTitle(value.label, 80) : "Untitled settings",
-    runtimeSettings: normalizeRuntimeSettings(value.runtimeSettings ?? {}),
+    runtimeSettings: presetRuntimeSettings(value.runtimeSettings ?? {}),
     providerMode,
     iconName: normalizeSettingsPresetIconName(value.iconName, providerMode),
     builtinModelId: typeof value.builtinModelId === "string" ? value.builtinModelId.trim() : "",
@@ -2863,6 +3210,16 @@ function codexApprovalModeForAccessMode(value: ChatPermissionMode): ChatCodexApp
   return value === "full_access" ? "never" : "default";
 }
 
+function syncedCodexApprovalMode(value: ChatPermissionMode, current: ChatCodexApprovalMode, explicitAccessChange: boolean): ChatCodexApprovalMode {
+  if (value === "full_access") {
+    return "never";
+  }
+  if (explicitAccessChange || current === "never") {
+    return "default";
+  }
+  return current;
+}
+
 function accessModeForCodexApprovalMode(value: ChatCodexApprovalMode): ChatPermissionMode {
   return value === "never" ? "full_access" : "default_permissions";
 }
@@ -2930,6 +3287,21 @@ function parseJsonObject(value: string | null): Record<string, unknown> | undefi
     return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Record<string, unknown> : undefined;
   } catch {
     return undefined;
+  }
+}
+
+function parseRequiredJsonObject(value: string | null, message: string): Record<string, unknown> {
+  if (!value) {
+    return {};
+  }
+  try {
+    const parsed = JSON.parse(value);
+    if (!isRecord(parsed)) {
+      throw new Error(message);
+    }
+    return parsed;
+  } catch {
+    throw new Error(message);
   }
 }
 

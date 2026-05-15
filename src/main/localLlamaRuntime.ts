@@ -244,9 +244,10 @@ export class LocalLlamaRuntime {
           if (!rawText) {
             return;
           }
-          const { content, reasoning } = channelParser.push(rawText);
-          if (content) {
-            options.onToken(content);
+          const { content, reasoning, commentary } = channelParser.push(rawText);
+          const visibleContent = `${commentary ?? ""}${content}`;
+          if (visibleContent) {
+            options.onToken(visibleContent);
           }
           if (reasoning) {
             options.onReasoning?.(reasoning);
@@ -267,9 +268,10 @@ export class LocalLlamaRuntime {
         }
       });
       if (channelParser) {
-        const { content, reasoning } = channelParser.finish();
-        if (content) {
-          options.onToken(content);
+        const { content, reasoning, commentary } = channelParser.finish();
+        const visibleContent = `${commentary ?? ""}${content}`;
+        if (visibleContent) {
+          options.onToken(visibleContent);
         }
         if (reasoning) {
           options.onReasoning?.(reasoning);
@@ -768,19 +770,20 @@ function localRuntimeMessages(settings: ChatRuntimeSettings, messages: ChatMessa
 
 export class GptOssChannelParser {
   private buffer = "";
-  private activeChannel: "analysis" | "final" | "final_json" | "tool_json" | null = null;
+  private activeChannel: "analysis" | "commentary" | "final" | "final_json" | "tool_json" | null = null;
   private activeToolRecipient = "";
   private done = false;
 
   constructor(private readonly options: { defaultChannel?: "analysis" | "final"; toolRecipients?: string[] } = {}) {}
 
-  push(text: string): { content: string; reasoning: string; toolCallContent?: string } {
+  push(text: string): GptOssChannelParserResult {
     if (this.done || !text) {
       return { content: "", reasoning: "" };
     }
     this.buffer += text;
     const content: string[] = [];
     const reasoning: string[] = [];
+    const commentary: string[] = [];
     const toolCalls: string[] = [];
     while (true) {
       if (!this.activeChannel) {
@@ -799,7 +802,7 @@ export class GptOssChannelParser {
         } else if (this.activeChannel === "tool_json") {
           appendCommentaryToolCallJson(this.activeToolRecipient, this.buffer.slice(0, endIndex), content, toolCalls);
         } else {
-          this.appendChannelText(this.buffer.slice(0, endIndex), content, reasoning);
+          this.appendChannelText(this.buffer.slice(0, endIndex), content, reasoning, commentary);
         }
         this.buffer = this.buffer.slice(endIndex + terminator.marker.length);
         this.activeChannel = null;
@@ -807,53 +810,54 @@ export class GptOssChannelParser {
         if (terminator.marker === GPTOSS_RETURN_MARKER || terminator.marker === GPTOSS_CALL_MARKER) {
           this.buffer = "";
           this.done = true;
-          return channelParserResult(content, reasoning, toolCalls);
+          return channelParserResult(content, reasoning, commentary, toolCalls);
         }
         if (!this.buffer) {
-          return channelParserResult(content, reasoning, toolCalls);
+          return channelParserResult(content, reasoning, commentary, toolCalls);
         }
         continue;
       }
       if (this.activeChannel === "final_json" || this.activeChannel === "tool_json") {
-        return channelParserResult(content, reasoning, toolCalls);
+        return channelParserResult(content, reasoning, commentary, toolCalls);
       }
       const partialEndLength = trailingPartialSpecialTerminatorLength(this.buffer);
       const emitText = partialEndLength > 0 ? this.buffer.slice(0, -partialEndLength) : this.buffer;
-      this.appendChannelText(emitText, content, reasoning);
+      this.appendChannelText(emitText, content, reasoning, commentary);
       this.buffer = partialEndLength > 0 ? this.buffer.slice(-partialEndLength) : "";
-      return channelParserResult(content, reasoning, toolCalls);
+      return channelParserResult(content, reasoning, commentary, toolCalls);
     }
   }
 
-  finish(): { content: string; reasoning: string; toolCallContent?: string } {
+  finish(): GptOssChannelParserResult {
     if (this.done || !this.buffer) {
       return { content: "", reasoning: "" };
     }
     const content: string[] = [];
     const reasoning: string[] = [];
+    const commentary: string[] = [];
     const toolCalls: string[] = [];
     if (this.activeChannel === "final_json") {
       appendCommentaryFinalJson(this.buffer, content);
       this.buffer = "";
       this.activeChannel = null;
-      return channelParserResult(content, reasoning, toolCalls);
+      return channelParserResult(content, reasoning, commentary, toolCalls);
     }
     if (this.activeChannel === "tool_json") {
       appendCommentaryToolCallJson(this.activeToolRecipient, this.buffer, content, toolCalls);
       this.buffer = "";
       this.activeChannel = null;
       this.activeToolRecipient = "";
-      return channelParserResult(content, reasoning, toolCalls);
+      return channelParserResult(content, reasoning, commentary, toolCalls);
     }
-    if ((this.activeChannel === "analysis" || this.activeChannel === "final") && !this.buffer.startsWith("<|")) {
-      this.appendChannelText(this.buffer, content, reasoning);
+    if ((this.activeChannel === "analysis" || this.activeChannel === "commentary" || this.activeChannel === "final") && !this.buffer.startsWith("<|")) {
+      this.appendChannelText(this.buffer, content, reasoning, commentary);
     }
     this.buffer = "";
     this.activeChannel = null;
-    return channelParserResult(content, reasoning, toolCalls);
+    return channelParserResult(content, reasoning, commentary, toolCalls);
   }
 
-  private consumeChannelPrefix(): "analysis" | "final" | "final_json" | "tool_json" | null {
+  private consumeChannelPrefix(): "analysis" | "commentary" | "final" | "final_json" | "tool_json" | null {
     while (this.buffer.startsWith("<|start|>assistant")) {
       this.buffer = this.buffer.slice("<|start|>assistant".length);
       if (!this.buffer) {
@@ -887,7 +891,7 @@ export class GptOssChannelParser {
     return null;
   }
 
-  private consumeCommentaryPrefix(): "analysis" | "final" | "final_json" | "tool_json" | "await_commentary" | null {
+  private consumeCommentaryPrefix(): "analysis" | "commentary" | "final" | "final_json" | "tool_json" | "await_commentary" | null {
     const commentaryPrefix = "<|channel|>commentary";
     if (!this.buffer.startsWith(commentaryPrefix)) {
       return null;
@@ -908,6 +912,9 @@ export class GptOssChannelParser {
     if (commentaryTarget === "final" && prefix.includes("<|constrain|>json")) {
       return "final_json";
     }
+    if (!commentaryTarget || commentaryTarget === "commentary") {
+      return "commentary";
+    }
     if (commentaryTarget === "final") {
       return "final";
     }
@@ -927,7 +934,7 @@ export class GptOssChannelParser {
     return "";
   }
 
-  private appendChannelText(text: string, content: string[], reasoning: string[]): void {
+  private appendChannelText(text: string, content: string[], reasoning: string[], commentary: string[]): void {
     if (!text) {
       return;
     }
@@ -935,15 +942,29 @@ export class GptOssChannelParser {
       reasoning.push(text);
       return;
     }
+    if (this.activeChannel === "commentary") {
+      commentary.push(text);
+      return;
+    }
     content.push(text);
   }
 }
 
-function channelParserResult(content: string[], reasoning: string[], toolCalls: string[]): { content: string; reasoning: string; toolCallContent?: string } {
-  const result: { content: string; reasoning: string; toolCallContent?: string } = {
+export interface GptOssChannelParserResult {
+  content: string;
+  reasoning: string;
+  commentary?: string;
+  toolCallContent?: string;
+}
+
+function channelParserResult(content: string[], reasoning: string[], commentary: string[], toolCalls: string[]): GptOssChannelParserResult {
+  const result: GptOssChannelParserResult = {
     content: content.join(""),
     reasoning: reasoning.join("")
   };
+  if (commentary.length > 0) {
+    result.commentary = commentary.join("");
+  }
   if (toolCalls.length > 0) {
     result.toolCallContent = toolCalls.join("");
   }

@@ -1169,6 +1169,42 @@ test("does not clear streamed OpenCode content when final snapshot content is em
   }
 });
 
+test("does not fail OpenCode turns when final answer streams after reasoning-only continuation", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-opencode-continued-final-test-"));
+  const modelPath = path.join(dir, "model.gguf");
+  fs.writeFileSync(modelPath, "");
+  const store = new ChatStore(path.join(dir, "chat.sqlite"));
+  const openCodeRuntime = new ScriptedOpenCodeRuntime([[
+    { type: "reasoning.delta", id: "message-1:reasoning-1", status: "updated", text: "Need acknowledgement." },
+    { type: "assistant.delta", id: "message-1:text-1", status: "updated", text: "Sure." },
+    { type: "final.snapshot", content: "Sure.", reasoning: "Need acknowledgement.", strict: true, messageId: "message-1" }
+  ]]);
+  const service = new ChatService(store, new EndpointOnlyLlamaRuntime(), new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined, new TestEmbeddingRuntime(), openCodeRuntime);
+  try {
+    let state = store.loadState();
+    store.updateProjectSettings(state.selectedProjectId, "OpenCode Continued Final Project", dir);
+    store.addLocalModel(modelPath);
+    state = store.loadState();
+    store.updateThreadSettings(state.selectedThreadId, {
+      builtinAgenticFramework: "opencode",
+      builtinModelId: state.selectedModelId
+    });
+
+    await service.submit({ text: "Cool!" });
+    await expect.poll(() => service.state().generation.status).toBe("idle");
+
+    state = store.loadState();
+    const assistant = state.messages.find((message) => message.role === "assistant");
+    expect(assistant?.status).toBe("complete");
+    expect(assistant?.content).toBe("Sure.");
+    expect(assistant?.reasoning).toBe("Need acknowledgement.");
+    expect(assistant?.timelineBlocks?.some((block) => block.kind === "status" && block.code === "opencode_failed")).toBe(false);
+  } finally {
+    service.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("does not append snapshot-only OpenCode reasoning after streamed answer", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-opencode-answer-only-final-reasoning-test-"));
   const modelPath = path.join(dir, "model.gguf");
@@ -1729,6 +1765,76 @@ test("validates strict OpenCode snapshots against concatenated message parts", a
   }
 });
 
+test("validates strict OpenCode snapshots against actual interleaved stream order", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-opencode-interleaved-snapshot-test-"));
+  const modelPath = path.join(dir, "model.gguf");
+  fs.writeFileSync(modelPath, "");
+  const store = new ChatStore(path.join(dir, "chat.sqlite"));
+  const openCodeRuntime = new ScriptedOpenCodeRuntime([[
+    { type: "assistant.delta", id: "msg_1:prt_1", status: "updated", text: "A" },
+    { type: "assistant.delta", id: "msg_1:prt_2", status: "updated", text: "B" },
+    { type: "assistant.delta", id: "msg_1:prt_1", status: "updated", text: "C" },
+    { type: "final.snapshot", content: "ABC", reasoning: "", strict: true, messageId: "msg_1" },
+    { type: "turn.completed" }
+  ]]);
+  const service = new ChatService(store, new EndpointOnlyLlamaRuntime(), new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined, new TestEmbeddingRuntime(), openCodeRuntime);
+  try {
+    let state = store.loadState();
+    store.updateProjectSettings(state.selectedProjectId, "OpenCode Interleaved Snapshot Project", dir);
+    store.addLocalModel(modelPath);
+    state = store.loadState();
+    store.updateThreadSettings(state.selectedThreadId, {
+      builtinAgenticFramework: "opencode",
+      builtinModelId: state.selectedModelId
+    });
+
+    await service.submit({ text: "interleaved message" });
+    await expect.poll(() => service.state().generation.status).toBe("idle");
+
+    state = store.loadState();
+    const assistant = state.messages.find((message) => message.role === "assistant");
+    expect(assistant?.content).toBe("ABC");
+    expect(assistant?.status).toBe("complete");
+  } finally {
+    service.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("fails strict OpenCode reasoning snapshots that omit streamed reasoning for the source message", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-opencode-reasoning-omitted-snapshot-test-"));
+  const modelPath = path.join(dir, "model.gguf");
+  fs.writeFileSync(modelPath, "");
+  const store = new ChatStore(path.join(dir, "chat.sqlite"));
+  const openCodeRuntime = new ScriptedOpenCodeRuntime([[
+    { type: "reasoning.delta", id: "msg_1:rsn_1", status: "updated", text: "Need answer." },
+    { type: "assistant.delta", id: "msg_1:prt_1", status: "updated", text: "Done." },
+    { type: "final.snapshot", content: "Done.", reasoning: "", strict: true, messageId: "msg_1" }
+  ]]);
+  const service = new ChatService(store, new EndpointOnlyLlamaRuntime(), new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined, new TestEmbeddingRuntime(), openCodeRuntime);
+  try {
+    let state = store.loadState();
+    store.updateProjectSettings(state.selectedProjectId, "OpenCode Reasoning Omitted Snapshot Project", dir);
+    store.addLocalModel(modelPath);
+    state = store.loadState();
+    store.updateThreadSettings(state.selectedThreadId, {
+      builtinAgenticFramework: "opencode",
+      builtinModelId: state.selectedModelId
+    });
+
+    await service.submit({ text: "reasoning mismatch" });
+    await expect.poll(() => service.state().generation.status).toBe("error");
+
+    state = store.loadState();
+    const assistant = state.messages.find((message) => message.role === "assistant");
+    expect(assistant?.status).toBe("error");
+    expect(assistant?.timelineBlocks?.some((block) => block.kind === "status" && block.code === "opencode_failed" && block.message.includes("reasoning did not match"))).toBe(true);
+  } finally {
+    service.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("answers OpenCode question blocks through the OpenCode runtime", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-opencode-question-action-test-"));
   const modelPath = path.join(dir, "model.gguf");
@@ -1767,17 +1873,137 @@ test("answers OpenCode question blocks through the OpenCode runtime", async () =
         id: "que_test",
         status: "requested",
         title: "Pattern",
-        question: "What pattern should I grep for?",
-        questions: [{ id: "que_test:0", label: "What pattern should I grep for?", options: ["TODO"], allowsCustomAnswer: true }],
+        question: "What pattern should I grep for?\nWhich files should I include?",
+        questions: [
+          { id: "que_test:0", label: "What pattern should I grep for?", options: ["TODO"], allowsCustomAnswer: true },
+          { id: "que_test:1", label: "Which files should I include?", options: ["*.ts"], allowsCustomAnswer: true }
+        ],
         requestMethod: "opencode"
       }]
     });
     const question = assistant.timelineBlocks?.find((block) => block.kind === "question");
     expect(question).toBeTruthy();
 
-    await service.timelineAction({ messageId: assistant.id, blockId: "que_test", action: "answer", answer: "TODO" });
+    await service.timelineAction({ messageId: assistant.id, blockId: "que_test", action: "answer", answers: { "que_test:0": "TODO", "que_test:1": "*.ts" } });
 
-    expect(openCodeRuntime.userInputs).toEqual([{ requestId: "que_test", answers: { "que_test:0": "TODO" } }]);
+    expect(openCodeRuntime.userInputs).toEqual([{ requestId: "que_test", answers: { "que_test:0": "TODO", "que_test:1": "*.ts" } }]);
+    state = store.loadState();
+    const completedQuestion = state.messages.find((message) => message.id === assistant.id)?.timelineBlocks?.find((block) => block.kind === "question");
+    expect(completedQuestion).toMatchObject({
+      kind: "question",
+      status: "completed",
+      question: "What pattern should I grep for?\nWhich files should I include?",
+      answers: { "que_test:0": "TODO", "que_test:1": "*.ts" }
+    });
+  } finally {
+    service.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("does not complete OpenCode question blocks when answer submission fails", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-opencode-question-failure-test-"));
+  const modelPath = path.join(dir, "model.gguf");
+  fs.writeFileSync(modelPath, "");
+  const store = new ChatStore(path.join(dir, "chat.sqlite"));
+  class RejectingOpenCodeRuntime extends ScriptedOpenCodeRuntime {
+    override async answerUserInput(): Promise<void> {
+      throw new Error("question reply failed");
+    }
+  }
+  const openCodeRuntime = new RejectingOpenCodeRuntime();
+  const service = new ChatService(store, new EndpointOnlyLlamaRuntime(), new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined, new TestEmbeddingRuntime(), openCodeRuntime);
+  try {
+    let state = store.loadState();
+    store.updateProjectSettings(state.selectedProjectId, "OpenCode Question Failure Project", dir);
+    store.addLocalModel(modelPath);
+    state = store.loadState();
+    store.updateThreadSettings(state.selectedThreadId, {
+      builtinAgenticFramework: "opencode",
+      builtinModelId: state.selectedModelId
+    });
+    const assistant = store.createMessage(state.selectedThreadId, "assistant", "", "streaming", {
+      timelineBlocks: [{
+        kind: "question",
+        id: "que_fail",
+        status: "requested",
+        title: "Pattern",
+        question: "What pattern should I grep for?",
+        questions: [{ id: "que_fail:0", label: "What pattern should I grep for?", options: ["TODO"], allowsCustomAnswer: true }],
+        requestMethod: "opencode"
+      }]
+    });
+
+    await expect(service.timelineAction({ messageId: assistant.id, blockId: "que_fail", action: "answer", answer: "TODO" })).rejects.toThrow("question reply failed");
+
+    state = store.loadState();
+    const question = state.messages.find((message) => message.id === assistant.id)?.timelineBlocks?.find((block) => block.kind === "question");
+    expect(question).toMatchObject({ kind: "question", status: "requested" });
+    expect(question && "answers" in question ? question.answers : undefined).toBeUndefined();
+  } finally {
+    service.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("preserves OpenCode question prompt fields when the server completes the question", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-opencode-question-complete-test-"));
+  const modelPath = path.join(dir, "model.gguf");
+  fs.writeFileSync(modelPath, "");
+  const store = new ChatStore(path.join(dir, "chat.sqlite"));
+  const openCodeRuntime = new ScriptedOpenCodeRuntime([[
+    {
+      type: "timeline",
+      eventType: "item.started",
+      block: {
+        kind: "question",
+        id: "que_done",
+        status: "requested",
+        title: "Pattern",
+        question: "What pattern should I grep for?",
+        questions: [{ id: "que_done:0", label: "What pattern should I grep for?", options: ["TODO"], allowsCustomAnswer: true }],
+        requestMethod: "opencode"
+      }
+    },
+    {
+      type: "timeline",
+      eventType: "item.completed",
+      block: {
+        kind: "question",
+        id: "que_done",
+        status: "completed",
+        title: "Question answered",
+        answers: { "que_done:0": "TODO" },
+        requestMethod: "opencode"
+      }
+    },
+    { type: "assistant.delta", id: "msg_1:prt_1", status: "updated", text: "Done." },
+    { type: "final.snapshot", content: "Done.", reasoning: "" }
+  ]]);
+  const service = new ChatService(store, new EndpointOnlyLlamaRuntime(), new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined, new TestEmbeddingRuntime(), openCodeRuntime);
+  try {
+    let state = store.loadState();
+    store.updateProjectSettings(state.selectedProjectId, "OpenCode Question Complete Project", dir);
+    store.addLocalModel(modelPath);
+    state = store.loadState();
+    store.updateThreadSettings(state.selectedThreadId, {
+      builtinAgenticFramework: "opencode",
+      builtinModelId: state.selectedModelId
+    });
+
+    await service.submit({ text: "ask and answer" });
+    await expect.poll(() => service.state().generation.status).toBe("idle");
+
+    state = store.loadState();
+    const question = state.messages.find((message) => message.role === "assistant")?.timelineBlocks?.find((block) => block.kind === "question");
+    expect(question).toMatchObject({
+      kind: "question",
+      status: "completed",
+      title: "Question answered",
+      question: "What pattern should I grep for?",
+      questions: [{ id: "que_done:0", label: "What pattern should I grep for?", options: ["TODO"], allowsCustomAnswer: true }],
+      answers: { "que_done:0": "TODO" }
+    });
   } finally {
     service.close();
     fs.rmSync(dir, { recursive: true, force: true });

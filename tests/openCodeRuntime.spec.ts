@@ -3,7 +3,7 @@ import fs from "node:fs";
 import http, { type Server } from "node:http";
 import os from "node:os";
 import path from "node:path";
-import { RealOpenCodeRuntime, type OpenCodeRuntimeEvent, type OpenCodeRunOptions } from "../src/main/openCodeRuntime";
+import { gptOssOpenCodeRequestMaxTokens, openCodeConfig, RealOpenCodeRuntime, renderGptOssOpenCodeProxyPrompt, type OpenCodeRuntimeEvent, type OpenCodeRunOptions } from "../src/main/openCodeRuntime";
 import type { ChatRuntimeSettings } from "../src/shared/types";
 
 const baseSettings: ChatRuntimeSettings = {
@@ -22,6 +22,38 @@ const baseSettings: ChatRuntimeSettings = {
 };
 
 type FakeChunk = string | { content: string; pauseAfter: string };
+
+test("OpenCode config maps Unit-0 full access to OpenCode web permissions", () => {
+  const fullAccess = openCodeConfig({
+    cwd: "C:\\Project",
+    prompt: "hi",
+    modelLabel: "fake-gpt-oss",
+    nativeGptOss: true,
+    endpoint: { baseUrl: "http://127.0.0.1:1234", modelId: "fake-gpt-oss" },
+    settings: baseSettings,
+    permissionMode: "full_access"
+  });
+  expect(fullAccess.permission).toBe("allow");
+
+  const defaultPermissions = openCodeConfig({
+    cwd: "C:\\Project",
+    prompt: "hi",
+    modelLabel: "fake-gpt-oss",
+    nativeGptOss: true,
+    endpoint: { baseUrl: "http://127.0.0.1:1234", modelId: "fake-gpt-oss" },
+    settings: baseSettings,
+    permissionMode: "default_permissions"
+  });
+  expect(defaultPermissions.permission).toMatchObject({
+    bash: "ask",
+    doom_loop: "ask",
+    external_directory: "ask",
+    lsp: "allow",
+    skill: "allow",
+    webfetch: "ask",
+    websearch: "ask"
+  });
+});
 
 test("real OpenCode GPT-OSS proxy rejects final-only output before rendering it", async () => {
   test.setTimeout(90_000);
@@ -166,6 +198,194 @@ test("real OpenCode GPT-OSS proxy continues analysis-only turns into final chann
   }
 });
 
+test("real OpenCode GPT-OSS proxy continues analysis-only turns when llama suppresses terminal return", async () => {
+  test.setTimeout(120_000);
+  const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-opencode-runtime-analysis-no-return-"));
+  const fakeLlama = await startFakeRawCompletionServer([
+    [
+      "<|channel|>analysis<|message|>Need acknowledgement."
+    ],
+    [
+      { content: "Sure", pauseAfter: "continued-final-token-without-return" },
+      ".",
+      "<|return|>"
+    ]
+  ]);
+  const runtime = new RealOpenCodeRuntime();
+  try {
+    const events: OpenCodeRuntimeEvent[] = [];
+    const run = collectOpenCodeEvents(runtime, {
+      cwd: projectDir,
+      prompt: "Cool!",
+      modelLabel: "fake-gpt-oss",
+      nativeGptOss: true,
+      endpoint: {
+        baseUrl: fakeLlama.url,
+        modelId: "fake-gpt-oss",
+        rawCompletionUrl: `${fakeLlama.url}/completion`
+      },
+      settings: baseSettings,
+      permissionMode: "full_access"
+    }, (event) => events.push(event));
+
+    await fakeLlama.waitForPause("continued-final-token-without-return");
+    await expect.poll(() => fakeLlama.requests.length).toBe(2);
+    await expect.poll(() => events.filter((event) => event.type === "reasoning.delta").map((event) => event.text).join("")).toBe("Need acknowledgement.");
+    await expect.poll(() => events.filter((event) => event.type === "assistant.delta").map((event) => event.text).join("")).toBe("Sure");
+    fakeLlama.release("continued-final-token-without-return");
+    await run;
+
+    expect(events.filter((event) => event.type === "assistant.delta").map((event) => event.text).join("")).toBe("Sure.");
+    expect(events.find((event) => event.type === "final.snapshot")).toMatchObject({ type: "final.snapshot", content: "Sure.", malformed: undefined });
+    expect(events.some((event) => event.type === "error")).toBe(false);
+    expect(fakeLlama.requests[1]?.prompt).toContain("<|channel|>analysis<|message|>Need acknowledgement.<|end|><|start|>assistant<|channel|>final<|message|>");
+  } finally {
+    runtime.close();
+    await fakeLlama.close();
+    fs.rmSync(projectDir, { recursive: true, force: true });
+  }
+});
+
+test("real OpenCode GPT-OSS proxy repeats final continuation when the model keeps emitting analysis", async () => {
+  test.setTimeout(120_000);
+  const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-opencode-runtime-repeated-analysis-"));
+  const fakeLlama = await startFakeRawCompletionServer([
+    [
+      "<|channel|>analysis<|message|>Must keep concise, "
+    ],
+    [
+      "<|channel|>analysis<|message|>answer with greeting."
+    ],
+    [
+      { content: "Hi", pauseAfter: "repeated-final-token" },
+      "<|return|>"
+    ]
+  ]);
+  const runtime = new RealOpenCodeRuntime();
+  try {
+    const events: OpenCodeRuntimeEvent[] = [];
+    const run = collectOpenCodeEvents(runtime, {
+      cwd: projectDir,
+      prompt: "hi potato",
+      modelLabel: "fake-gpt-oss",
+      nativeGptOss: true,
+      endpoint: {
+        baseUrl: fakeLlama.url,
+        modelId: "fake-gpt-oss",
+        rawCompletionUrl: `${fakeLlama.url}/completion`
+      },
+      settings: baseSettings,
+      permissionMode: "full_access"
+    }, (event) => events.push(event));
+
+    await fakeLlama.waitForPause("repeated-final-token");
+    await expect.poll(() => fakeLlama.requests.length).toBe(3);
+    await expect.poll(() => events.filter((event) => event.type === "reasoning.delta").map((event) => event.text).join("")).toBe("Must keep concise, answer with greeting.");
+    await expect.poll(() => events.filter((event) => event.type === "assistant.delta").map((event) => event.text).join("")).toBe("Hi");
+    fakeLlama.release("repeated-final-token");
+    await run;
+
+    expect(events.filter((event) => event.type === "assistant.delta").map((event) => event.text).join("")).toBe("Hi");
+    expect(events.find((event) => event.type === "final.snapshot")).toMatchObject({ type: "final.snapshot", content: "Hi", reasoning: "Must keep concise, answer with greeting.", malformed: undefined });
+    expect(events.some((event) => event.type === "error")).toBe(false);
+    expect(fakeLlama.requests[1]?.prompt).toContain("<|channel|>analysis<|message|>Must keep concise, <|end|><|start|>assistant<|channel|>final<|message|>");
+    expect(fakeLlama.requests[2]?.prompt).toContain("<|channel|>analysis<|message|>answer with greeting.<|end|><|start|>assistant<|channel|>final<|message|>");
+  } finally {
+    runtime.close();
+    await fakeLlama.close();
+    fs.rmSync(projectDir, { recursive: true, force: true });
+  }
+});
+
+test("real OpenCode GPT-OSS proxy does not invent final content after repeated analysis continuations", async () => {
+  test.setTimeout(120_000);
+  const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-opencode-runtime-repeated-analysis-empty-"));
+  const fakeLlama = await startFakeRawCompletionServer([
+    ["<|channel|>analysis<|message|>Need greeting, "],
+    ["<|channel|>analysis<|message|>keep concise, "],
+    ["<|channel|>analysis<|message|>answer now, "],
+    ["<|channel|>analysis<|message|>still thinking, "],
+    ["<|channel|>analysis<|message|>no final."]
+  ]);
+  const runtime = new RealOpenCodeRuntime();
+  try {
+    const events = await collectOpenCodeEvents(runtime, {
+      cwd: projectDir,
+      prompt: "hi potato",
+      modelLabel: "fake-gpt-oss",
+      nativeGptOss: true,
+      endpoint: {
+        baseUrl: fakeLlama.url,
+        modelId: "fake-gpt-oss",
+        rawCompletionUrl: `${fakeLlama.url}/completion`
+      },
+      settings: baseSettings,
+      permissionMode: "full_access"
+    });
+
+    expect(fakeLlama.requests).toHaveLength(5);
+    expect(events.filter((event) => event.type === "assistant.delta").map((event) => event.text).join("")).toBe("");
+    expect(events.filter((event) => event.type === "reasoning.delta").map((event) => event.text).join("")).toBe("Need greeting, keep concise, answer now, still thinking, no final.");
+    expect(events.find((event) => event.type === "final.snapshot")).toMatchObject({
+      type: "final.snapshot",
+      content: "",
+      reasoning: "Need greeting, keep concise, answer now, still thinking, no final.",
+      malformed: undefined
+    });
+    expect(events.some((event) => event.type === "error")).toBe(false);
+  } finally {
+    runtime.close();
+    await fakeLlama.close();
+    fs.rmSync(projectDir, { recursive: true, force: true });
+  }
+});
+
+test("real OpenCode GPT-OSS proxy streams commentary prose as visible content", async () => {
+  test.setTimeout(90_000);
+  const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-opencode-runtime-commentary-"));
+  const fakeLlama = await startFakeRawCompletionServer([
+    [
+      "<|channel|>analysis<|message|>Need acknowledgement.",
+      "<|end|><|start|>assistant<|channel|>commentary to=commentary<|message|>",
+      { content: "Ok", pauseAfter: "commentary-token" },
+      "<|return|>"
+    ]
+  ]);
+  const runtime = new RealOpenCodeRuntime();
+  try {
+    const events: OpenCodeRuntimeEvent[] = [];
+    const run = collectOpenCodeEvents(runtime, {
+      cwd: projectDir,
+      prompt: "use caveman speak during reasoning",
+      modelLabel: "fake-gpt-oss",
+      nativeGptOss: true,
+      endpoint: {
+        baseUrl: fakeLlama.url,
+        modelId: "fake-gpt-oss",
+        rawCompletionUrl: `${fakeLlama.url}/completion`
+      },
+      settings: baseSettings,
+      permissionMode: "full_access"
+    }, (event) => events.push(event));
+
+    await fakeLlama.waitForPause("commentary-token");
+    await expect.poll(() => events.filter((event) => event.type === "reasoning.delta").map((event) => event.text).join("")).toBe("Need acknowledgement.");
+    await expect.poll(() => events.filter((event) => event.type === "assistant.delta").map((event) => event.text).join("")).toBe("Ok");
+    fakeLlama.release("commentary-token");
+    await run;
+
+    expect(fakeLlama.requests).toHaveLength(1);
+    expect(events.filter((event) => event.type === "assistant.delta").map((event) => event.text).join("")).toBe("Ok");
+    expect(events.some((event) => event.type === "timeline" && event.block.kind === "tool")).toBe(false);
+    expect(events.find((event) => event.type === "final.snapshot")).toMatchObject({ type: "final.snapshot", content: "Ok", malformed: undefined });
+    expect(events.some((event) => event.type === "error")).toBe(false);
+  } finally {
+    runtime.close();
+    await fakeLlama.close();
+    fs.rmSync(projectDir, { recursive: true, force: true });
+  }
+});
+
 test("real OpenCode GPT-OSS proxy executes and renders tool calls once", async () => {
   test.setTimeout(120_000);
   const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-opencode-runtime-tool-"));
@@ -251,6 +471,207 @@ test("real OpenCode GPT-OSS proxy executes and renders tool calls once", async (
   }
 });
 
+test("real OpenCode GPT-OSS proxy budgets large webfetch output before post-tool final streaming", async () => {
+  test.setTimeout(120_000);
+  const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-opencode-runtime-tool-budget-"));
+  const contentServer = await startTextServer(Array.from({ length: 2200 }, (_, index) => `Peanut butter source line ${index.toString().padStart(4, "0")} ${"x".repeat(80)}`).join("\n"));
+  const fakeLlama = await startFakeRawCompletionServer([
+    [
+      "<|channel|>analysis<|message|>Need web source.",
+      "<|end|><|start|>assistant<|channel|>commentary to=webfetch code<|message|>",
+      JSON.stringify({ url: contentServer.url, format: "markdown" }),
+      { content: "<|call|>", pauseAfter: "large-webfetch-call" }
+    ],
+    [
+      "<|channel|>analysis<|message|>Tool output enough.",
+      "<|end|><|start|>assistant<|channel|>final<|message|>",
+      { content: "George Washington Carver is often associated with peanut products, but peanut butter predates him.", pauseAfter: "large-webfetch-final" },
+      "<|return|>"
+    ]
+  ]);
+  const runtime = new RealOpenCodeRuntime();
+  try {
+    const events: OpenCodeRuntimeEvent[] = [];
+    const run = collectOpenCodeEvents(runtime, {
+      cwd: projectDir,
+      prompt: "Search the web to see who invented peanut butter, then answer briefly.",
+      modelLabel: "fake-gpt-oss",
+      nativeGptOss: true,
+      endpoint: {
+        baseUrl: fakeLlama.url,
+        modelId: "fake-gpt-oss",
+        rawCompletionUrl: `${fakeLlama.url}/completion`
+      },
+      settings: { ...baseSettings, nCtx: 4096, maxTokens: 256 },
+      permissionMode: "full_access"
+    }, (event) => events.push(event));
+
+    await fakeLlama.waitForPause("large-webfetch-call");
+    await expect.poll(() => events.some((event) => event.type === "timeline" && event.eventType === "item.started" && event.block.kind === "tool" && event.block.toolName === "webfetch")).toBe(true);
+    fakeLlama.release("large-webfetch-call");
+    await fakeLlama.waitForPause("large-webfetch-final");
+    await expect.poll(() => fakeLlama.requests.length).toBe(2);
+    expect(fakeLlama.requests[1]?.prompt).toContain("# OpenCode Tool Result");
+    expect(fakeLlama.requests[1]?.prompt).toContain("OpenCode tool result truncated to fit the local model context window");
+    expect(fakeLlama.requests[1]?.nPredict).toBeGreaterThan(0);
+    await expect.poll(() => events.filter((event) => event.type === "assistant.delta").map((event) => event.text).join("")).toContain("peanut butter predates him");
+    fakeLlama.release("large-webfetch-final");
+    await run;
+
+    const toolEvents = events.filter((event) => event.type === "timeline" && event.block.kind === "tool");
+    expect(toolEvents.filter((event) => event.eventType === "item.started")).toHaveLength(1);
+    expect(toolEvents.filter((event) => event.eventType === "item.completed")).toHaveLength(1);
+    expect(events.filter((event) => event.type === "assistant.delta").map((event) => event.text).join("")).toContain("peanut butter predates him");
+    expect(events.find((event) => event.type === "final.snapshot")).toMatchObject({ type: "final.snapshot", malformed: undefined });
+    expect(events.some((event) => event.type === "error")).toBe(false);
+  } finally {
+    runtime.close();
+    await fakeLlama.close();
+    await contentServer.close();
+    fs.rmSync(projectDir, { recursive: true, force: true });
+  }
+});
+
+test("OpenCode GPT-OSS proxy prompt keeps completion budget when tool results are huge", () => {
+  const prompt = renderGptOssOpenCodeProxyPrompt({
+    messages: [
+      { role: "user", content: "search the web to see who invented peanut butter" },
+      {
+        role: "assistant",
+        content: "[[UNIT0_ANALYSIS]]Need web info.[[UNIT0_FINAL]]",
+        tool_calls: [{
+          id: "call_large",
+          type: "function",
+          function: { name: "webfetch", arguments: "{\"url\":\"https://example.com\",\"format\":\"markdown\"}" }
+        }]
+      },
+      { role: "tool", tool_call_id: "call_large", content: "A".repeat(80_000) }
+    ],
+    tools: [{ type: "function", function: { name: "webfetch", parameters: { type: "object" } } }]
+  }, {
+    cwd: "C:\\Project",
+    prompt: "search the web to see who invented peanut butter",
+    modelLabel: "fake-gpt-oss",
+    nativeGptOss: true,
+    endpoint: { baseUrl: "http://127.0.0.1:1234", modelId: "fake-gpt-oss" },
+    settings: { ...baseSettings, nCtx: 4096, maxTokens: 256 },
+    permissionMode: "full_access"
+  });
+
+  expect(prompt).toContain("# OpenCode Tool Result");
+  expect(prompt).toContain("OpenCode tool result truncated to fit the local model context window");
+  expect(gptOssOpenCodeRequestMaxTokens(prompt, { ...baseSettings, nCtx: 4096, maxTokens: 256 })).toBeGreaterThan(0);
+});
+
+test("real OpenCode GPT-OSS proxy does not force final continuation after terminal-suppressed tool calls", async () => {
+  test.setTimeout(120_000);
+  const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-opencode-runtime-tool-no-call-"));
+  fs.writeFileSync(path.join(projectDir, "alpha.txt"), "alpha\n");
+  fs.writeFileSync(path.join(projectDir, "beta.txt"), "beta\n");
+  const fakeLlama = await startFakeRawCompletionServer([
+    [
+      "<|channel|>analysis<|message|>Need files.",
+      "<|end|><|start|>assistant<|channel|>commentary to=glob code<|message|>",
+      "{\"pattern\":\"*\"}"
+    ],
+    [
+      "<|channel|>analysis<|message|>Got files.",
+      "<|end|><|start|>assistant<|channel|>final<|message|>",
+      "alpha.txt beta.txt",
+      "<|return|>"
+    ]
+  ]);
+  const runtime = new RealOpenCodeRuntime();
+  try {
+    const events: OpenCodeRuntimeEvent[] = [];
+    await collectOpenCodeEvents(runtime, {
+      cwd: projectDir,
+      prompt: "Use search to list files here, then answer with the file names.",
+      modelLabel: "fake-gpt-oss",
+      nativeGptOss: true,
+      endpoint: {
+        baseUrl: fakeLlama.url,
+        modelId: "fake-gpt-oss",
+        rawCompletionUrl: `${fakeLlama.url}/completion`
+      },
+      settings: baseSettings,
+      permissionMode: "full_access"
+    }, (event) => events.push(event));
+
+    const assistantText = events.filter((event) => event.type === "assistant.delta").map((event) => event.text).join("");
+    expect(assistantText).toContain("alpha.txt");
+    expect(assistantText).toContain("beta.txt");
+    const toolEvents = events.filter((event) => event.type === "timeline" && event.block.kind === "tool");
+    expect(toolEvents.filter((event) => event.eventType === "item.started")).toHaveLength(1);
+    expect(toolEvents.filter((event) => event.eventType === "item.completed")).toHaveLength(1);
+    expect(fakeLlama.requests).toHaveLength(2);
+    expect(fakeLlama.requests[1]?.prompt).toContain("# OpenCode Tool Result");
+    expect(fakeLlama.requests[1]?.prompt).toContain("alpha.txt");
+    expect(fakeLlama.requests[1]?.prompt).not.toContain("<|channel|>final<|message|>");
+    expect(events.some((event) => event.type === "error")).toBe(false);
+  } finally {
+    runtime.close();
+    await fakeLlama.close();
+    fs.rmSync(projectDir, { recursive: true, force: true });
+  }
+});
+
+test("real OpenCode GPT-OSS proxy streams commentary preambles before tool calls", async () => {
+  test.setTimeout(120_000);
+  const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-opencode-runtime-tool-preamble-"));
+  fs.writeFileSync(path.join(projectDir, "alpha.txt"), "alpha\n");
+  const fakeLlama = await startFakeRawCompletionServer([
+    [
+      "<|channel|>analysis<|message|>Need files.",
+      "<|end|><|start|>assistant<|channel|>commentary<|message|>",
+      "I will list files.",
+      "<|end|><|start|>assistant<|channel|>commentary to=glob code<|message|>",
+      "{\"pattern\":\"*\"}<|call|>"
+    ],
+    [
+      "<|channel|>analysis<|message|>Got files.",
+      "<|end|><|start|>assistant<|channel|>final<|message|>",
+      "alpha.txt",
+      "<|return|>"
+    ]
+  ]);
+  const runtime = new RealOpenCodeRuntime();
+  try {
+    const events: OpenCodeRuntimeEvent[] = [];
+    await collectOpenCodeEvents(runtime, {
+      cwd: projectDir,
+      prompt: "List files here.",
+      modelLabel: "fake-gpt-oss",
+      nativeGptOss: true,
+      endpoint: {
+        baseUrl: fakeLlama.url,
+        modelId: "fake-gpt-oss",
+        rawCompletionUrl: `${fakeLlama.url}/completion`
+      },
+      settings: baseSettings,
+      permissionMode: "full_access"
+    }, (event) => events.push(event));
+
+    const assistantText = events.filter((event) => event.type === "assistant.delta").map((event) => event.text).join("");
+    expect(assistantText).toContain("I will list files.");
+    expect(assistantText).toContain("alpha.txt");
+    const preambleIndex = events.findIndex((event) => event.type === "assistant.delta" && event.text.includes("I will list files."));
+    const toolStartedIndex = events.findIndex((event) => event.type === "timeline" && event.eventType === "item.started" && event.block.kind === "tool");
+    const postToolReasoningIndex = events.findIndex((event) => event.type === "reasoning.delta" && event.text.includes("Got files."));
+    const finalIndex = events.findIndex((event) => event.type === "assistant.delta" && event.text.includes("alpha.txt"));
+    expect(preambleIndex).toBeGreaterThan(-1);
+    expect(toolStartedIndex).toBeGreaterThan(preambleIndex);
+    expect(postToolReasoningIndex).toBeGreaterThan(toolStartedIndex);
+    expect(finalIndex).toBeGreaterThan(postToolReasoningIndex);
+    expect(fakeLlama.requests).toHaveLength(2);
+    expect(events.some((event) => event.type === "error")).toBe(false);
+  } finally {
+    runtime.close();
+    await fakeLlama.close();
+    fs.rmSync(projectDir, { recursive: true, force: true });
+  }
+});
+
 test("real OpenCode GPT-OSS proxy renders question tool calls as questions", async () => {
   test.setTimeout(120_000);
   const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-opencode-runtime-question-"));
@@ -327,12 +748,12 @@ async function collectOpenCodeEvents(runtime: RealOpenCodeRuntime, options: Open
 
 async function startFakeRawCompletionServer(responses: FakeChunk[][]): Promise<{
   url: string;
-  requests: Array<{ prompt: string }>;
+  requests: Array<{ prompt: string; nPredict: number }>;
   waitForPause: (label: string) => Promise<void>;
   release: (label: string) => void;
   close: () => Promise<void>;
 }> {
-  const requests: Array<{ prompt: string }> = [];
+  const requests: Array<{ prompt: string; nPredict: number }> = [];
   const pauses = new Map<string, { paused: Promise<void>; released: Promise<void>; release: () => void; resolvePaused: () => void }>();
   let requestIndex = 0;
   const pauseState = (label: string) => {
@@ -359,7 +780,7 @@ async function startFakeRawCompletionServer(responses: FakeChunk[][]): Promise<{
         return;
       }
       const body = await readRequestJson(request);
-      requests.push({ prompt: typeof body.prompt === "string" ? body.prompt : "" });
+      requests.push({ prompt: typeof body.prompt === "string" ? body.prompt : "", nPredict: typeof body.n_predict === "number" ? body.n_predict : 0 });
       const chunks = responses[Math.min(requestIndex, responses.length - 1)] ?? [];
       requestIndex += 1;
       response.writeHead(200, {
@@ -397,6 +818,25 @@ async function startFakeRawCompletionServer(responses: FakeChunk[][]): Promise<{
     requests,
     waitForPause: (label: string) => pauseState(label).paused,
     release: (label: string) => pauseState(label).release(),
+    close: () => closeServer(server)
+  };
+}
+
+async function startTextServer(content: string): Promise<{ url: string; close: () => Promise<void> }> {
+  const server = http.createServer((_, response) => {
+    response.writeHead(200, { "Content-Type": "text/markdown; charset=utf-8" });
+    response.end(content);
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => resolve());
+  });
+  const address = server.address();
+  if (!address || typeof address === "string") {
+    throw new Error("Text server did not bind a TCP port.");
+  }
+  return {
+    url: `http://127.0.0.1:${address.port}/large.md`,
     close: () => closeServer(server)
   };
 }

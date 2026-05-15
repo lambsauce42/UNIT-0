@@ -233,7 +233,7 @@ export interface ChatAppSettings {
 export interface ChatSettingsPreset {
   id: string;
   label: string;
-  runtimeSettings: ChatRuntimeSettings;
+  runtimeSettings: Omit<ChatRuntimeSettings, "permissionMode">;
   providerMode: ChatProviderMode;
   iconName: string;
   builtinModelId: string;

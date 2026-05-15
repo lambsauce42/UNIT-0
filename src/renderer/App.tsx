@@ -205,8 +205,8 @@ const BrandPresetIcon = (({ size = 24, ...props }: SVGProps<SVGSVGElement> & { s
 )) as LucideIcon;
 
 const OpenAIPresetIcon = (({ size = 24, ...props }: SVGProps<SVGSVGElement> & { size?: string | number }) => (
-  <svg {...props} width={size} height={size} viewBox="136 217 288 286" fill="none" aria-hidden="true">
-    <path d="M249.176 323.434V298.276C249.176 296.158 249.971 294.569 251.825 293.509L302.406 264.381C309.29 260.409 317.5 258.555 325.973 258.555C357.75 258.555 377.877 283.185 377.877 309.399C377.877 311.253 377.877 313.371 377.611 315.49L325.178 284.771C322.001 282.919 318.822 282.919 315.645 284.771L249.176 323.434ZM367.283 421.415V361.301C367.283 357.592 365.694 354.945 362.516 353.092L296.048 314.43L317.763 301.982C319.617 300.925 321.206 300.925 323.058 301.982L373.639 331.112C388.205 339.586 398.003 357.592 398.003 375.069C398.003 395.195 386.087 413.733 367.283 421.412V421.415ZM233.553 368.452L211.838 355.742C209.986 354.684 209.19 353.095 209.19 350.975V292.718C209.19 264.383 230.905 242.932 260.301 242.932C271.423 242.932 281.748 246.641 290.49 253.26L238.321 283.449C235.146 285.303 233.555 287.951 233.555 291.659V368.455L233.553 368.452ZM280.292 395.462L249.176 377.985V340.913L280.292 323.436L311.407 340.913V377.985L280.292 395.462ZM300.286 475.968C289.163 475.968 278.837 472.259 270.097 465.64L322.264 435.449C325.441 433.597 327.03 430.949 327.03 427.239V350.445L349.011 363.155C350.865 364.213 351.66 365.802 351.66 367.922V426.179C351.66 454.514 329.679 475.965 300.286 475.965V475.968ZM237.525 416.915L186.944 387.785C172.378 379.31 162.582 343.827C162.582 323.436 174.763 305.164 193.563 297.485V357.861C193.563 361.571 195.154 364.217 198.33 366.071L264.535 404.467L242.82 416.915C240.967 417.972 239.377 417.972 237.525 416.915ZM234.614 460.343C204.689 460.343 182.71 437.833 182.71 410.028C182.71 407.91 182.976 405.792 183.238 403.672L235.405 433.863C238.582 435.715 241.763 435.715 244.938 433.863L311.407 395.466V420.622C311.407 422.742 310.612 424.331 308.758 425.389L258.179 454.519C251.293 458.491 243.083 460.343 234.611 460.343H234.614ZM300.286 491.854C332.329 491.854 359.073 469.082 365.167 438.892C394.825 431.211 413.892 403.406 413.892 375.073C413.892 356.535 405.948 338.529 391.648 325.552C392.972 319.991 393.766 314.43 393.766 308.87C393.766 271.003 363.048 242.666 327.562 242.666C320.413 242.666 313.528 243.723 306.644 246.109C294.725 234.457 278.307 227.042 260.301 227.042C228.258 227.042 201.513 249.815 195.42 280.004C165.761 287.685 146.694 315.49 146.694 343.824C146.694 362.362 154.638 380.368 168.938 393.344C167.613 398.906 166.819 404.467 166.819 410.027C166.819 447.894 197.538 476.231 233.024 476.231C240.172 476.231 247.058 475.173 253.943 472.788C265.859 484.441 282.278 491.854 300.286 491.854Z" fill="currentColor" />
+  <svg {...props} width={size} height={size} viewBox="0 0 20 20" aria-hidden="true">
+    <path d="M11.248 18.25q-.825 0-1.568-.314a4.3 4.3 0 0 1-1.32-.874 4 4 0 0 1-1.304.214 4 4 0 0 1-2.046-.544 4.27 4.27 0 0 1-1.518-1.485 4 4 0 0 1-.56-2.095q0-.48.131-1.04A4.4 4.4 0 0 1 2.04 10.71a4.07 4.07 0 0 1 .017-3.4 4.2 4.2 0 0 1 1.056-1.418 3.8 3.8 0 0 1 1.6-.842 3.9 3.9 0 0 1 .76-1.683q.593-.759 1.451-1.188a4.04 4.04 0 0 1 1.832-.429q.825 0 1.567.313.742.314 1.32.875a4 4 0 0 1 1.304-.215q1.106 0 2.046.545a4.14 4.14 0 0 1 1.501 1.485q.578.941.578 2.095 0 .48-.132 1.04.66.61 1.023 1.419.363.792.363 1.666 0 .892-.38 1.717a4.3 4.3 0 0 1-1.072 1.435 3.8 3.8 0 0 1-1.584.825 3.8 3.8 0 0 1-.775 1.683 4.06 4.06 0 0 1-1.436 1.188 4.04 4.04 0 0 1-1.832.429m-4.076-2.062q.825 0 1.435-.347l3.103-1.782a.36.36 0 0 0 .164-.313v-1.42L7.881 14.62a.67.67 0 0 1-.726 0l-3.118-1.798a.5.5 0 0 1-.017.115v.198q0 .841.396 1.551.413.693 1.139 1.089a3.2 3.2 0 0 0 1.617.412m.165-2.69a.4.4 0 0 0 .181.05q.083 0 .165-.05l1.238-.71-3.977-2.31a.7.7 0 0 1-.363-.643v-3.58q-.825.362-1.32 1.122a2.9 2.9 0 0 0-.495 1.65q0 .809.413 1.55.412.743 1.072 1.123zm3.91 3.663q.875 0 1.585-.396a2.96 2.96 0 0 0 1.534-2.64v-3.564a.32.32 0 0 0-.165-.297l-1.254-.726v4.604a.7.7 0 0 1-.363.643l-3.119 1.799a3 3 0 0 0 1.783.577m.627-6.039V8.878L10.01 7.822 8.129 8.878v2.244l1.881 1.056zM7.057 5.859a.7.7 0 0 1 .363-.644l3.119-1.798a3 3 0 0 0-1.782-.578q-.874 0-1.584.396A2.96 2.96 0 0 0 6.05 4.324a3.07 3.07 0 0 0-.396 1.551v3.547q0 .199.165.314l1.237.726zm8.383 7.887q.825-.364 1.303-1.123.495-.758.495-1.65a3.15 3.15 0 0 0-.412-1.55q-.413-.743-1.073-1.123l-3.086-1.782q-.099-.065-.181-.049a.3.3 0 0 0-.165.05l-1.238.692 3.993 2.327a.6.6 0 0 1 .264.264.64.64 0 0 1 .1.363zm-3.317-8.382a.63.63 0 0 1 .726 0l3.135 1.831v-.297q0-.792-.396-1.501a2.86 2.86 0 0 0-1.105-1.155q-.71-.43-1.65-.43-.825 0-1.436.347L8.294 5.941a.36.36 0 0 0-.165.314v1.418z" fill="currentColor" />
   </svg>
 )) as LucideIcon;
 
@@ -4857,6 +4857,7 @@ function ChatSettingSelect({
 type ChatMarkdownRenderEnv = {
   copiedCodeBlockIds?: ReadonlySet<string>;
   footnoteScope: string;
+  literalLinks?: boolean;
 };
 
 const chatMarkdown = MarkdownIt({
@@ -4884,11 +4885,19 @@ chatMarkdown.renderer.rules.table_open = () => '<div class="chat-markdown-table-
 chatMarkdown.renderer.rules.table_close = () => "</table></div>";
 
 const defaultLinkOpenRenderer = chatMarkdown.renderer.rules.link_open ?? ((tokens, index, options, env, self) => self.renderToken(tokens, index, options));
+const defaultLinkCloseRenderer = chatMarkdown.renderer.rules.link_close ?? ((tokens, index, options, env, self) => self.renderToken(tokens, index, options));
 chatMarkdown.renderer.rules.link_open = (tokens, index, options, env, self) => {
+  if ((env as ChatMarkdownRenderEnv).literalLinks) {
+    return "";
+  }
   tokens[index].attrSet("target", "_blank");
   tokens[index].attrSet("rel", "noreferrer");
   return defaultLinkOpenRenderer(tokens, index, options, env, self);
 };
+
+chatMarkdown.renderer.rules.link_close = (tokens, index, options, env, self) => (
+  (env as ChatMarkdownRenderEnv).literalLinks ? "" : defaultLinkCloseRenderer(tokens, index, options, env, self)
+);
 
 function ChatSurface() {
   const [chatState, setChatState] = useState<ChatState | null>(null);
@@ -5042,7 +5051,7 @@ function ChatSurface() {
     ? (threadUsesCodex ? reasoningLabel(selectedThread.codexReasoningEffort) : runtimeReasoningLabel(fallbackRuntimeSettings))
     : "Medium";
   const permissionButtonLabel = selectedThread && fallbackRuntimeSettings
-    ? (threadUsesCodex ? permissionLabel(codexAccessModeForApprovalMode(selectedThread.codexApprovalMode)) : permissionLabel(fallbackRuntimeSettings.permissionMode))
+    ? (threadUsesCodex ? permissionLabel(codexAccessModeForApprovalMode(selectedThread.codexApprovalMode)) : permissionLabel(selectedThread.permissionMode))
     : "Full access";
   const permissionButtonTone = permissionButtonLabel === "Full access" ? "full-access" : "default-access";
   const PermissionButtonIcon = permissionButtonLabel === "Full access" ? LockOpen : ShieldCheck;
@@ -6419,7 +6428,7 @@ function ChatDropUpMenu({
   const activeBuiltinModels = activeBuiltinFramework === "opencode"
     ? chatState.models.filter((model) => model.providerId !== "remote")
     : chatState.models;
-  const activePermissionMode = activeRuntimeSettings.permissionMode;
+  const activePermissionMode = activeThread?.permissionMode ?? activeRuntimeSettings.permissionMode;
   const activeAccessMode = activeUsesCodex && activeThread ? codexAccessModeForApprovalMode(activeThread.codexApprovalMode) : activePermissionMode;
   const activeReasoningEffort = activeUsesCodex ? activeThread?.codexReasoningEffort : activeRuntimeSettings.reasoningEffort;
   const selectedThread = menu.kind === "thread" ? chatState.threads.find((thread) => thread.id === menu.threadId) : null;
@@ -6644,7 +6653,16 @@ function ChatDropUpMenu({
                   }));
                 } else {
                   void onRun(async () => {
-                    await window.unitApi.chat.updateRuntimeSettings({ settings: { permissionMode: option.id } });
+                    if (activeThread) {
+                      await window.unitApi.chat.updateThreadSettings({
+                        threadId: activeThread.id,
+                        permissionMode: option.id,
+                        runtimeSettings: { permissionMode: option.id },
+                        codexApprovalMode: codexApprovalModeForAccessMode(option.id)
+                      });
+                    } else {
+                      await window.unitApi.chat.updateRuntimeSettings({ settings: { permissionMode: option.id } });
+                    }
                     return window.unitApi.chat.bootstrap();
                   });
                 }
@@ -6856,6 +6874,9 @@ function ChatDialog({
   const [presetEmbeddingModelPath, setPresetEmbeddingModelPath] = useState(() => initialSettingsPresetEmbeddingModelPath(dialog, state));
   const [documentIndexPaths, setDocumentIndexPaths] = useState<string[]>(() => initialDocumentIndexPaths(dialog, state));
   const dialogKey = chatDialogKey(dialog);
+  const setDialogProviderMode = (value: ChatProviderMode) => {
+    setThreadProviderMode(value);
+  };
 
   useEffect(() => {
     setTitle(initialChatDialogTitle(dialog, state));
@@ -7130,7 +7151,7 @@ function ChatDialog({
                 label="Provider"
                 value={threadProviderMode}
                 options={[{ value: "builtin", label: "Built-in model" }, { value: "codex", label: "Codex" }]}
-                onChange={(value) => setThreadProviderMode(value as ChatProviderMode)}
+                onChange={(value) => setDialogProviderMode(value as ChatProviderMode)}
               />
             </section>
             <section className="chat-settings-section">
@@ -7168,17 +7189,6 @@ function ChatDialog({
                   value={threadCodexReasoningEffort}
                   options={reasoningOptions(state.codexModels.find((model) => model.id === threadCodexModelId)?.reasoningEfforts ?? ["low", "medium", "high"])}
                   onChange={(value) => setThreadCodexReasoningEffort(value as ChatReasoningEffort)}
-                />
-                <ChatSettingSelect
-                  label="Access"
-                  value={codexAccessModeForApprovalMode(threadCodexApprovalMode)}
-                  options={CHAT_PERMISSION_OPTIONS.map((option) => ({ value: option.id, label: option.label }))}
-                  onChange={(value) => {
-                    const nextAccess = value as ChatPermissionMode;
-                    setThreadPermissionMode(nextAccess);
-                    setThreadCodexApprovalMode(codexApprovalModeForAccessMode(nextAccess));
-                    setSettings({ ...settings, permissionMode: nextAccess });
-                  }}
                 />
               </div>
             </section>
@@ -7221,12 +7231,6 @@ function ChatDialog({
                   value={settings.reasoningEffort}
                   options={reasoningOptions(["low", "medium", "high"])}
                   onChange={(value) => setSettings({ ...settings, reasoningEffort: value })}
-                />
-                <ChatSettingSelect
-                  label="Access"
-                  value={settings.permissionMode}
-                  options={[{ value: "default_permissions", label: "Default" }, { value: "full_access", label: "Full access" }]}
-                  onChange={(value) => setSettings({ ...settings, permissionMode: value })}
                 />
               </div>
               <div className="chat-settings-row">
@@ -7560,7 +7564,7 @@ function ChatDialog({
                 ariaLabel="Thread provider"
                 value={threadProviderMode}
                 options={[{ value: "builtin", label: "Built-in model" }, { value: "codex", label: "Codex" }]}
-                onChange={(value) => setThreadProviderMode(value as ChatProviderMode)}
+                onChange={(value) => setDialogProviderMode(value as ChatProviderMode)}
               />
             </section>
             {threadProviderMode === "codex" ? (
@@ -7606,6 +7610,7 @@ function ChatDialog({
                     const nextAccess = value as ChatPermissionMode;
                     setThreadPermissionMode(nextAccess);
                     setThreadCodexApprovalMode(codexApprovalModeForAccessMode(nextAccess));
+                    setSettings({ ...settings, permissionMode: nextAccess });
                   }}
                 />
                 <label className="chat-settings-check">
@@ -7692,7 +7697,12 @@ function ChatDialog({
                   ariaLabel="Thread permissions"
                   value={settings.permissionMode}
                   options={[{ value: "default_permissions", label: "Default" }, { value: "full_access", label: "Full access" }]}
-                  onChange={(value) => setSettings({ ...settings, permissionMode: value })}
+                  onChange={(value) => {
+                    const nextAccess = value as ChatPermissionMode;
+                    setThreadPermissionMode(nextAccess);
+                    setThreadCodexApprovalMode(codexApprovalModeForAccessMode(nextAccess));
+                    setSettings({ ...settings, permissionMode: nextAccess });
+                  }}
                 />
               </div>
               <div className="chat-settings-row">
@@ -7994,7 +8004,7 @@ function initialRuntimeSettingsForm(dialog: ChatDialogState, state: ChatState): 
   if (dialog?.kind === "settings-preset" && dialog.presetId) {
     const preset = state.settingsPresets.find((candidate) => candidate.id === dialog.presetId);
     if (preset) {
-      return runtimeSettingsToForm(preset.runtimeSettings);
+      return runtimeSettingsToForm({ ...state.runtimeSettings, ...preset.runtimeSettings });
     }
   }
   return runtimeSettingsToForm(state.runtimeSettings);
@@ -8060,9 +8070,10 @@ function initialThreadPermissionMode(dialog: ChatDialogState, state: ChatState):
 }
 
 function initialThreadCodexApprovalMode(dialog: ChatDialogState, state: ChatState): ChatCodexApprovalMode {
-  return dialog?.kind === "thread-settings"
-    ? state.threads.find((thread) => thread.id === dialog.threadId)?.codexApprovalMode ?? "default"
-    : "default";
+  if (dialog?.kind === "thread-settings") {
+    return state.threads.find((thread) => thread.id === dialog.threadId)?.codexApprovalMode ?? "default";
+  }
+  return "default";
 }
 
 function initialThreadPlanModeEnabled(dialog: ChatDialogState, state: ChatState) {
@@ -8310,7 +8321,7 @@ function ChatReasoningDisclosure({
   const disclosureIdRef = useRef(disclosureId);
   const detailsRef = useRef<HTMLDetailsElement | null>(null);
   const panelRef = useRef<HTMLDivElement | null>(null);
-  const reasoningHtml = renderChatMarkdownHtml(reasoning, disclosureId, copiedCodeBlockIds);
+  const reasoningHtml = renderChatMarkdownHtml(reasoning, disclosureId, copiedCodeBlockIds, { literalLinks: true });
 
   useEffect(() => {
     if (disclosureIdRef.current !== disclosureId) {
@@ -9021,12 +9032,12 @@ function attachmentPreviewSrc(filePath: string) {
   return normalized.startsWith("/") ? `file://${normalized}` : `file:///${normalized}`;
 }
 
-function renderChatMarkdownHtml(markdown: string, footnoteScope: string, copiedCodeBlockIds?: ReadonlySet<string>) {
+function renderChatMarkdownHtml(markdown: string, footnoteScope: string, copiedCodeBlockIds?: ReadonlySet<string>, options: { literalLinks?: boolean } = {}) {
   if (!markdown.trim()) {
     return "";
   }
   const { source, replacements } = extractChatMath(markdown);
-  let html = chatMarkdown.render(source, { copiedCodeBlockIds, footnoteScope } satisfies ChatMarkdownRenderEnv);
+  let html = chatMarkdown.render(source, { copiedCodeBlockIds, footnoteScope, literalLinks: options.literalLinks } satisfies ChatMarkdownRenderEnv);
   html = scopeChatFootnotes(html, footnoteScope);
   for (const replacement of replacements) {
     if (replacement.kind === "display") {

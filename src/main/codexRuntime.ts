@@ -87,6 +87,13 @@ export interface CodexRuntime {
   close(): void;
 }
 
+export function effectiveCodexApprovalPolicy(options: Pick<CodexRunOptions, "permissionMode" | "approvalMode">): ChatCodexApprovalMode | undefined {
+  if (options.permissionMode === "full_access") {
+    return "never";
+  }
+  return options.approvalMode === "default" ? undefined : options.approvalMode;
+}
+
 export class MockCodexRuntime implements CodexRuntime {
   private cancelled = false;
   private active = false;
@@ -377,15 +384,7 @@ export class CodexAppServerRuntime implements CodexRuntime {
       : await this.startThread(connection, options);
     this.activeThreadId = threadId;
     yield { type: "thread.started", thread_id: threadId };
-    const turn = await connection.request("turn/start", {
-      threadId,
-      input: codexInputItems(options),
-      model: options.model,
-      effort: options.reasoningEffort,
-      approvalPolicy: options.approvalMode === "default" ? undefined : options.approvalMode,
-      sandboxPolicy: options.permissionMode === "full_access" ? { type: "dangerFullAccess" } : undefined,
-      collaborationMode: collaborationModePayload(options)
-    });
+    const turn = await connection.request("turn/start", codexTurnStartPayload(threadId, options));
     const turnRecord = turn.turn;
     this.activeTurnId = isRecord(turnRecord) ? String(turnRecord.id ?? "") : "";
     if (!this.activeTurnId) {
@@ -519,7 +518,7 @@ export class CodexAppServerRuntime implements CodexRuntime {
       cwd: options.cwd,
       model: options.model,
       baseInstructions: options.baseInstructions?.trim() || undefined,
-      approvalPolicy: options.approvalMode === "default" ? undefined : options.approvalMode
+      approvalPolicy: effectiveCodexApprovalPolicy(options)
     });
     const thread = response.thread;
     const id = isRecord(thread) ? String(thread.id ?? "") : "";
@@ -535,7 +534,7 @@ export class CodexAppServerRuntime implements CodexRuntime {
       cwd: options.cwd,
       model: options.model,
       baseInstructions: options.baseInstructions?.trim() || undefined,
-      approvalPolicy: options.approvalMode === "default" ? undefined : options.approvalMode
+      approvalPolicy: effectiveCodexApprovalPolicy(options)
     });
     const thread = response.thread;
     const id = isRecord(thread) ? String(thread.id ?? options.resumeThreadId ?? "") : options.resumeThreadId ?? "";
@@ -650,6 +649,18 @@ export class CodexAppServerRuntime implements CodexRuntime {
   }
 }
 
+export function codexTurnStartPayload(threadId: string, options: CodexRunOptions): Record<string, unknown> {
+  return {
+    threadId,
+    input: codexInputItems(options),
+    model: options.model,
+    effort: options.reasoningEffort,
+    approvalPolicy: effectiveCodexApprovalPolicy(options),
+    sandboxPolicy: options.permissionMode === "full_access" ? { type: "dangerFullAccess" } : undefined,
+    collaborationMode: collaborationModePayload(options)
+  };
+}
+
 export class CodexCliRuntime implements CodexRuntime {
   private activeProcess: ChildProcessWithoutNullStreams | null = null;
 
@@ -719,7 +730,7 @@ export function buildCodexExecCommand(options: CodexRunOptions): { command: stri
   for (const imagePath of options.imagePaths ?? []) {
     args.push("--image", imagePath);
   }
-  if (options.approvalMode !== "default") {
+  if (options.permissionMode !== "full_access" && options.approvalMode !== "default") {
     args.push("-c", `approval_policy=${options.approvalMode}`);
   }
   if (options.permissionMode === "full_access") {
