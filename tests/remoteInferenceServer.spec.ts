@@ -49,7 +49,8 @@ test("remote GPT-OSS chat preserves spaces, linebreaks, and reasoning split", as
     "```\nHello",
     ", world!\n\nLine two with  double spaces.",
     "<|ret",
-    "urn|>"
+    "urn|>",
+    "leaked"
   ]);
   try {
     const result = await runRemoteChat(harness.remotePort, "chat", [
@@ -58,6 +59,7 @@ test("remote GPT-OSS chat preserves spaces, linebreaks, and reasoning split", as
 
     expect(result.content).toBe("\n\n```ts\n  const value = 42;\n```\nHello, world!\n\nLine two with  double spaces.");
     expect(result.reasoning).toBe("\n  Need space.\nNext thought.");
+    expect(result.content).not.toContain("leaked");
     expect(result.content).not.toContain("<|");
     expect(harness.requests[0].body.prompt).toContain("No tools or external recipients are available in this chat.");
     expect(harness.requests[0].body.prompt).toContain("Do not emit commentary to tools, files, browsers, functions, repo_browser, or any recipient other than final.");
@@ -105,6 +107,57 @@ test("remote GPT-OSS OpenCode uses local-equivalent prompt and shell tool parsin
     expect(prompt).toContain("# Host Shell Result\nThis tool output was injected by the host, not authored by the user.\n<tool_result>\nTool result:\nstdout:\nnone\nstderr: (empty)\n</tool_result>");
   } finally {
     await harness.close();
+  }
+});
+
+test("remote GPT-OSS parser stops after terminal tool-call markers", async () => {
+  const harness = await startRemoteHarness([
+    '<|channel|>commentary to=shell <|constrain|>json<|message|>{"command":"rg -n TODO src"}<|call|>leaked'
+  ]);
+  try {
+    const result = await runRemoteChat(harness.remotePort, "opencode", [
+      { role: "user", content: "Inspect TODOs" }
+    ]);
+
+    expect(result.content).toBe('<tool_call>{"command":"rg -n TODO src","tool":"shell"}</tool_call>');
+    expect(result.content).not.toContain("leaked");
+  } finally {
+    await harness.close();
+  }
+});
+
+test("remote GPT-OSS parser rejects malformed constrained JSON", async () => {
+  const malformedFinal = await startRemoteHarness([
+    "<|channel|>commentary to=final <|constrain|>json<|message|>{not-json}<|return|>"
+  ]);
+  try {
+    await expect(runRemoteChat(malformedFinal.remotePort, "chat", [
+      { role: "user", content: "hi" }
+    ])).rejects.toThrow("malformed constrained final JSON");
+  } finally {
+    await malformedFinal.close();
+  }
+
+  const malformedTool = await startRemoteHarness([
+    "<|channel|>commentary to=shell <|constrain|>json<|message|>{not-json}<|call|>"
+  ]);
+  try {
+    await expect(runRemoteChat(malformedTool.remotePort, "opencode", [
+      { role: "user", content: "Inspect TODOs" }
+    ])).rejects.toThrow("malformed tool-call JSON");
+  } finally {
+    await malformedTool.close();
+  }
+
+  const unknownTool = await startRemoteHarness([
+    '<|channel|>commentary to=unknown <|constrain|>json<|message|>{"command":"dir"}<|call|>'
+  ]);
+  try {
+    await expect(runRemoteChat(unknownTool.remotePort, "opencode", [
+      { role: "user", content: "Inspect TODOs" }
+    ])).rejects.toThrow("unsupported commentary recipient");
+  } finally {
+    await unknownTool.close();
   }
 });
 

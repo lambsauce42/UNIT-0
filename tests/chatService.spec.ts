@@ -854,6 +854,91 @@ test("completes OpenCode answer-only turns without requiring reasoning", async (
   }
 });
 
+test("requires streamed reasoning for native GPT-OSS OpenCode turns", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-opencode-gptoss-reasoning-required-test-"));
+  const modelPath = path.join(dir, "gpt-oss-20b-mxfp4.gguf");
+  fs.writeFileSync(modelPath, "");
+  const store = new ChatStore(path.join(dir, "chat.sqlite"));
+  const openCodeRuntime = new ScriptedOpenCodeRuntime([[
+    { type: "assistant.delta", id: "assistant-1", status: "updated", text: "Hello!" }
+  ]]);
+  const service = new ChatService(store, new EndpointOnlyLlamaRuntime(), new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined, new TestEmbeddingRuntime(), openCodeRuntime);
+  try {
+    let state = store.loadState();
+    store.updateProjectSettings(state.selectedProjectId, "OpenCode GPT-OSS Reasoning Project", dir);
+    store.addLocalModel(modelPath);
+    state = store.loadState();
+    store.updateThreadSettings(state.selectedThreadId, {
+      builtinAgenticFramework: "opencode",
+      builtinModelId: state.selectedModelId
+    });
+
+    await service.submit({ text: "hi" });
+    await expect.poll(() => service.state().generation.status).toBe("error");
+
+    state = store.loadState();
+    const assistant = state.messages.find((message) => message.role === "assistant");
+    expect(assistant?.content).toBe("Hello!");
+    expect(assistant?.status).toBe("error");
+    expect(assistant?.timelineBlocks?.some((block) => block.kind === "status" && block.code === "opencode_failed" && block.message.includes("without streamed reasoning"))).toBe(true);
+  } finally {
+    service.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("streams OpenCode answer and reasoning in upstream chunk order", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-opencode-upstream-stream-test-"));
+  const modelPath = path.join(dir, "model.gguf");
+  fs.writeFileSync(modelPath, "");
+  const store = new ChatStore(path.join(dir, "chat.sqlite"));
+  const openCodeRuntime = new ScriptedOpenCodeRuntime([[
+    { type: "reasoning.delta", id: "reasoning-1", status: "updated", text: "X" },
+    { type: "reasoning.delta", id: "reasoning-1", status: "updated", text: "Y" },
+    { type: "assistant.delta", id: "assistant-1", status: "updated", text: "A" },
+    { type: "assistant.delta", id: "assistant-1", status: "updated", text: "B" },
+    { type: "assistant.delta", id: "assistant-1", status: "updated", text: "C" }
+  ]]);
+  const frames: Array<{ content: string; reasoning: string }> = [];
+  let service: ChatService | null = null;
+  service = new ChatService(store, new EndpointOnlyLlamaRuntime(), new RemoteHostRuntime(), new MockCodexRuntime(), () => {
+    const assistant = service?.state().messages.find((message) => message.role === "assistant");
+    if (assistant) {
+      frames.push({ content: assistant.content, reasoning: assistant.reasoning ?? "" });
+    }
+  }, new TestEmbeddingRuntime(), openCodeRuntime);
+  try {
+    let state = store.loadState();
+    store.updateProjectSettings(state.selectedProjectId, "OpenCode Render Unit Stream Project", dir);
+    store.addLocalModel(modelPath);
+    state = store.loadState();
+    store.updateThreadSettings(state.selectedThreadId, {
+      builtinAgenticFramework: "opencode",
+      builtinModelId: state.selectedModelId
+    });
+
+    await service.submit({ text: "stream small units" });
+    await expect.poll(() => service?.state().generation.status).toBe("idle");
+
+    const expectedFrames = [
+      { content: "", reasoning: "X" },
+      { content: "", reasoning: "XY" },
+      { content: "A", reasoning: "XY" },
+      { content: "AB", reasoning: "XY" },
+      { content: "ABC", reasoning: "XY" }
+    ];
+    const firstIndex = frames.findIndex((frame) => frame.content === "" && frame.reasoning === "X");
+    expect(firstIndex).toBeGreaterThanOrEqual(0);
+    expect(frames.slice(firstIndex, firstIndex + expectedFrames.length)).toEqual(expectedFrames);
+    for (let index = firstIndex + expectedFrames.length; index < frames.length; index += 1) {
+      expect(frames[index]).toEqual({ content: "ABC", reasoning: "XY" });
+    }
+  } finally {
+    service?.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("fails OpenCode tool-only turns that never stream answer or reasoning text", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-opencode-tool-only-test-"));
   const modelPath = path.join(dir, "model.gguf");
@@ -892,7 +977,7 @@ test("fails OpenCode tool-only turns that never stream answer or reasoning text"
   }
 });
 
-test("routes flattened OpenCode GPT-OSS snapshots into reasoning instead of assistant content", async () => {
+test("fails unmarked multi-paragraph OpenCode GPT-OSS text instead of guessing channels", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-opencode-flat-test-"));
   const modelPath = path.join(dir, "gpt-oss-renamed-model.gguf");
   fs.writeFileSync(modelPath, "");
@@ -953,34 +1038,17 @@ test("routes flattened OpenCode GPT-OSS snapshots into reasoning instead of assi
     });
 
     await service.submit({ text: "hi" });
-    await expect.poll(() => service.state().generation.status).toBe("idle");
+    await expect.poll(() => service.state().generation.status).toBe("error");
 
     state = store.loadState();
     const assistant = state.messages.find((message) => message.role === "assistant");
-    expect(assistant?.content).toBe("Hello!");
-    expect(assistant?.reasoning).toBe("User says \"hi\". We need to respond appropriately.");
-    expect(assistant?.content).not.toContain("User says");
-    expect(assistant?.content).not.toContain("<|return|>");
-    expect(assistant?.reasoning).not.toContain("<|return|>");
-    expect(assistant?.timelineBlocks?.map((block) => block.kind)).toEqual(["reasoning", "assistant_message"]);
-    expect(assistant?.timelineBlocks?.find((block) => block.kind === "reasoning")).toMatchObject({
-      status: "completed",
-      text: "User says \"hi\". We need to respond appropriately."
-    });
-    expect(assistant?.timelineBlocks?.find((block) => block.kind === "assistant_message")).toMatchObject({
-      status: "completed",
-      text: "Hello!"
-    });
-    const firstReasoningFrame = snapshots.findIndex((snapshot) => {
+    expect(assistant?.content).toBe("");
+    expect(assistant?.reasoning ?? "").toBe("");
+    expect(assistant?.timelineBlocks?.some((block) => block.kind === "status" && block.code === "opencode_failed")).toBe(true);
+    expect(snapshots.some((snapshot) => {
       const item = snapshot.messages.find((message) => message.role === "assistant");
-      return Boolean(item?.reasoning || item?.timelineBlocks?.some((block) => block.kind === "reasoning" && block.text));
-    });
-    const firstAnswerFrame = snapshots.findIndex((snapshot) => {
-      const item = snapshot.messages.find((message) => message.role === "assistant");
-      return Boolean(item?.content || item?.timelineBlocks?.some((block) => block.kind === "assistant_message" && block.text));
-    });
-    expect(firstReasoningFrame).toBeGreaterThanOrEqual(0);
-    expect(firstAnswerFrame).toBeGreaterThan(firstReasoningFrame);
+      return Boolean(item?.content || item?.reasoning || item?.timelineBlocks?.some((block) => (block.kind === "reasoning" || block.kind === "assistant_message") && block.text));
+    })).toBe(false);
     expect(openCodeRuntime.calls[0]?.nativeGptOss).toBe(true);
     expect(openCodeRuntime.calls[0]?.endpoint.modelId).toBe("llama");
   } finally {
@@ -1543,6 +1611,145 @@ test("maps OpenCode message deltas and diffs full part snapshots", () => {
   }]);
 });
 
+test("fails OpenCode turns when streamed final text differs from the final snapshot", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-opencode-snapshot-mismatch-test-"));
+  const modelPath = path.join(dir, "model.gguf");
+  fs.writeFileSync(modelPath, "");
+  const store = new ChatStore(path.join(dir, "chat.sqlite"));
+  const openCodeRuntime = new ScriptedOpenCodeRuntime([[
+    { type: "assistant.delta", id: "assistant-1", status: "updated", text: "Partial" },
+    { type: "final.snapshot", content: "Partial answer.", reasoning: "", strict: true }
+  ]]);
+  const service = new ChatService(store, new EndpointOnlyLlamaRuntime(), new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined, new TestEmbeddingRuntime(), openCodeRuntime);
+  try {
+    let state = store.loadState();
+    store.updateProjectSettings(state.selectedProjectId, "OpenCode Snapshot Mismatch Project", dir);
+    store.addLocalModel(modelPath);
+    state = store.loadState();
+    store.updateThreadSettings(state.selectedThreadId, {
+      builtinAgenticFramework: "opencode",
+      builtinModelId: state.selectedModelId
+    });
+
+    await service.submit({ text: "stream incomplete" });
+    await expect.poll(() => service.state().generation.status).toBe("error");
+
+    state = store.loadState();
+    const assistant = state.messages.find((message) => message.role === "assistant");
+    expect(assistant?.content).toBe("Partial");
+    expect(assistant?.status).toBe("error");
+    expect(assistant?.timelineBlocks?.some((block) => block.kind === "status" && block.code === "opencode_failed" && block.message.includes("did not match"))).toBe(true);
+  } finally {
+    service.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("validates strict OpenCode final snapshots against streamed message segments", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-opencode-segment-snapshot-test-"));
+  const modelPath = path.join(dir, "model.gguf");
+  fs.writeFileSync(modelPath, "");
+  const store = new ChatStore(path.join(dir, "chat.sqlite"));
+  const openCodeRuntime = new ScriptedOpenCodeRuntime([[
+    { type: "assistant.delta", id: "msg_1:prt_1", status: "updated", text: "First" },
+    { type: "assistant.delta", id: "msg_2:prt_2", status: "updated", text: "Second" },
+    { type: "final.snapshot", content: "Second", reasoning: "", strict: true, messageId: "msg_2" },
+    { type: "turn.completed" }
+  ]]);
+  const service = new ChatService(store, new EndpointOnlyLlamaRuntime(), new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined, new TestEmbeddingRuntime(), openCodeRuntime);
+  try {
+    let state = store.loadState();
+    store.updateProjectSettings(state.selectedProjectId, "OpenCode Segment Snapshot Project", dir);
+    store.addLocalModel(modelPath);
+    state = store.loadState();
+    store.updateThreadSettings(state.selectedThreadId, {
+      builtinAgenticFramework: "opencode",
+      builtinModelId: state.selectedModelId
+    });
+
+    await service.submit({ text: "two messages" });
+    await expect.poll(() => service.state().generation.status).toBe("idle");
+
+    state = store.loadState();
+    const assistant = state.messages.find((message) => message.role === "assistant");
+    expect(assistant?.content).toBe("FirstSecond");
+    expect(assistant?.status).toBe("complete");
+  } finally {
+    service.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("fails strict OpenCode final snapshots that do not match their source message segment", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-opencode-stale-segment-snapshot-test-"));
+  const modelPath = path.join(dir, "model.gguf");
+  fs.writeFileSync(modelPath, "");
+  const store = new ChatStore(path.join(dir, "chat.sqlite"));
+  const openCodeRuntime = new ScriptedOpenCodeRuntime([[
+    { type: "assistant.delta", id: "msg_1:prt_1", status: "updated", text: "First" },
+    { type: "assistant.delta", id: "msg_2:prt_2", status: "updated", text: "Second" },
+    { type: "final.snapshot", content: "First", reasoning: "", strict: true, messageId: "msg_2" }
+  ]]);
+  const service = new ChatService(store, new EndpointOnlyLlamaRuntime(), new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined, new TestEmbeddingRuntime(), openCodeRuntime);
+  try {
+    let state = store.loadState();
+    store.updateProjectSettings(state.selectedProjectId, "OpenCode Stale Segment Snapshot Project", dir);
+    store.addLocalModel(modelPath);
+    state = store.loadState();
+    store.updateThreadSettings(state.selectedThreadId, {
+      builtinAgenticFramework: "opencode",
+      builtinModelId: state.selectedModelId
+    });
+
+    await service.submit({ text: "two messages" });
+    await expect.poll(() => service.state().generation.status).toBe("error");
+
+    state = store.loadState();
+    const assistant = state.messages.find((message) => message.role === "assistant");
+    expect(assistant?.content).toBe("FirstSecond");
+    expect(assistant?.status).toBe("error");
+  } finally {
+    service.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("does not compare strict OpenCode final snapshots against earlier streamed reasoning", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-opencode-snapshot-reasoning-scope-test-"));
+  const modelPath = path.join(dir, "model.gguf");
+  fs.writeFileSync(modelPath, "");
+  const store = new ChatStore(path.join(dir, "chat.sqlite"));
+  const openCodeRuntime = new ScriptedOpenCodeRuntime([[
+    { type: "reasoning.delta", id: "reasoning-1", status: "updated", text: "Use a tool first." },
+    { type: "assistant.delta", id: "assistant-1", status: "updated", text: "Done." },
+    { type: "final.snapshot", content: "Done.", reasoning: "", strict: true },
+    { type: "turn.completed" }
+  ]]);
+  const service = new ChatService(store, new EndpointOnlyLlamaRuntime(), new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined, new TestEmbeddingRuntime(), openCodeRuntime);
+  try {
+    let state = store.loadState();
+    store.updateProjectSettings(state.selectedProjectId, "OpenCode Snapshot Reasoning Scope Project", dir);
+    store.addLocalModel(modelPath);
+    state = store.loadState();
+    store.updateThreadSettings(state.selectedThreadId, {
+      builtinAgenticFramework: "opencode",
+      builtinModelId: state.selectedModelId
+    });
+
+    await service.submit({ text: "finish after tool" });
+    await expect.poll(() => service.state().generation.status).toBe("idle");
+
+    state = store.loadState();
+    const assistant = state.messages.find((message) => message.role === "assistant");
+    expect(assistant?.content).toBe("Done.");
+    expect(assistant?.reasoning).toBe("Use a tool first.");
+    expect(assistant?.status).toBe("complete");
+  } finally {
+    service.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("splits OpenCode SSE frames with CRLF and flushes final unterminated data", () => {
   const first = splitSseFrames("data: {\"type\":\"one\"}\r\n\r\n");
   const partial = splitSseFrames("data: {\"type\":\"two\"}\r");
@@ -1623,7 +1830,285 @@ test("normalizes GPT-OSS Harmony channels split across OpenCode text deltas", ()
   expect(second.map((event) => "text" in event ? event.text : "").join("")).not.toContain("<|");
 });
 
-test("normalizes flattened GPT-OSS OpenCode text after return marker", () => {
+test("does not duplicate reasoning when OpenCode emits native reasoning and Harmony text", () => {
+  const parsers = new Map();
+  const native = normalizeOpenCodeHarmonyEvent({
+    type: "reasoning.delta",
+    id: "msg_dupe:reasoning_part",
+    status: "updated",
+    sessionId: "ses_dupe",
+    text: "Need short answer."
+  }, parsers);
+  const harmony = normalizeOpenCodeHarmonyEvent({
+    type: "assistant.delta",
+    id: "msg_dupe:text_part",
+    status: "updated",
+    sessionId: "ses_dupe",
+    text: "<|channel|>analysis<|message|>Need short answer.<|end|><|start|>assistant<|channel|>final<|message|>Done.<|return|>"
+  }, parsers);
+
+  expect(native).toEqual([{
+    type: "reasoning.delta",
+    id: "msg_dupe:reasoning_part",
+    status: "updated",
+    text: "Need short answer.",
+    sessionId: "ses_dupe"
+  }]);
+  expect(harmony).toEqual([{
+    type: "assistant.delta",
+    id: "msg_dupe:text_part",
+    status: "updated",
+    text: "Done.",
+    sessionId: "ses_dupe"
+  }]);
+});
+
+test("preserves parsed reasoning suffix when native OpenCode reasoning was partial", () => {
+  const parsers = new Map();
+  const native = normalizeOpenCodeHarmonyEvent({
+    type: "reasoning.delta",
+    id: "msg_reasoning_suffix:reasoning_part",
+    status: "updated",
+    sessionId: "ses_reasoning_suffix",
+    text: "Need files."
+  }, parsers);
+  const harmony = normalizeOpenCodeHarmonyEvent({
+    type: "assistant.delta",
+    id: "msg_reasoning_suffix:text_part",
+    status: "updated",
+    sessionId: "ses_reasoning_suffix",
+    text: "<|channel|>analysis<|message|>Need files. Verify filenames before answering.<|end|><|start|>assistant<|channel|>final<|message|>Done.<|return|>"
+  }, parsers);
+
+  expect(native).toEqual([{
+    type: "reasoning.delta",
+    id: "msg_reasoning_suffix:reasoning_part",
+    status: "updated",
+    text: "Need files.",
+    sessionId: "ses_reasoning_suffix"
+  }]);
+  expect(harmony).toEqual([
+    {
+      type: "reasoning.delta",
+      id: "msg_reasoning_suffix:text_part:reasoning",
+      status: "updated",
+      text: " Verify filenames before answering.",
+      replace: undefined,
+      sessionId: "ses_reasoning_suffix"
+    },
+    {
+      type: "assistant.delta",
+      id: "msg_reasoning_suffix:text_part",
+      status: "updated",
+      text: "Done.",
+      sessionId: "ses_reasoning_suffix"
+    }
+  ]);
+});
+
+test("allows final content after native OpenCode reasoning in a later response part", () => {
+  const parsers = new Map();
+  const native = normalizeOpenCodeHarmonyEvent({
+    type: "reasoning.delta",
+    id: "msg_native_split:reasoning_part",
+    status: "updated",
+    sessionId: "ses_native_split",
+    text: "Need short answer."
+  }, parsers);
+  const final = normalizeOpenCodeHarmonyEvent({
+    type: "assistant.delta",
+    id: "msg_native_split:text_part",
+    status: "updated",
+    sessionId: "ses_native_split",
+    text: "[[UNIT0_ANALYSIS]][[UNIT0_FINAL]]Done.<|return|>"
+  }, parsers, true, "marker-secret");
+
+  expect(native).toEqual([{
+    type: "reasoning.delta",
+    id: "msg_native_split:reasoning_part",
+    status: "updated",
+    text: "Need short answer.",
+    sessionId: "ses_native_split"
+  }]);
+  expect(final).toEqual([{
+    type: "assistant.delta",
+    id: "msg_native_split:text_part",
+    status: "updated",
+    text: "Done.",
+    replace: undefined,
+    sessionId: "ses_native_split"
+  }]);
+});
+
+test("rejects final-only delimited content even after earlier native reasoning", () => {
+  const parsers = new Map();
+  normalizeOpenCodeHarmonyEvent({
+    type: "reasoning.delta",
+    id: "msg_final_only_after_reasoning:reasoning_part",
+    status: "updated",
+    sessionId: "ses_final_only_after_reasoning",
+    text: "Need short answer."
+  }, parsers);
+  const final = normalizeOpenCodeHarmonyEvent({
+    type: "assistant.delta",
+    id: "msg_final_only_after_reasoning:text_part",
+    status: "updated",
+    sessionId: "ses_final_only_after_reasoning",
+    text: "[[UNIT0_FINAL]]Done.<|return|>"
+  }, parsers, true, "marker-secret");
+
+  expect(final).toEqual([{ type: "error", message: "OpenCode GPT-OSS emitted malformed channel delimiters." }]);
+});
+
+test("normalizes multiple delimited reasoning spans around tool markers", () => {
+  const parsers = new Map();
+  const toolStart = Buffer.from(JSON.stringify({
+    id: "call_multi_reasoning",
+    name: "glob",
+    argumentsText: "{\"pattern\":\"*\"}",
+    cwd: "C:\\Workspace"
+  }), "utf8").toString("base64url");
+  const toolComplete = Buffer.from(JSON.stringify({
+    id: "call_multi_reasoning",
+    name: "glob",
+    argumentsText: "{\"pattern\":\"*\"}",
+    cwd: "C:\\Workspace",
+    output: "a.ts"
+  }), "utf8").toString("base64url");
+  const events = normalizeOpenCodeHarmonyEvent({
+    type: "assistant.delta",
+    id: "msg_multi_reasoning:prt_multi_reasoning",
+    status: "updated",
+    sessionId: "ses_multi_reasoning",
+    text: `[[UNIT0_ANALYSIS]]Need files.[[UNIT0_TOOL_START:${toolStart}]][[UNIT0_TOOL_COMPLETE:${toolComplete}]][[UNIT0_ANALYSIS]]Got files.[[UNIT0_FINAL]]Done.<|return|>`
+  }, parsers);
+
+  expect(events.map((event) => event.type)).toEqual(["reasoning.delta", "timeline", "timeline", "reasoning.delta", "assistant.delta"]);
+  expect(events[0]).toMatchObject({ type: "reasoning.delta", text: "Need files." });
+  expect(events[1]).toMatchObject({ type: "timeline", eventType: "item.started" });
+  expect(events[2]).toMatchObject({ type: "timeline", eventType: "item.completed" });
+  expect(events[3]).toMatchObject({ type: "reasoning.delta", text: "Got files." });
+  expect(events[4]).toMatchObject({ type: "assistant.delta", text: "Done." });
+});
+
+test("allows final content after an authenticated tool completion without extra analysis", () => {
+  const parsers = new Map();
+  const toolStart = Buffer.from(JSON.stringify({
+    id: "call_final_after_tool",
+    name: "glob",
+    argumentsText: "{\"pattern\":\"*\"}",
+    cwd: "C:\\Workspace"
+  }), "utf8").toString("base64url");
+  const toolComplete = Buffer.from(JSON.stringify({
+    id: "call_final_after_tool",
+    name: "glob",
+    argumentsText: "{\"pattern\":\"*\"}",
+    cwd: "C:\\Workspace",
+    output: "a.ts"
+  }), "utf8").toString("base64url");
+
+  const first = normalizeOpenCodeHarmonyEvent({
+    type: "assistant.delta",
+    id: "msg_final_after_tool:prt_final_after_tool",
+    status: "updated",
+    sessionId: "ses_final_after_tool",
+    text: `[[UNIT0_ANALYSIS]]Need files.[[UNIT0_TOOL_START:${toolStart}]]`
+  }, parsers);
+  const second = normalizeOpenCodeHarmonyEvent({
+    type: "assistant.delta",
+    id: "msg_final_after_tool:prt_final_after_tool_2",
+    status: "updated",
+    sessionId: "ses_final_after_tool",
+    text: `[[UNIT0_TOOL_COMPLETE:${toolComplete}]][[UNIT0_FINAL]]a.ts<|return|>`
+  }, parsers);
+
+  expect(first.map((event) => event.type)).toEqual(["reasoning.delta", "timeline"]);
+  expect(second.map((event) => event.type)).toEqual(["timeline", "assistant.delta"]);
+  expect(second[0]).toMatchObject({ type: "timeline", eventType: "item.completed" });
+  expect(second[1]).toMatchObject({ type: "assistant.delta", text: "a.ts" });
+});
+
+test("rejects delimited tool markers after final content instead of reordering them", () => {
+  const parsers = new Map();
+  const toolStart = Buffer.from(JSON.stringify({
+    id: "call_after_final",
+    name: "glob",
+    argumentsText: "{\"pattern\":\"*\"}"
+  }), "utf8").toString("base64url");
+  const events = normalizeOpenCodeHarmonyEvent({
+    type: "assistant.delta",
+    id: "msg_tool_after_final:prt_tool_after_final",
+    status: "updated",
+    sessionId: "ses_tool_after_final",
+    text: `[[UNIT0_ANALYSIS]]Think.[[UNIT0_FINAL]]Answer.[[UNIT0_TOOL_START:${toolStart}]]<|return|>`
+  }, parsers);
+
+  expect(events).toEqual([{ type: "error", message: "OpenCode GPT-OSS emitted malformed channel delimiters." }]);
+});
+
+test("rejects divergent native and parsed reasoning instead of merging suffixes", () => {
+  const parsers = new Map();
+  const native = normalizeOpenCodeHarmonyEvent({
+    type: "reasoning.delta",
+    id: "msg_reasoning_diverge:reasoning_part",
+    status: "updated",
+    sessionId: "ses_reasoning_diverge",
+    text: "Need file."
+  }, parsers);
+  const harmony = normalizeOpenCodeHarmonyEvent({
+    type: "assistant.delta",
+    id: "msg_reasoning_diverge:text_part",
+    status: "updated",
+    sessionId: "ses_reasoning_diverge",
+    text: "<|channel|>analysis<|message|>Need files.<|end|><|start|>assistant<|channel|>final<|message|>Done.<|return|>"
+  }, parsers);
+
+  expect(native).toHaveLength(1);
+  expect(harmony).toEqual([{ type: "error", message: "OpenCode GPT-OSS emitted divergent native and parsed reasoning." }]);
+});
+
+test("does not duplicate reasoning when parsed Harmony reasoning arrives before native reasoning", () => {
+  const parsers = new Map();
+  const harmony = normalizeOpenCodeHarmonyEvent({
+    type: "assistant.delta",
+    id: "msg_dupe_reverse:text_part",
+    status: "updated",
+    sessionId: "ses_dupe_reverse",
+    text: "<|channel|>analysis<|message|>Need short answer.<|end|>"
+  }, parsers);
+  const native = normalizeOpenCodeHarmonyEvent({
+    type: "reasoning.delta",
+    id: "msg_dupe_reverse:reasoning_part",
+    status: "updated",
+    sessionId: "ses_dupe_reverse",
+    text: "Need short answer."
+  }, parsers);
+  const final = normalizeOpenCodeHarmonyEvent({
+    type: "assistant.delta",
+    id: "msg_dupe_reverse:text_part",
+    status: "updated",
+    sessionId: "ses_dupe_reverse",
+    text: "<|start|>assistant<|channel|>final<|message|>Done.<|return|>"
+  }, parsers);
+
+  expect(harmony).toEqual([{
+    type: "reasoning.delta",
+    id: "msg_dupe_reverse:text_part:reasoning",
+    status: "updated",
+    text: "Need short answer.",
+    sessionId: "ses_dupe_reverse"
+  }]);
+  expect(native).toEqual([]);
+  expect(final).toEqual([{
+    type: "assistant.delta",
+    id: "msg_dupe_reverse:text_part",
+    status: "updated",
+    text: "Done.",
+    sessionId: "ses_dupe_reverse"
+  }]);
+});
+
+test("holds unmarked GPT-OSS OpenCode text instead of guessing channels", () => {
   const parsers = new Map();
   const first = normalizeOpenCodeHarmonyEvent({
     type: "assistant.delta",
@@ -1640,25 +2125,11 @@ test("normalizes flattened GPT-OSS OpenCode text after return marker", () => {
     text: "Hello!<|return|>"
   }, parsers);
 
-  expect(first).toEqual([{
-    type: "reasoning.delta",
-    id: "msg_flat:prt_flat:reasoning",
-    status: "updated",
-    text: "User says \"hi\". We need to respond appropriately.",
-    sessionId: "ses_flat"
-  }]);
-  expect(second).toEqual([
-    {
-      type: "assistant.delta",
-      id: "msg_flat:prt_flat",
-      status: "updated",
-      text: "Hello!",
-      sessionId: "ses_flat"
-    }
-  ]);
+  expect(first).toEqual([]);
+  expect(second).toEqual([]);
 });
 
-test("streams flattened GPT-OSS reasoning while holding ambiguous final text until return", () => {
+test("streams delimited plain GPT-OSS text into reasoning and final content", () => {
   const parsers = new Map();
   const events = [
     ...normalizeOpenCodeHarmonyEvent({
@@ -1666,14 +2137,14 @@ test("streams flattened GPT-OSS reasoning while holding ambiguous final text unt
       id: "msg_live:prt_live",
       status: "updated",
       sessionId: "ses_live",
-      text: "Need "
+      text: "[[UNIT0_ANALYSIS]]Need "
     }, parsers),
     ...normalizeOpenCodeHarmonyEvent({
       type: "assistant.delta",
       id: "msg_live:prt_live",
       status: "updated",
       sessionId: "ses_live",
-      text: "a short greeting.\n\nHel"
+      text: "a short greeting.[[UNIT0_FINAL]]Hel"
     }, parsers),
     ...normalizeOpenCodeHarmonyEvent({
       type: "assistant.delta",
@@ -1689,20 +2160,38 @@ test("streams flattened GPT-OSS reasoning while holding ambiguous final text unt
       type: "reasoning.delta",
       id: "msg_live:prt_live:reasoning",
       status: "updated",
-      text: "Need a short greeting.",
+      text: "Need ",
+      replace: undefined,
+      sessionId: "ses_live"
+    },
+    {
+      type: "reasoning.delta",
+      id: "msg_live:prt_live:reasoning",
+      status: "updated",
+      text: "a short greeting.",
+      replace: undefined,
       sessionId: "ses_live"
     },
     {
       type: "assistant.delta",
       id: "msg_live:prt_live",
       status: "updated",
-      text: "Hello",
+      text: "Hel",
+      replace: undefined,
+      sessionId: "ses_live"
+    },
+    {
+      type: "assistant.delta",
+      id: "msg_live:prt_live",
+      status: "updated",
+      text: "lo",
+      replace: undefined,
       sessionId: "ses_live"
     }
   ]);
 });
 
-test("uses the last flattened GPT-OSS paragraph as final content when return arrives", () => {
+test("holds all unmarked GPT-OSS paragraphs when no delimiter arrives", () => {
   const parsers = new Map();
   const events = normalizeOpenCodeHarmonyEvent({
     type: "assistant.delta",
@@ -1712,25 +2201,10 @@ test("uses the last flattened GPT-OSS paragraph as final content when return arr
     text: "Reason one.\n\nReason two.\n\nFinal answer.<|return|>"
   }, parsers);
 
-  expect(events).toEqual([
-    {
-      type: "reasoning.delta",
-      id: "msg_multi:prt_multi:reasoning",
-      status: "updated",
-      text: "Reason one.\n\nReason two.",
-      sessionId: "ses_multi"
-    },
-    {
-      type: "assistant.delta",
-      id: "msg_multi:prt_multi",
-      status: "updated",
-      text: "Final answer.",
-      sessionId: "ses_multi"
-    }
-  ]);
+  expect(events).toEqual([]);
 });
 
-test("does not stream an ambiguous second flattened paragraph as final content before return", () => {
+test("holds ambiguous unmarked paragraphs before return", () => {
   const parsers = new Map();
   const events = [
     ...normalizeOpenCodeHarmonyEvent({
@@ -1749,29 +2223,7 @@ test("does not stream an ambiguous second flattened paragraph as final content b
     }, parsers)
   ];
 
-  expect(events).toEqual([
-    {
-      type: "reasoning.delta",
-      id: "msg_multi_live:prt_multi_live:reasoning",
-      status: "updated",
-      text: "Reason one.",
-      sessionId: "ses_multi_live"
-    },
-    {
-      type: "reasoning.delta",
-      id: "msg_multi_live:prt_multi_live:reasoning",
-      status: "updated",
-      text: "\n\nReason two.",
-      sessionId: "ses_multi_live"
-    },
-    {
-      type: "assistant.delta",
-      id: "msg_multi_live:prt_multi_live",
-      status: "updated",
-      text: "Final answer.",
-      sessionId: "ses_multi_live"
-    }
-  ]);
+  expect(events).toEqual([]);
 });
 
 test("passes GPT-OSS reasoning deltas through without speculative final cue splitting", () => {
@@ -1825,7 +2277,7 @@ test("passes GPT-OSS reasoning deltas through without speculative final cue spli
   ]);
 });
 
-test("holds flattened GPT-OSS OpenCode final text until return confirms the boundary", () => {
+test("holds unmarked GPT-OSS OpenCode final text before return instead of guessing", () => {
   const parsers = new Map();
   const events = [
     ...normalizeOpenCodeHarmonyEvent({
@@ -1858,26 +2310,11 @@ test("holds flattened GPT-OSS OpenCode final text until return confirms the boun
     }, parsers)
   ];
 
-  expect(events).toEqual([
-    {
-      type: "reasoning.delta",
-      id: "msg_stream:prt_stream:reasoning",
-      status: "updated",
-      text: "Need a short greeting.",
-      sessionId: "ses_stream"
-    },
-    {
-      type: "assistant.delta",
-      id: "msg_stream:prt_stream",
-      status: "updated",
-      text: "Hello!",
-      sessionId: "ses_stream"
-    }
-  ]);
+  expect(events).toEqual([]);
   expect(events.map((event) => "text" in event ? event.text : "").join("")).not.toContain("<|return|>");
 });
 
-test("holds flattened GPT-OSS partial return markers out of streamed final text", () => {
+test("holds partial return markers and unmarked text without delimiters", () => {
   const parsers = new Map();
   const events = [
     ...normalizeOpenCodeHarmonyEvent({
@@ -1903,26 +2340,11 @@ test("holds flattened GPT-OSS partial return markers out of streamed final text"
     }, parsers)
   ];
 
-  expect(events).toEqual([
-    {
-      type: "reasoning.delta",
-      id: "msg_partial:prt_partial:reasoning",
-      status: "updated",
-      text: "Need a short greeting.",
-      sessionId: "ses_partial"
-    },
-    {
-      type: "assistant.delta",
-      id: "msg_partial:prt_partial",
-      status: "updated",
-      text: "Answer",
-      sessionId: "ses_partial"
-    }
-  ]);
+  expect(events).toEqual([]);
   expect(events.map((event) => "text" in event ? event.text : "").join("")).not.toContain("<");
 });
 
-test("keeps streamed flattened final text when a trailing blank line arrives before return", () => {
+test("holds unmarked final text with trailing blank line when no delimiter arrives", () => {
   const parsers = new Map();
   const events = [
     ...normalizeOpenCodeHarmonyEvent({
@@ -1948,25 +2370,10 @@ test("keeps streamed flattened final text when a trailing blank line arrives bef
     }, parsers)
   ];
 
-  expect(events).toEqual([
-    {
-      type: "reasoning.delta",
-      id: "msg_trailing:prt_trailing:reasoning",
-      status: "updated",
-      text: "Need a short answer.",
-      sessionId: "ses_trailing"
-    },
-    {
-      type: "assistant.delta",
-      id: "msg_trailing:prt_trailing",
-      status: "updated",
-      text: "opencode-ok",
-      sessionId: "ses_trailing"
-    }
-  ]);
+  expect(events).toEqual([]);
 });
 
-test("normalizes flattened GPT-OSS OpenCode text when no answer streamed before return", () => {
+test("holds unmarked GPT-OSS OpenCode text before return without mining reasoning", () => {
   const parsers = new Map();
   const first = normalizeOpenCodeHarmonyEvent({
     type: "assistant.delta",
@@ -1984,25 +2391,10 @@ test("normalizes flattened GPT-OSS OpenCode text when no answer streamed before 
   }, parsers);
 
   expect(first).toEqual([]);
-  expect(second).toEqual([
-    {
-      type: "reasoning.delta",
-      id: "msg_late:prt_late:reasoning",
-      status: "updated",
-      text: "User says \"hi\". We need to respond appropriately.",
-      sessionId: "ses_late"
-    },
-    {
-      type: "assistant.delta",
-      id: "msg_late:prt_late",
-      status: "updated",
-      text: "Hello!",
-      sessionId: "ses_late"
-    }
-  ]);
+  expect(second).toEqual([]);
 });
 
-test("replaces completed flattened GPT-OSS text from a corrected full part snapshot", () => {
+test("holds completed unmarked GPT-OSS text from full part snapshots", () => {
   const parsers = new Map();
   const first = normalizeOpenCodeHarmonyEvent({
     type: "assistant.delta",
@@ -2020,40 +2412,8 @@ test("replaces completed flattened GPT-OSS text from a corrected full part snaps
     replace: true
   }, parsers);
 
-  expect(first).toEqual([
-    {
-      type: "reasoning.delta",
-      id: "msg_replace:prt_replace:reasoning",
-      status: "updated",
-      text: "Old reason.",
-      sessionId: "ses_replace"
-    },
-    {
-      type: "assistant.delta",
-      id: "msg_replace:prt_replace",
-      status: "updated",
-      text: "old-answer",
-      sessionId: "ses_replace"
-    }
-  ]);
-  expect(corrected).toEqual([
-    {
-      type: "reasoning.delta",
-      id: "msg_replace:prt_replace:reasoning",
-      status: "updated",
-      text: "Correct reason.",
-      replace: true,
-      sessionId: "ses_replace"
-    },
-    {
-      type: "assistant.delta",
-      id: "msg_replace:prt_replace",
-      status: "updated",
-      text: "correct-answer",
-      replace: true,
-      sessionId: "ses_replace"
-    }
-  ]);
+  expect(first).toEqual([]);
+  expect(corrected).toEqual([]);
 });
 
 test("normalizes GPT-OSS Harmony channels from OpenCode final snapshots", () => {
@@ -2065,21 +2425,63 @@ test("normalizes GPT-OSS Harmony channels from OpenCode final snapshots", () => 
   });
 });
 
-test("normalizes flattened GPT-OSS final snapshots with return marker", () => {
+test("does not mine unmarked GPT-OSS final snapshots without delimiters", () => {
   const parsed = parseOpenCodeHarmonySnapshot("User says \"hi\". We need a greeting.\n\nHello!<|return|>");
 
   expect(parsed).toEqual({
-    reasoning: "User says \"hi\". We need a greeting.",
-    content: "Hello!"
+    reasoning: "",
+    content: ""
   });
 });
 
-test("normalizes flattened GPT-OSS final snapshots with trailing blank line before return", () => {
+test("does not mine unmarked GPT-OSS final snapshots with trailing blank line before return", () => {
   const parsed = parseOpenCodeHarmonySnapshot("Need a short answer.\n\nopencode-ok\n\n<|return|>");
+
+  expect(parsed).toEqual({
+    reasoning: "",
+    content: ""
+  });
+});
+
+test("normalizes delimited plain GPT-OSS final snapshots", () => {
+  const parsed = parseOpenCodeHarmonySnapshot("[[UNIT0_ANALYSIS]]Need a short answer.[[UNIT0_FINAL]]opencode-ok<|return|>");
 
   expect(parsed).toEqual({
     reasoning: "Need a short answer.",
     content: "opencode-ok"
+  });
+});
+
+test("rejects final-only and duplicate-marker delimited plain GPT-OSS snapshots", () => {
+  expect(parseOpenCodeHarmonySnapshot("[[UNIT0_FINAL]]answer<|return|>")).toEqual({ reasoning: "", content: "" });
+  expect(parseOpenCodeHarmonySnapshot("[[UNIT0_ANALYSIS]]one[[UNIT0_FINAL]]answer[[UNIT0_ANALYSIS]]two<|return|>")).toEqual({ reasoning: "", content: "" });
+});
+
+test("surfaces malformed delimited OpenCode GPT-OSS streams as errors", () => {
+  const parsers = new Map();
+  const first = normalizeOpenCodeHarmonyEvent({
+    type: "assistant.delta",
+    id: "msg_bad_markers:prt_bad_markers",
+    status: "updated",
+    sessionId: "ses_bad_markers",
+    text: "[[UNIT0_ANALYSIS]]think[[UNIT0_FINAL]]answer"
+  }, parsers);
+  const second = normalizeOpenCodeHarmonyEvent({
+    type: "assistant.delta",
+    id: "msg_bad_markers:prt_bad_markers",
+    status: "updated",
+    sessionId: "ses_bad_markers",
+    text: "[[UNIT0_ANALYSIS]]more"
+  }, parsers);
+
+  expect(first.some((event) => event.type === "assistant.delta")).toBe(true);
+  expect(second).toEqual([{ type: "error", message: "OpenCode GPT-OSS emitted malformed channel delimiters." }]);
+});
+
+test("preserves multi-paragraph delimited GPT-OSS final snapshots", () => {
+  expect(parseOpenCodeHarmonySnapshot("[[UNIT0_ANALYSIS]]think[[UNIT0_FINAL]]first\n\nsecond<|return|>")).toEqual({
+    reasoning: "think",
+    content: "first\n\nsecond"
   });
 });
 
@@ -2101,7 +2503,7 @@ test("passes through non-GPT-OSS OpenCode plain text deltas", () => {
   }]);
 });
 
-test("normalizes no-boundary flattened GPT-OSS text as final content only after return", () => {
+test("holds no-boundary unmarked GPT-OSS text before return", () => {
   const parsers = new Map();
   const first = normalizeOpenCodeHarmonyEvent({
     type: "assistant.delta",
@@ -2119,16 +2521,10 @@ test("normalizes no-boundary flattened GPT-OSS text as final content only after 
   }, parsers);
 
   expect(first).toEqual([]);
-  expect(second).toEqual([{
-    type: "assistant.delta",
-    id: "msg_direct:prt_direct",
-    status: "updated",
-    text: "Hello world",
-    sessionId: "ses_direct"
-  }]);
+  expect(second).toEqual([]);
 });
 
-test("keeps no-boundary multi-line flattened GPT-OSS final text intact", () => {
+test("holds no-boundary multi-line unmarked GPT-OSS text", () => {
   const parsers = new Map();
   const events = normalizeOpenCodeHarmonyEvent({
     type: "assistant.delta",
@@ -2138,13 +2534,7 @@ test("keeps no-boundary multi-line flattened GPT-OSS final text intact", () => {
     text: "Hello\nworld<|return|>"
   }, parsers);
 
-  expect(events).toEqual([{
-    type: "assistant.delta",
-    id: "msg_multiline_direct:prt_multiline_direct",
-    status: "updated",
-    text: "Hello\nworld",
-    sessionId: "ses_multiline_direct"
-  }]);
+  expect(events).toEqual([]);
 });
 
 test("rejects remote models for OpenCode because the real harness is bound to the local OpenAI endpoint", async () => {

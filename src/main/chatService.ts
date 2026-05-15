@@ -1393,12 +1393,13 @@ export class ChatService {
         model: options.model,
         settings: openCodeModelSettings(options.model, options.thread.runtimeSettings)
       });
+      const nativeGptOss = isNativeGptOssModel(options.model);
       for await (const event of this.openCodeRuntime.runTurn({
         cwd: project.directory,
         prompt: lastUserMessage.content,
         sessionId: options.thread.openCodeSessionId,
         modelLabel: options.model.label,
-        nativeGptOss: isNativeGptOssModel(options.model),
+        nativeGptOss,
         endpoint,
         settings: openCodeModelSettings(options.model, options.thread.runtimeSettings),
         permissionMode: options.thread.permissionMode
@@ -1409,7 +1410,7 @@ export class ChatService {
         this.applyOpenCodeEvent(options.assistantMessageId, options.thread.id, event, timelineBlocks, assistantTextById, reasoningTextById);
       }
       if (!options.runCancelled()) {
-        this.assertOpenCodeStreamProducedVisibleOutput(options.assistantMessageId);
+        this.assertOpenCodeStreamProducedVisibleOutput(options.assistantMessageId, nativeGptOss);
       }
       this.store.updateMessageStatus(options.assistantMessageId, options.runCancelled() ? "interrupted" : "complete");
       if (options.ownsActiveGeneration()) {
@@ -1438,7 +1439,7 @@ export class ChatService {
     return this.store.loadState().messages.find((message) => message.id === messageId)?.content ?? "";
   }
 
-  private assertOpenCodeStreamProducedVisibleOutput(assistantMessageId: string): void {
+  private assertOpenCodeStreamProducedVisibleOutput(assistantMessageId: string, requireReasoning = false): void {
     const assistant = this.store.loadState().messages.find((message) => message.id === assistantMessageId);
     const content = assistant?.content.trim() ?? "";
     const reasoning = assistant?.reasoning?.trim() ?? "";
@@ -1450,6 +1451,9 @@ export class ChatService {
         throw new Error("OpenCode completed without streamed final answer.");
       }
       throw new Error("OpenCode completed without streamed output.");
+    }
+    if (requireReasoning && !reasoning) {
+      throw new Error("OpenCode completed without streamed reasoning.");
     }
   }
 
@@ -1531,6 +1535,27 @@ export class ChatService {
     if (event.type === "final.snapshot") {
       const existingContent = this.assistantMessageContent(assistantMessageId);
       const existingReasoning = this.store.loadState().messages.find((message) => message.id === assistantMessageId)?.reasoning ?? "";
+      if (event.strict && event.malformed) {
+        throw new Error("OpenCode final snapshot contained malformed GPT-OSS channel delimiters.");
+      }
+      const streamedContentSegments = event.messageId
+        ? [...assistantTextById.entries()].filter(([id]) => openCodeMessageIdFromEventId(id) === event.messageId).map(([, text]) => text)
+        : [...assistantTextById.values()];
+      const snapshotMatchesStreamedContent = event.messageId
+        ? streamedContentSegments.includes(event.content)
+        : event.content === existingContent || streamedContentSegments.includes(event.content);
+      if (event.strict && existingContent && !snapshotMatchesStreamedContent) {
+        throw new Error("OpenCode streamed final answer did not match the final snapshot.");
+      }
+      const streamedReasoningSegments = event.messageId
+        ? [...reasoningTextById.entries()].filter(([id]) => openCodeMessageIdFromEventId(id) === event.messageId).map(([, text]) => text)
+        : [...reasoningTextById.values()];
+      const snapshotMatchesStreamedReasoning = event.messageId
+        ? streamedReasoningSegments.includes(event.reasoning)
+        : event.reasoning === existingReasoning || streamedReasoningSegments.includes(event.reasoning);
+      if (event.strict && event.reasoning && existingReasoning && !snapshotMatchesStreamedReasoning) {
+        throw new Error("OpenCode streamed reasoning did not match the final snapshot.");
+      }
       this.store.replaceMessageReasoning(assistantMessageId, existingReasoning);
       this.store.replaceMessageContent(assistantMessageId, existingContent);
       completeOpenCodeReasoningBlocks(timelineBlocks);
@@ -2777,6 +2802,10 @@ function extensionForMimeType(mimeType: string): string {
     return ".gif";
   }
   return ".png";
+}
+
+function openCodeMessageIdFromEventId(id: string): string {
+  return id.split(":")[0] ?? "";
 }
 
 function sanitizeAttachmentName(name: string): string {

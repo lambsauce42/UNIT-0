@@ -18,6 +18,10 @@ export type FileViewerSyntaxHighlighting = "one-dark" | "vscode-dark" | "codemir
 export interface FileViewerSessionState {
   rootPath?: string;
   syntaxHighlighting?: FileViewerSyntaxHighlighting;
+  selectedFileId?: string;
+  fileTreeWidth?: number;
+  fileTreePinned?: boolean;
+  fileTreeCollapsed?: boolean;
 }
 
 export interface BrowserSessionState {
@@ -690,6 +694,7 @@ export interface ShelveAppletInstancePayload {
 export interface UnshelveAppletInstancePayload {
   workspaceId: string;
   appletInstanceId: string;
+  splitRatio: number;
 }
 
 export interface ChangeAppletInstanceKindPayload {

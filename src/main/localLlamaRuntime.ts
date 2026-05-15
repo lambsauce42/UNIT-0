@@ -111,6 +111,7 @@ export type LocalLlamaRuntimeOptions = {
 export type LocalLlamaOpenAiEndpoint = {
   baseUrl: string;
   modelId: string;
+  rawCompletionUrl?: string;
 };
 
 type ServerKey = {
@@ -312,7 +313,8 @@ export class LocalLlamaRuntime {
     const server = await this.ensureServer(options.model, options.settings);
     return {
       baseUrl: server.baseUrl,
-      modelId: server.modelId
+      modelId: server.modelId,
+      rawCompletionUrl: `${server.baseUrl}/completion`
     };
   }
 
@@ -662,6 +664,26 @@ function isNativeGptOssReference(value: string): boolean {
   return value.toLowerCase().includes("gpt-oss");
 }
 
+export function renderGptOssOpenCodeSystemPrompt(settings: ChatRuntimeSettings): string {
+  return [
+    "You are ChatGPT, a large language model trained by OpenAI.",
+    "Knowledge cutoff: 2024-06",
+    `Current date: ${new Date().toISOString().slice(0, 10)}`,
+    "",
+    `Reasoning: ${settings.reasoningEffort.trim().toLowerCase() || "medium"}`,
+    "",
+    "# Valid channels: analysis, commentary, final. Channel must be included for every message.",
+    "OpenCode mode is for coding work inside the selected project directory.",
+    "Use OpenCode's provided tools when inspection is needed.",
+    "Use the analysis channel for your complete reasoning, even for short prompts.",
+    "Use the commentary channel for tool calls.",
+    "Use the final channel only for the final user-visible answer.",
+    "After the final answer, immediately end the assistant message with the native return token.",
+    "Do not put final-answer text in analysis.",
+    "Do not put reasoning text in final."
+  ].join("\n");
+}
+
 function renderGptOssPrompt(
   messages: ChatMessage[],
   settings: ChatRuntimeSettings,
@@ -752,13 +774,14 @@ export class GptOssChannelParser {
 
   constructor(private readonly options: { defaultChannel?: "analysis" | "final"; toolRecipients?: string[] } = {}) {}
 
-  push(text: string): { content: string; reasoning: string } {
+  push(text: string): { content: string; reasoning: string; toolCallContent?: string } {
     if (this.done || !text) {
       return { content: "", reasoning: "" };
     }
     this.buffer += text;
     const content: string[] = [];
     const reasoning: string[] = [];
+    const toolCalls: string[] = [];
     while (true) {
       if (!this.activeChannel) {
         const nextChannel = this.consumeChannelPrefix();
@@ -774,54 +797,60 @@ export class GptOssChannelParser {
         if (this.activeChannel === "final_json") {
           appendCommentaryFinalJson(this.buffer.slice(0, endIndex), content);
         } else if (this.activeChannel === "tool_json") {
-          appendCommentaryToolCallJson(this.activeToolRecipient, this.buffer.slice(0, endIndex), content);
+          appendCommentaryToolCallJson(this.activeToolRecipient, this.buffer.slice(0, endIndex), content, toolCalls);
         } else {
           this.appendChannelText(this.buffer.slice(0, endIndex), content, reasoning);
         }
         this.buffer = this.buffer.slice(endIndex + terminator.marker.length);
         this.activeChannel = null;
         this.activeToolRecipient = "";
+        if (terminator.marker === GPTOSS_RETURN_MARKER || terminator.marker === GPTOSS_CALL_MARKER) {
+          this.buffer = "";
+          this.done = true;
+          return channelParserResult(content, reasoning, toolCalls);
+        }
         if (!this.buffer) {
-          return { content: content.join(""), reasoning: reasoning.join("") };
+          return channelParserResult(content, reasoning, toolCalls);
         }
         continue;
       }
       if (this.activeChannel === "final_json" || this.activeChannel === "tool_json") {
-        return { content: content.join(""), reasoning: reasoning.join("") };
+        return channelParserResult(content, reasoning, toolCalls);
       }
       const partialEndLength = trailingPartialSpecialTerminatorLength(this.buffer);
       const emitText = partialEndLength > 0 ? this.buffer.slice(0, -partialEndLength) : this.buffer;
       this.appendChannelText(emitText, content, reasoning);
       this.buffer = partialEndLength > 0 ? this.buffer.slice(-partialEndLength) : "";
-      return { content: content.join(""), reasoning: reasoning.join("") };
+      return channelParserResult(content, reasoning, toolCalls);
     }
   }
 
-  finish(): { content: string; reasoning: string } {
+  finish(): { content: string; reasoning: string; toolCallContent?: string } {
     if (this.done || !this.buffer) {
       return { content: "", reasoning: "" };
     }
     const content: string[] = [];
     const reasoning: string[] = [];
+    const toolCalls: string[] = [];
     if (this.activeChannel === "final_json") {
       appendCommentaryFinalJson(this.buffer, content);
       this.buffer = "";
       this.activeChannel = null;
-      return { content: content.join(""), reasoning: reasoning.join("") };
+      return channelParserResult(content, reasoning, toolCalls);
     }
     if (this.activeChannel === "tool_json") {
-      appendCommentaryToolCallJson(this.activeToolRecipient, this.buffer, content);
+      appendCommentaryToolCallJson(this.activeToolRecipient, this.buffer, content, toolCalls);
       this.buffer = "";
       this.activeChannel = null;
       this.activeToolRecipient = "";
-      return { content: content.join(""), reasoning: reasoning.join("") };
+      return channelParserResult(content, reasoning, toolCalls);
     }
     if ((this.activeChannel === "analysis" || this.activeChannel === "final") && !this.buffer.startsWith("<|")) {
       this.appendChannelText(this.buffer, content, reasoning);
     }
     this.buffer = "";
     this.activeChannel = null;
-    return { content: content.join(""), reasoning: reasoning.join("") };
+    return channelParserResult(content, reasoning, toolCalls);
   }
 
   private consumeChannelPrefix(): "analysis" | "final" | "final_json" | "tool_json" | null {
@@ -870,29 +899,28 @@ export class GptOssChannelParser {
     }
     const prefix = this.buffer.slice(0, messageIndex + messageMarker.length);
     this.buffer = this.buffer.slice(messageIndex + messageMarker.length);
-    const toolRecipient = this.commentaryToolRecipient(prefix);
+    const commentaryTarget = commentaryRecipient(prefix);
+    const toolRecipient = this.commentaryToolRecipient(commentaryTarget);
     if (toolRecipient) {
       this.activeToolRecipient = toolRecipient;
       return "tool_json";
     }
-    if (prefix.includes("to=final") && prefix.includes("<|constrain|>json")) {
+    if (commentaryTarget === "final" && prefix.includes("<|constrain|>json")) {
       return "final_json";
     }
-    if (prefix.includes("to=final")) {
+    if (commentaryTarget === "final") {
       return "final";
     }
-    return "analysis";
+    throw new Error(`GPT-OSS emitted unsupported commentary recipient: ${commentaryTarget || "(none)"}.`);
   }
 
-  private commentaryToolRecipient(prefix: string): string {
+  private commentaryToolRecipient(commentaryTarget: string): string {
     const recipients = this.options.toolRecipients ?? [];
     if (recipients.length === 0) {
       return "";
     }
-    const normalized = prefix.replace(/\s+/g, " ");
     for (const recipient of recipients) {
-      const escaped = recipient.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      if (new RegExp(`(?:^|\\s)to=${escaped}(?:\\s|<|$)`, "u").test(normalized)) {
+      if (commentaryTarget === recipient) {
         return recipient;
       }
     }
@@ -911,8 +939,26 @@ export class GptOssChannelParser {
   }
 }
 
+function channelParserResult(content: string[], reasoning: string[], toolCalls: string[]): { content: string; reasoning: string; toolCallContent?: string } {
+  const result: { content: string; reasoning: string; toolCallContent?: string } = {
+    content: content.join(""),
+    reasoning: reasoning.join("")
+  };
+  if (toolCalls.length > 0) {
+    result.toolCallContent = toolCalls.join("");
+  }
+  return result;
+}
+
 function awaitingKnownPrefix(text: string, markers: string[]): boolean {
   return Boolean(text) && markers.some((marker) => marker.startsWith(text));
+}
+
+function commentaryRecipient(prefix: string): string {
+  const markerIndex = prefix.indexOf("<|message|>");
+  const header = markerIndex >= 0 ? prefix.slice(0, markerIndex) : prefix;
+  const match = /(?:^|\s)to=([^\s<]+)/u.exec(header);
+  return match?.[1] ?? "";
 }
 
 function firstSpecialTerminator(text: string): { index: number; marker: string } | null {
@@ -957,12 +1003,12 @@ function appendCommentaryFinalJson(text: string, content: string[]): void {
       }
     }
   } catch {
-    // Fall through to preserving the raw constrained payload.
+    throw new Error("GPT-OSS emitted malformed constrained final JSON.");
   }
-  content.push(normalized);
+  throw new Error("GPT-OSS emitted constrained final JSON without final content.");
 }
 
-function appendCommentaryToolCallJson(toolRecipient: string, text: string, content: string[]): void {
+function appendCommentaryToolCallJson(toolRecipient: string, text: string, content: string[], toolCalls?: string[]): void {
   const normalized = text.trim();
   if (!normalized) {
     return;
@@ -971,13 +1017,15 @@ function appendCommentaryToolCallJson(toolRecipient: string, text: string, conte
     const decoded = JSON.parse(normalized) as unknown;
     if (decoded && typeof decoded === "object" && !Array.isArray(decoded)) {
       const payload = { ...(decoded as Record<string, unknown>), tool: toolRecipient };
-      content.push(`<tool_call>${JSON.stringify(payload)}</tool_call>`);
+      const toolCall = `<tool_call>${JSON.stringify(payload)}</tool_call>`;
+      content.push(toolCall);
+      toolCalls?.push(toolCall);
       return;
     }
   } catch {
-    // Keep malformed tool JSON visible to the strict document tool-call parser.
+    throw new Error("GPT-OSS emitted malformed tool-call JSON.");
   }
-  content.push(`<tool_call>${normalized}</tool_call>`);
+  throw new Error("GPT-OSS emitted malformed tool-call JSON.");
 }
 
 function sleep(ms: number): Promise<void> {

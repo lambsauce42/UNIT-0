@@ -26,11 +26,14 @@ import {
   LockOpen,
   Monitor,
   MoreHorizontal,
+  PanelLeftClose,
+  PanelLeftOpen,
   PanelRight,
   PanelRightDashed,
   PanelTop,
   Pencil,
   Paperclip,
+  Pin,
   Plus,
   Power,
   RadioTower,
@@ -81,7 +84,7 @@ import {
   type SVGProps,
   type WheelEvent as ReactWheelEvent
 } from "react";
-import { createPortal } from "react-dom";
+import { createPortal, flushSync } from "react-dom";
 import { THIRD_PARTY_LICENSES } from "./thirdPartyLicenses";
 import { DEFAULT_BROWSER_URL, normalizeBrowserNavigationUrl } from "../shared/browserUrls";
 import type {
@@ -138,6 +141,7 @@ import {
 } from "../shared/layoutGeometry";
 import { WORKSPACE_TAB_SIZE } from "../shared/tabMetrics";
 import { planWorkspaceTemplate } from "../shared/templatePlanner";
+import { insertAppletLeafWithRatio } from "../shared/workspaceLayout";
 import { workspaceTemplateById, workspaceTemplates } from "../shared/workspaceTemplates";
 import { closeHitRectForTab } from "./tabGeometry";
 import { extractShellWrappedCommand } from "./timelineDisplay";
@@ -273,12 +277,12 @@ type ResizeSnapGuide = {
 const WORKSPACE_SURFACE_PADDING = 10;
 const SIDEBAR_RAIL_WIDTH = 40;
 const SIDEBAR_RESIZE_HANDLE_WIDTH = 8;
-const EXPANDED_SIDEBAR_FIXED_WIDTH = SIDEBAR_RAIL_WIDTH + SIDEBAR_RESIZE_HANDLE_WIDTH;
 const MIN_EXPANDED_SIDEBAR_WIDTH_RATIO = 0.18;
 const MAX_EXPANDED_SIDEBAR_WIDTH_RATIO = 0.45;
 const APPLET_ACTIONS_COLLAPSE_WIDTH = 340;
 const RESIZE_SNAP_RADIUS = 8;
 const TERMINAL_PTY_RESIZE_SETTLE_MS = 90;
+const SIDEBAR_RETURN_TO_TILE_ANIMATION_MS = 220;
 
 function TabCloseIcon(props: SVGProps<SVGSVGElement>) {
   return (
@@ -1464,13 +1468,21 @@ function WorkspaceSurface({ state, windowId, workspace }: { state: UnitState; wi
   const resizeDragRef = useRef<ResizeDragState | null>(null);
   const resizePublishRafRef = useRef<number | null>(null);
   const pendingResizeLayoutRef = useRef<WorkspaceLayoutNode | null>(null);
+  const sidebarReturnAnimationRef = useRef<{
+    instanceId: string;
+    rect: DOMRect;
+    clone: HTMLElement;
+  } | null>(null);
   const [layoutSize, setLayoutSize] = useState<LayoutSize>({ width: 0, height: 0 });
   const [layoutOverride, setLayoutOverride] = useState<WorkspaceLayoutNode | null>(null);
+  const [surfaceWidth, setSurfaceWidth] = useState(0);
   const [hoverResizeTarget, setHoverResizeTarget] = useState<ResizeTarget | null>(null);
   const [resizeDrag, setResizeDrag] = useState<ResizeDragState | null>(null);
   const [resizeSnapGuides, setResizeSnapGuides] = useState<ResizeSnapGuide[]>([]);
   const [switchSourceInstanceId, setSwitchSourceInstanceId] = useState<string | null>(null);
   const [expandedSidebarAppletId, setExpandedSidebarAppletId] = useState<string | null>(null);
+  const [returningSidebarAppletId, setReturningSidebarAppletId] = useState<string | null>(null);
+  const [returningSidebarLayout, setReturningSidebarLayout] = useState<WorkspaceLayoutNode | null>(null);
   const [sidebarAddMenuOpen, setSidebarAddMenuOpen] = useState(false);
   const sidebarResizeRef = useRef<{
     pointerId: number;
@@ -1510,6 +1522,9 @@ function WorkspaceSurface({ state, windowId, workspace }: { state: UnitState; wi
   const expandedSidebarApplet = expandedSidebarAppletId ? appletByInstanceId.get(expandedSidebarAppletId) : null;
   const sidebarExpanded = Boolean(expandedSidebarAppletId && expandedSidebarApplet?.session);
   const sidebarWidthRatio = state.settings.expandedSidebarWidthRatio;
+  const sidebarPanelWidth = surfaceWidth > 0
+    ? Math.max(0, Math.round(surfaceWidth * sidebarWidthRatio - SIDEBAR_RAIL_WIDTH))
+    : 320;
   const visibleWorkspaceAppletIdList = useMemo(
     () => workspace.applets.map((instance) => instance.id).filter((appletId) => !workspaceShelfAppletIds.has(appletId)),
     [workspace.applets, workspaceShelfAppletIds]
@@ -1536,11 +1551,12 @@ function WorkspaceSurface({ state, windowId, workspace }: { state: UnitState; wi
     () => (workspace.layout ? stripShelvedAppletLeaves(workspace.layout, workspaceShelfAppletIds) : null),
     [workspace.layout, workspaceShelfAppletIds]
   );
+  const activeReturningSidebarLayout = returningSidebarAppletId && returningSidebarLayout ? returningSidebarLayout : null;
   const effectiveLayout = useMemo(
-    () => activeLayoutOverride ?? visibleWorkspaceLayout,
-    [activeLayoutOverride, visibleWorkspaceLayout]
+    () => activeReturningSidebarLayout ?? activeLayoutOverride ?? visibleWorkspaceLayout,
+    [activeLayoutOverride, activeReturningSidebarLayout, visibleWorkspaceLayout]
   );
-  const layoutSource = activeLayoutOverride ? "override" : "workspace";
+  const layoutSource = activeReturningSidebarLayout ? "sidebar-return" : activeLayoutOverride ? "override" : "workspace";
   const effectiveLayoutAppletIds = useMemo(
     () => (effectiveLayout ? collectLayoutAppletIds(effectiveLayout) : []),
     [effectiveLayout]
@@ -1610,11 +1626,67 @@ function WorkspaceSurface({ state, windowId, workspace }: { state: UnitState; wi
       window.removeEventListener("resize", scheduleMeasure);
     };
   }, []);
-  useEffect(() => {
+  useLayoutEffect(() => {
+    const surface = surfaceRef.current;
+    if (!surface) {
+      return;
+    }
+    const measure = () => {
+      setSurfaceWidth((current) => {
+        const nextWidth = Math.max(0, Math.round(surface.clientWidth));
+        return current === nextWidth ? current : nextWidth;
+      });
+    };
+    measure();
+    const resizeObserver = new ResizeObserver(measure);
+    resizeObserver.observe(surface);
+    return () => resizeObserver.disconnect();
+  }, []);
+  useLayoutEffect(() => {
     if (expandedSidebarAppletId && !workspace.shelfAppletIds.includes(expandedSidebarAppletId)) {
       setExpandedSidebarAppletId(null);
     }
   }, [expandedSidebarAppletId, workspace.shelfAppletIds]);
+  useLayoutEffect(() => {
+    const animation = sidebarReturnAnimationRef.current;
+    if (!animation || returningSidebarAppletId !== animation.instanceId || workspace.shelfAppletIds.includes(animation.instanceId)) {
+      return;
+    }
+    const leaf = surfaceRef.current?.querySelector<HTMLElement>(
+      `.layout-leaf[data-applet-instance-id="${CSS.escape(animation.instanceId)}"]`
+    );
+    if (!leaf) {
+      return;
+    }
+    const clone = animation.clone;
+    const targetRect = leaf.getBoundingClientRect();
+    if (targetRect.width <= 0 || targetRect.height <= 0 || !clone.isConnected) {
+      return;
+    }
+    const deltaX = targetRect.left - animation.rect.left;
+    const deltaY = targetRect.top - animation.rect.top;
+    const scaleX = targetRect.width / animation.rect.width;
+    const scaleY = targetRect.height / animation.rect.height;
+    sidebarReturnAnimationRef.current = null;
+    const motion = clone.animate(
+      [
+        { transform: "translate3d(0, 0, 0) scale(1, 1)" },
+        { transform: `translate3d(${deltaX}px, ${deltaY}px, 0) scale(${scaleX}, ${scaleY})` }
+      ],
+      {
+        duration: SIDEBAR_RETURN_TO_TILE_ANIMATION_MS,
+        easing: "cubic-bezier(0.2, 0, 0, 1)",
+        fill: "both"
+      }
+    );
+    void motion.finished.finally(() => {
+      flushSync(() => {
+        setReturningSidebarAppletId((current) => current === animation.instanceId ? null : current);
+        setReturningSidebarLayout(null);
+      });
+      clone.remove();
+    });
+  }, [returningSidebarAppletId, workspace.layout, workspace.shelfAppletIds]);
   useEffect(() => {
     if (!sidebarAddMenuOpen) {
       return;
@@ -1933,11 +2005,59 @@ function WorkspaceSurface({ state, windowId, workspace }: { state: UnitState; wi
   );
   const returnAppletToTiles = useCallback(
     (instanceId: string) => {
+      const surface = surfaceRef.current;
+      const stage = mainStageRef.current;
+      if (!surface || !stage) {
+        throw new Error("Cannot return sidebar applet without measured workspace geometry");
+      }
+      const currentLayoutWidth = Math.max(0, Math.round(stage.clientWidth - WORKSPACE_SURFACE_PADDING * 2));
+      const finalLayoutWidth = Math.max(0, Math.round(surface.clientWidth - SIDEBAR_RAIL_WIDTH - WORKSPACE_SURFACE_PADDING * 2));
+      const finalLayoutHeight = Math.max(0, Math.round(stage.clientHeight - WORKSPACE_SURFACE_PADDING * 2));
+      const finalSplitAvailableWidth = Math.max(0, finalLayoutWidth - TILE_GUTTER_SIZE);
+      if (currentLayoutWidth <= 0 || finalLayoutWidth <= 0 || finalLayoutHeight <= 0 || finalSplitAvailableWidth <= 0) {
+        throw new Error("Cannot return sidebar applet with empty workspace geometry");
+      }
+      const returnSplitRatio = Math.max(0.05, Math.min(0.95, currentLayoutWidth / finalSplitAvailableWidth));
+      const nextLayout = insertAppletLeafWithRatio(
+        workspace.layout,
+        instanceId,
+        undefined,
+        "row",
+        returnSplitRatio
+      );
+      const panel = surfaceRef.current?.querySelector<HTMLElement>(".workspace-sidebar-panel-content");
+      if (panel) {
+        const rect = panel.getBoundingClientRect();
+        const clone = panel.cloneNode(true) as HTMLElement;
+        clone.classList.add("sidebar-return-clone");
+        clone.style.left = `${rect.left}px`;
+        clone.style.top = `${rect.top}px`;
+        clone.style.width = `${rect.width}px`;
+        clone.style.height = `${rect.height}px`;
+        document.body.appendChild(clone);
+        sidebarReturnAnimationRef.current = {
+          instanceId,
+          rect,
+          clone
+        };
+      }
+      flushSync(() => {
+        setLayoutSize({ width: finalLayoutWidth, height: finalLayoutHeight });
+        setReturningSidebarLayout(nextLayout);
+        setReturningSidebarAppletId(instanceId);
+        setExpandedSidebarAppletId(null);
+      });
       void window.unitApi.applets
-        .unshelveAppletInstance({ workspaceId: workspace.id, appletInstanceId: instanceId })
-        .catch((error) => console.error("Failed to return applet to tiles", error));
+        .unshelveAppletInstance({ workspaceId: workspace.id, appletInstanceId: instanceId, splitRatio: returnSplitRatio })
+        .catch((error) => {
+          sidebarReturnAnimationRef.current?.clone.remove();
+          sidebarReturnAnimationRef.current = null;
+          setReturningSidebarAppletId(null);
+          setReturningSidebarLayout(null);
+          console.error("Failed to return applet to tiles", error);
+        });
     },
-    [workspace.id]
+    [workspace.id, workspace.layout]
   );
   const closeApplet = useCallback(
     (instanceId: string) => {
@@ -1970,9 +2090,9 @@ function WorkspaceSurface({ state, windowId, workspace }: { state: UnitState; wi
   const activeResizeTarget = resizeDrag?.target ?? hoverResizeTarget;
   const activeResizeGroups = resizeGroupsForTarget(activeResizeTarget, resizeEnabledGroups);
   const expandedSidebarGridColumns = useCallback((ratio: number) => {
-    return `minmax(0, 1fr) ${SIDEBAR_RESIZE_HANDLE_WIDTH}px calc(${ratio * 100}% - ${EXPANDED_SIDEBAR_FIXED_WIDTH}px) ${SIDEBAR_RAIL_WIDTH}px`;
+    return `minmax(0, 1fr) calc(${ratio * 100}% - ${SIDEBAR_RAIL_WIDTH}px) ${SIDEBAR_RAIL_WIDTH}px`;
   }, []);
-  const collapsedSidebarGridColumns = `minmax(0, 1fr) 0px calc(0% - 0px) ${SIDEBAR_RAIL_WIDTH}px`;
+  const collapsedSidebarGridColumns = `minmax(0, 1fr) 0px ${SIDEBAR_RAIL_WIDTH}px`;
   const sidebarRatioFromPointer = useCallback(
     (
       clientX: number,
@@ -2024,9 +2144,10 @@ function WorkspaceSurface({ state, windowId, workspace }: { state: UnitState; wi
         drag.rafId = null;
         const surface = surfaceRef.current;
         if (surface && sidebarResizeRef.current === drag) {
-          surface.style.gridTemplateColumns = expandedSidebarGridColumns(
-            sidebarRatioFromPointer(drag.pendingClientX, drag)
-          );
+          const nextRatio = sidebarRatioFromPointer(drag.pendingClientX, drag);
+          surface.style.gridTemplateColumns = expandedSidebarGridColumns(nextRatio);
+          surface.style.setProperty("--workspace-sidebar-width", `${nextRatio * 100}%`);
+          surface.style.setProperty("--workspace-sidebar-panel-width", `${Math.max(0, Math.round(drag.surfaceWidth * nextRatio - SIDEBAR_RAIL_WIDTH))}px`);
         }
       });
     };
@@ -2043,6 +2164,8 @@ function WorkspaceSurface({ state, windowId, workspace }: { state: UnitState; wi
       const surface = surfaceRef.current;
       if (surface) {
         surface.style.gridTemplateColumns = expandedSidebarGridColumns(nextRatio);
+        surface.style.setProperty("--workspace-sidebar-width", `${nextRatio * 100}%`);
+        surface.style.setProperty("--workspace-sidebar-panel-width", `${Math.max(0, Math.round(drag.surfaceWidth * nextRatio - SIDEBAR_RAIL_WIDTH))}px`);
         surface.classList.remove("sidebar-resizing");
       }
       void window.unitApi
@@ -2064,14 +2187,20 @@ function WorkspaceSurface({ state, windowId, workspace }: { state: UnitState; wi
   }, [expandedSidebarGridColumns, sidebarRatioFromPointer]);
   return (
     <section
-      className={sidebarExpanded ? "workspace-surface sidebar-expanded" : "workspace-surface"}
+      className={[
+        "workspace-surface",
+        sidebarExpanded ? "sidebar-expanded" : "",
+        returningSidebarAppletId ? "sidebar-returning-to-tiles" : ""
+      ].filter(Boolean).join(" ")}
       data-testid="workspace-surface"
       ref={surfaceRef}
       style={{
         gridTemplateColumns: sidebarExpanded
           ? expandedSidebarGridColumns(sidebarWidthRatio)
-          : collapsedSidebarGridColumns
-      }}
+          : collapsedSidebarGridColumns,
+        "--workspace-sidebar-width": `${sidebarWidthRatio * 100}%`,
+        "--workspace-sidebar-panel-width": `${sidebarPanelWidth}px`
+      } as CSSProperties}
     >
       <div className="workspace-main-stage" ref={mainStageRef}>
         {effectiveLayout && layoutGeometry ? (
@@ -2106,6 +2235,7 @@ function WorkspaceSurface({ state, windowId, workspace }: { state: UnitState; wi
             activeGroups={activeResizeGroups}
             snapGuides={resizeSnapGuides}
             onBeginResizeDrag={beginResizeDrag}
+            returningSidebarAppletId={returningSidebarAppletId}
           />
         ) : (
           <div className="workspace-empty" data-testid="workspace-empty">
@@ -2153,36 +2283,36 @@ function WorkspaceSurface({ state, windowId, workspace }: { state: UnitState; wi
       />
       <aside className="workspace-sidebar-panel" data-testid="workspace-sidebar-panel" aria-hidden={!sidebarExpanded}>
         {sidebarExpanded && expandedSidebarApplet?.session ? (
-          <>
-          <header className="workspace-sidebar-header">
-            <div className="applet-title">
-              {(() => {
-                const Icon = iconByKind[expandedSidebarApplet.session.kind];
-                return <Icon size={15} />;
-              })()}
-              <span>{expandedSidebarApplet.session.title}</span>
-            </div>
-            <div className="applet-actions">
-              <button className="icon-button" type="button" aria-label={`${expandedSidebarApplet.session.title} return to tiles`} onClick={() => returnAppletToTiles(expandedSidebarApplet.instance.id)}>
-                <TableCellsMerge size={15} />
-              </button>
-              <button
-                className="icon-button"
-                type="button"
-                aria-label="Collapse sidebar"
-                onClick={() => {
-                  setExpandedSidebarAppletId(null);
-                }}
-              >
-                <ArrowRight size={15} />
-              </button>
-              <button className="icon-button" type="button" aria-label={`${expandedSidebarApplet.session.title} close`} onClick={() => closeApplet(expandedSidebarApplet.instance.id)}>
-                <Trash2 size={15} />
-              </button>
-            </div>
-          </header>
-          <div className="workspace-sidebar-body">{renderAppletBody(expandedSidebarApplet.session, windowId)}</div>
-          </>
+          <div className="workspace-sidebar-panel-content">
+            <header className="workspace-sidebar-header">
+              <div className="applet-title">
+                {(() => {
+                  const Icon = iconByKind[expandedSidebarApplet.session.kind];
+                  return <Icon size={15} />;
+                })()}
+                <span>{expandedSidebarApplet.session.title}</span>
+              </div>
+              <div className="applet-actions">
+                <button className="icon-button" type="button" aria-label={`${expandedSidebarApplet.session.title} return to tiles`} onClick={() => returnAppletToTiles(expandedSidebarApplet.instance.id)}>
+                  <TableCellsMerge size={15} />
+                </button>
+                <button
+                  className="icon-button"
+                  type="button"
+                  aria-label="Collapse sidebar"
+                  onClick={() => {
+                    setExpandedSidebarAppletId(null);
+                  }}
+                >
+                  <ArrowRight size={15} />
+                </button>
+                <button className="icon-button" type="button" aria-label={`${expandedSidebarApplet.session.title} close`} onClick={() => closeApplet(expandedSidebarApplet.instance.id)}>
+                  <Trash2 size={15} />
+                </button>
+              </div>
+            </header>
+            <div className="workspace-sidebar-body">{renderAppletBody(expandedSidebarApplet.session, windowId)}</div>
+          </div>
         ) : null}
       </aside>
       <aside className="workspace-sidebar-rail" aria-label="Sidebar applets" data-testid="workspace-shelf">
@@ -2269,7 +2399,8 @@ function WorkspaceLayout({
   completedGroups,
   activeGroups,
   snapGuides,
-  onBeginResizeDrag
+  onBeginResizeDrag,
+  returningSidebarAppletId
 }: {
   geometry: CanonicalLayoutGeometry;
   appletsById: Map<string, { instance: Workspace["applets"][number]; session: AppletSession | undefined }>;
@@ -2290,6 +2421,7 @@ function WorkspaceLayout({
   activeGroups: EdgeGroup[];
   snapGuides: ResizeSnapGuide[];
   onBeginResizeDrag: (event: ReactPointerEvent<HTMLElement>, target: ResizeTarget) => void;
+  returningSidebarAppletId: string | null;
 }) {
   return (
     <div
@@ -2319,7 +2451,8 @@ function WorkspaceLayout({
             className={[
               "layout-leaf",
               switchSourceInstanceId === leaf.appletInstanceId ? "layout-leaf-switch-source" : "",
-              switchSourceInstanceId && switchSourceInstanceId !== leaf.appletInstanceId ? "layout-leaf-switch-target" : ""
+              switchSourceInstanceId && switchSourceInstanceId !== leaf.appletInstanceId ? "layout-leaf-switch-target" : "",
+              returningSidebarAppletId === leaf.appletInstanceId ? "layout-leaf-sidebar-return-target" : ""
             ]
               .filter(Boolean)
               .join(" ")}
@@ -3787,16 +3920,34 @@ const FILE_VIEWER_HIGHLIGHT_STYLES: Record<FileViewerSyntaxHighlighting, Highlig
 };
 
 const FILE_TREE_ROOT_ID = "__workspace_root__";
+const FILE_TREE_DEFAULT_WIDTH = 236;
+const FILE_TREE_MIN_WIDTH = 168;
+const FILE_TREE_MAX_WIDTH = 520;
+
+function clampFileTreeWidth(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value)
+    ? Math.max(FILE_TREE_MIN_WIDTH, Math.min(FILE_TREE_MAX_WIDTH, Math.round(value)))
+    : FILE_TREE_DEFAULT_WIDTH;
+}
 
 function FileViewerSurface({ session }: { session: AppletSession }) {
+  const fileViewerRef = useRef<HTMLDivElement | null>(null);
   const treeHostRef = useRef<HTMLDivElement | null>(null);
   const treeMotionTimerRef = useRef<number | null>(null);
+  const treeResizeRef = useRef<{
+    pointerId: number;
+    startClientX: number;
+    startWidth: number;
+  } | null>(null);
   const selectedFileRef = useRef<ReadFileResult | null>(null);
+  const persistedSelectedFileIdRef = useRef("");
   const editorContentRef = useRef("");
   const dirtyRef = useRef(false);
   const configuredRootPathRef = useRef("");
   const [treeHeight, setTreeHeight] = useState(0);
   const [treeMotionActive, setTreeMotionActive] = useState(false);
+  const [treeAutoExpanded, setTreeAutoExpanded] = useState(false);
+  const [localTreeWidth, setLocalTreeWidth] = useState<number | null>(null);
   const [treeData, setTreeData] = useState<FileTreeEntry[]>([]);
   const [rootPath, setRootPath] = useState("");
   const [selectedFile, setSelectedFile] = useState<ReadFileResult | null>(null);
@@ -3808,12 +3959,22 @@ function FileViewerSurface({ session }: { session: AppletSession }) {
   const [discardRequest, setDiscardRequest] = useState<FileViewerDiscardRequest | null>(null);
   const [status, setStatus] = useState<FileViewerStatus>({ state: "loading", label: "Loading files" });
   const configuredRootPath = session.state.fileViewer?.rootPath ?? "";
+  const persistedSelectedFileId = session.state.fileViewer?.selectedFileId ?? "";
   const persistedSyntaxHighlightingMode = session.state.fileViewer?.syntaxHighlighting ?? "one-dark";
+  const persistedTreeWidth = clampFileTreeWidth(session.state.fileViewer?.fileTreeWidth);
+  const fileTreePinned = session.state.fileViewer?.fileTreePinned ?? true;
+  const fileTreeCollapsed = session.state.fileViewer?.fileTreeCollapsed ?? false;
+  const fileTreeExpanded = fileTreePinned ? !fileTreeCollapsed : treeAutoExpanded;
+  const fileTreeWidth = localTreeWidth ?? persistedTreeWidth;
   const syntaxHighlightingMode = localSyntaxHighlightingMode ?? persistedSyntaxHighlightingMode;
 
   useEffect(() => {
     selectedFileRef.current = selectedFile;
   }, [selectedFile]);
+
+  useEffect(() => {
+    persistedSelectedFileIdRef.current = persistedSelectedFileId;
+  }, [persistedSelectedFileId]);
 
   useEffect(() => {
     editorContentRef.current = editorContent;
@@ -3828,8 +3989,24 @@ function FileViewerSurface({ session }: { session: AppletSession }) {
   }, [configuredRootPath]);
 
   useEffect(() => {
+    if (!treeResizeRef.current) {
+      setLocalTreeWidth(null);
+    }
+  }, [persistedTreeWidth]);
+
+  useEffect(() => {
     setLocalSyntaxHighlightingMode(null);
   }, [persistedSyntaxHighlightingMode]);
+
+  const persistFileViewerState = useCallback(async (fileViewerState: Partial<NonNullable<AppletSession["state"]["fileViewer"]>>) => {
+    await window.unitApi.applets.updateAppletSessionState({
+      sessionId: session.id,
+      state: {
+        ...session.state,
+        fileViewer: { ...session.state.fileViewer, ...fileViewerState }
+      }
+    });
+  }, [session.id, session.state]);
 
   const loadDirectory = useCallback(async (directoryId: string) => {
     setStatus({ state: "loading", label: directoryId ? `Loading ${directoryId}` : "Loading files" });
@@ -3851,26 +4028,69 @@ function FileViewerSurface({ session }: { session: AppletSession }) {
     setStatus({ state: "idle" });
   }, [configuredRootPath]);
 
+  const readFileFromDisk = useCallback(async (fileId: string) => {
+    setStatus({ state: "loading", label: `Reading ${fileId}` });
+    return window.unitApi.fileSystem.readFile({ rootPath: configuredRootPath, fileId });
+  }, [configuredRootPath]);
+
   useEffect(() => {
+    let cancelled = false;
     setTreeData([]);
     setSelectedFile(null);
     setEditorContent("");
     setDirty(false);
-    void loadDirectory("").catch((error: unknown) => setStatus({ state: "error", message: errorMessage(error) }));
-  }, [loadDirectory]);
+    void (async () => {
+      await loadDirectory("");
+      const selectedFileId = persistedSelectedFileIdRef.current;
+      if (!selectedFileId) {
+        return;
+      }
+      const file = await readFileFromDisk(selectedFileId);
+      if (cancelled) {
+        return;
+      }
+      setSelectedFile(file);
+      setStatus({ state: "idle" });
+    })().catch((error: unknown) => {
+      if (!cancelled) {
+        setStatus({ state: "error", message: errorMessage(error) });
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [configuredRootPath, loadDirectory, readFileFromDisk]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     const element = treeHostRef.current;
+    const fileViewer = fileViewerRef.current;
     if (!element) {
       return;
     }
-    const resizeObserver = new ResizeObserver(() => {
+    let frame: number | null = null;
+    const measure = () => {
+      frame = null;
       setTreeHeight(Math.max(160, Math.floor(element.getBoundingClientRect().height)));
-    });
+    };
+    const scheduleMeasure = () => {
+      if (frame !== null) {
+        return;
+      }
+      frame = window.requestAnimationFrame(measure);
+    };
+    const resizeObserver = new ResizeObserver(scheduleMeasure);
     resizeObserver.observe(element);
-    setTreeHeight(Math.max(160, Math.floor(element.getBoundingClientRect().height)));
-    return () => resizeObserver.disconnect();
-  }, []);
+    if (fileViewer) {
+      resizeObserver.observe(fileViewer);
+    }
+    scheduleMeasure();
+    return () => {
+      if (frame !== null) {
+        window.cancelAnimationFrame(frame);
+      }
+      resizeObserver.disconnect();
+    };
+  }, [fileTreeExpanded]);
 
   useEffect(() => {
     return () => {
@@ -3965,11 +4185,11 @@ function FileViewerSurface({ session }: { session: AppletSession }) {
   );
 
   const readFileIntoEditor = useCallback(async (fileId: string) => {
-    setStatus({ state: "loading", label: `Reading ${fileId}` });
-    const file = await window.unitApi.fileSystem.readFile({ rootPath: configuredRootPath, fileId });
+    const file = await readFileFromDisk(fileId);
     setSelectedFile(file);
     setStatus({ state: "idle" });
-  }, [configuredRootPath]);
+    await persistFileViewerState({ selectedFileId: file.id });
+  }, [persistFileViewerState, readFileFromDisk]);
 
   const openFile = useCallback(async (fileId: string) => {
     if (selectedFile?.id === fileId) {
@@ -3983,25 +4203,13 @@ function FileViewerSurface({ session }: { session: AppletSession }) {
   }, [readFileIntoEditor, selectedFile?.id]);
 
   const applyRootDirectory = useCallback(async (nextRootPath: string) => {
-    await window.unitApi.applets.updateAppletSessionState({
-      sessionId: session.id,
-      state: {
-        ...session.state,
-        fileViewer: { ...session.state.fileViewer, rootPath: nextRootPath }
-      }
-    });
-  }, [session.id, session.state]);
+    await persistFileViewerState({ rootPath: nextRootPath, selectedFileId: "" });
+  }, [persistFileViewerState]);
 
   const updateSyntaxHighlighting = useCallback(async (nextSyntaxHighlighting: FileViewerSyntaxHighlighting) => {
     setLocalSyntaxHighlightingMode(nextSyntaxHighlighting);
-    await window.unitApi.applets.updateAppletSessionState({
-      sessionId: session.id,
-      state: {
-        ...session.state,
-        fileViewer: { ...session.state.fileViewer, syntaxHighlighting: nextSyntaxHighlighting }
-      }
-    });
-  }, [session.id, session.state]);
+    await persistFileViewerState({ syntaxHighlighting: nextSyntaxHighlighting });
+  }, [persistFileViewerState]);
 
   const selectRootDirectory = useCallback(async () => {
     const result = await window.unitApi.fileSystem.selectDirectory({ currentPath: rootPath || configuredRootPath });
@@ -4048,14 +4256,108 @@ function FileViewerSurface({ session }: { session: AppletSession }) {
     [animateTreeMotion, loadDirectory, openFile]
   );
 
+  const persistTreeWidth = useCallback(async (nextWidth: number) => {
+    await persistFileViewerState({ fileTreeWidth: clampFileTreeWidth(nextWidth) });
+  }, [persistFileViewerState]);
+
+  const beginTreeResize = useCallback((event: ReactPointerEvent<HTMLElement>) => {
+    if (!fileTreeExpanded || event.button !== 0) {
+      return;
+    }
+    event.preventDefault();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    treeResizeRef.current = {
+      pointerId: event.pointerId,
+      startClientX: event.clientX,
+      startWidth: fileTreeWidth
+    };
+  }, [fileTreeExpanded, fileTreeWidth]);
+
+  const updateTreeResize = useCallback((event: ReactPointerEvent<HTMLElement>) => {
+    const drag = treeResizeRef.current;
+    if (!drag || event.pointerId !== drag.pointerId) {
+      return;
+    }
+    setLocalTreeWidth(clampFileTreeWidth(drag.startWidth + event.clientX - drag.startClientX));
+  }, []);
+
+  const finishTreeResize = useCallback((event: ReactPointerEvent<HTMLElement>) => {
+    const drag = treeResizeRef.current;
+    if (!drag || event.pointerId !== drag.pointerId) {
+      return;
+    }
+    const nextWidth = clampFileTreeWidth(drag.startWidth + event.clientX - drag.startClientX);
+    treeResizeRef.current = null;
+    setLocalTreeWidth(nextWidth);
+    void persistTreeWidth(nextWidth).catch((error: unknown) => setStatus({ state: "error", message: errorMessage(error) }));
+  }, [persistTreeWidth]);
+
+  const toggleTreePinned = useCallback(() => {
+    const nextPinned = !fileTreePinned;
+    setTreeAutoExpanded(false);
+    void persistFileViewerState({
+      fileTreePinned: nextPinned,
+      fileTreeCollapsed: !nextPinned
+    }).catch((error: unknown) => setStatus({ state: "error", message: errorMessage(error) }));
+  }, [fileTreePinned, persistFileViewerState]);
+
+  const collapseFileTree = useCallback(() => {
+    setTreeAutoExpanded(false);
+    void persistFileViewerState({ fileTreeCollapsed: true }).catch((error: unknown) => setStatus({ state: "error", message: errorMessage(error) }));
+  }, [persistFileViewerState]);
+
+  const expandFileTreeFromHandle = useCallback(() => {
+    if (!fileTreePinned) {
+      setTreeAutoExpanded(true);
+      return;
+    }
+    void persistFileViewerState({ fileTreeCollapsed: false }).catch((error: unknown) => setStatus({ state: "error", message: errorMessage(error) }));
+  }, [fileTreePinned, persistFileViewerState]);
+
+  const enterTreeExpandHandle = useCallback(() => {
+    if (!fileTreePinned) {
+      setTreeAutoExpanded(true);
+    }
+  }, [fileTreePinned]);
+
+  const leaveAutoTree = useCallback((event: ReactPointerEvent<HTMLElement>) => {
+    if (fileTreePinned) {
+      return;
+    }
+    const relatedTarget = event.relatedTarget;
+    if (relatedTarget instanceof Element && relatedTarget.closest(".file-tree-panel, .file-tree-header-toggle")) {
+      return;
+    }
+    setTreeAutoExpanded(false);
+  }, [fileTreePinned]);
+
   return (
-    <div className="file-viewer">
-      <aside className="file-tree-panel">
+    <div
+      className="file-viewer"
+      data-tree-expanded={fileTreeExpanded ? "1" : "0"}
+      ref={fileViewerRef}
+      style={{ "--file-tree-width": `${fileTreeWidth}px` } as CSSProperties}
+    >
+      <aside className="file-tree-panel" onPointerLeave={leaveAutoTree}>
         <div className="file-tree-root">
           <span title={rootPath}>{rootPath || "Workspace"}</span>
-          <button className="icon-button" type="button" aria-label="File viewer settings" onClick={() => setSettingsOpen(true)}>
-            <Settings size={14} />
-          </button>
+          <div className="file-tree-controls">
+            <button
+              className={["icon-button", fileTreePinned ? "active" : ""].filter(Boolean).join(" ")}
+              type="button"
+              aria-label={fileTreePinned ? "Unpin file tree" : "Pin file tree"}
+              aria-pressed={fileTreePinned}
+              onClick={toggleTreePinned}
+            >
+              <Pin size={13} />
+            </button>
+            <button className="icon-button" type="button" aria-label="Collapse file tree" onClick={collapseFileTree}>
+              <PanelLeftClose size={14} />
+            </button>
+            <button className="icon-button" type="button" aria-label="File viewer settings" onClick={() => setSettingsOpen(true)}>
+              <Settings size={14} />
+            </button>
+          </div>
         </div>
         <div className={["file-tree-host", treeMotionActive ? "animating-tree" : ""].filter(Boolean).join(" ")} ref={treeHostRef}>
           {treeHeight > 0 ? (
@@ -4079,9 +4381,32 @@ function FileViewerSurface({ session }: { session: AppletSession }) {
           ) : null}
         </div>
       </aside>
+      <button
+        className="file-tree-resizer"
+        type="button"
+        aria-label="Resize file tree"
+        aria-hidden={!fileTreeExpanded}
+        tabIndex={fileTreeExpanded ? 0 : -1}
+        onPointerDown={beginTreeResize}
+        onPointerMove={updateTreeResize}
+        onPointerUp={finishTreeResize}
+        onPointerCancel={finishTreeResize}
+      />
       <section className="file-code-panel">
         <header className="file-code-header">
-          <span>{selectedFile?.name ?? "No file selected"}</span>
+          <span className="file-tree-header-toggle-slot" data-visible={fileTreeExpanded ? "0" : "1"} aria-hidden={fileTreeExpanded}>
+            <button
+              className="icon-button file-tree-header-toggle"
+              type="button"
+              aria-label={fileTreePinned ? "Expand file tree" : "Hover to expand file tree"}
+              tabIndex={fileTreeExpanded ? -1 : 0}
+              onClick={expandFileTreeFromHandle}
+              onPointerEnter={enterTreeExpandHandle}
+            >
+              <PanelLeftOpen size={14} />
+            </button>
+          </span>
+          <span className="file-code-title">{selectedFile?.name ?? "No file selected"}</span>
           <div className="file-code-actions">
             {dirty ? <small>Unsaved</small> : status.state === "loading" ? <small>{status.label}</small> : null}
             <button

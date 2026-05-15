@@ -1,14 +1,17 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import fs from "node:fs";
+import http, { type Server } from "node:http";
 import { createRequire } from "node:module";
 import net from "node:net";
 import path from "node:path";
 import type { ChatPermissionMode, ChatRuntimeSettings, ChatTimelineBlock } from "../shared/types.js";
-import { GptOssChannelParser, type LocalLlamaOpenAiEndpoint } from "./localLlamaRuntime.js";
+import { GptOssChannelParser, renderGptOssOpenCodeSystemPrompt, type LocalLlamaOpenAiEndpoint } from "./localLlamaRuntime.js";
 
 const requireFromOpenCodeRuntime = createRequire(__filename);
 const OPENCODE_PROVIDER_ID = "unit0-local";
 const OPENCODE_MODEL_ID = "unit0-model";
+const OPENCODE_DEBUG_LOG = process.env.UNIT0_OPENCODE_DEBUG_LOG;
 
 export type OpenCodeRunOptions = {
   cwd: string;
@@ -21,12 +24,16 @@ export type OpenCodeRunOptions = {
   permissionMode: ChatPermissionMode;
 };
 
+type OpenCodeConfigOptions = Omit<OpenCodeRunOptions, "endpoint"> & {
+  endpoint: { baseUrl: string; modelId: string };
+};
+
 export type OpenCodeRuntimeEvent =
   | { type: "session.started"; sessionId: string }
   | { type: "assistant.delta"; id: string; status: string; text: string; replace?: boolean; sessionId?: string }
   | { type: "reasoning.delta"; id: string; status: string; text: string; replace?: boolean; sessionId?: string }
   | { type: "timeline"; eventType: "item.started" | "item.updated" | "item.completed"; block: ChatTimelineBlock; sessionId?: string }
-  | { type: "final.snapshot"; content: string; reasoning: string }
+  | { type: "final.snapshot"; content: string; reasoning: string; strict?: boolean; malformed?: boolean; messageId?: string }
   | { type: "turn.completed"; sessionId?: string }
   | { type: "error"; message: string; details?: string; sessionId?: string };
 
@@ -37,10 +44,40 @@ type OpenCodeServer = {
   process: ChildProcess;
 };
 
+type OpenCodeProviderEndpoint = {
+  baseUrl: string;
+  modelId: string;
+  markerSecret?: string;
+  close(): void;
+};
+
 type QueuedOpenCodeEvent =
   | { kind: "event"; event: OpenCodeRuntimeEvent }
   | { kind: "stream.closed" }
   | { kind: "error"; error: Error };
+
+type OpenCodeEventReader = {
+  connected: Promise<void>;
+  done: Promise<void>;
+};
+
+type OpenCodeProxyToolCallRecord = {
+  id: string;
+  name: string;
+  argumentsText: string;
+  cwd?: string;
+  secret?: string;
+  output?: string;
+};
+
+type OpenCodeProxyToolEventSink = {
+  cwd: string;
+  queue: AsyncEventQueue;
+  pending: Map<string, OpenCodeProxyToolCallRecord>;
+  completed: OpenCodeProxyToolCallRecord[];
+  sawReasoning: boolean;
+  markerSecret: string;
+};
 
 type OpenCodePart = {
   id?: string;
@@ -72,12 +109,30 @@ type OpenCodeHarmonyState = {
   rawText: string;
   sawHarmonyMarker: boolean;
   completed: boolean;
-  streamedFlattenedReasoningLength: number;
-  streamedFlattenedReasoning: string;
-  flattenedContentStartIndex: number | null;
+  sawPlainProtocolMarker: boolean;
+  plainProtocolInvalid: boolean;
+  streamedPlainReasoningLength: number;
   streamedFlattenedContentLength: number;
   harmonyParserStarted: boolean;
+  emittedToolMarkerIds: Set<string>;
+  sawReasoning: boolean;
 };
+
+type OpenCodeReasoningSourceState = {
+  nativeText: string;
+  parsedText: string;
+};
+
+type OpenCodeDelimitedSegment =
+  | { type: "reasoning"; text: string; start: number; end: number }
+  | { type: "content"; text: string; start: number; end: number }
+  | { type: "toolStart"; toolCall: OpenCodeProxyToolCallRecord }
+  | { type: "toolComplete"; toolCall: OpenCodeProxyToolCallRecord };
+
+const openCodeReasoningSourceStates = new WeakMap<Map<string, OpenCodeHarmonyState>, Map<string, OpenCodeReasoningSourceState>>();
+const openCodeToolMarkerIds = new WeakMap<Map<string, OpenCodeHarmonyState>, Set<string>>();
+const openCodeCompletedToolMarkerIds = new WeakMap<Map<string, OpenCodeHarmonyState>, Set<string>>();
+const openCodeReasoningSeen = new WeakMap<Map<string, OpenCodeHarmonyState>, { value: boolean }>();
 
 export interface OpenCodeRuntime {
   runTurn(options: OpenCodeRunOptions): AsyncIterable<OpenCodeRuntimeEvent>;
@@ -102,11 +157,16 @@ export class RealOpenCodeRuntime implements OpenCodeRuntime {
     const eventQueue = new AsyncEventQueue();
     let sessionId = options.sessionId?.trim() ?? "";
     let latestAssistantMessageId = "";
+    let providerEndpoint: OpenCodeProviderEndpoint | null = null;
     const harmonyStates = new Map<string, OpenCodeHarmonyState>();
     const normalizeGptOss = options.nativeGptOss;
+    const onAbort = () => eventQueue.push({ kind: "stream.closed" });
     try {
       server = await startOpenCodeServer({
-        config: openCodeConfig(options),
+        config: openCodeConfig({
+          ...options,
+          endpoint: providerEndpoint = await openCodeProviderEndpoint(options, eventQueue)
+        }),
         signal: abortController.signal
       });
       this.activeServer = server;
@@ -125,7 +185,8 @@ export class RealOpenCodeRuntime implements OpenCodeRuntime {
         }
       }
       this.activeSessionId = sessionId;
-      eventStream = readOpenCodeEvents(server.url, options.cwd, abortController.signal, (event) => {
+      abortController.signal.addEventListener("abort", onAbort, { once: true });
+      const eventReader = readOpenCodeEvents(server.url, options.cwd, abortController.signal, (event) => {
         const eventSessionId = eventSessionIdOf(event);
         if (eventSessionId && eventSessionId !== sessionId) {
           return;
@@ -142,16 +203,20 @@ export class RealOpenCodeRuntime implements OpenCodeRuntime {
             cwd: options.cwd
           });
         }
-        for (const normalizedEvent of normalizeOpenCodeHarmonyEvent(event, harmonyStates, normalizeGptOss)) {
+        for (const normalizedEvent of normalizeOpenCodeHarmonyEvent(event, harmonyStates, normalizeGptOss, providerEndpoint?.markerSecret)) {
           eventQueue.push({ kind: "event", event: normalizedEvent });
         }
       }, (message, details) => {
         eventQueue.push({ kind: "event", event: { type: "error", message, details } });
-      }).then(() => eventQueue.push({ kind: "stream.closed" }), (error) => {
+      });
+      eventStream = eventReader.done.then(() => eventQueue.push({ kind: "stream.closed" }), (error) => {
         if (!abortController.signal.aborted) {
           eventQueue.push({ kind: "error", error: error instanceof Error ? error : new Error(String(error)) });
+        } else {
+          eventQueue.push({ kind: "stream.closed" });
         }
       });
+      await eventReader.connected;
       yield { type: "session.started", sessionId };
       await openCodeJson<void>(server.url, `/session/${encodeURIComponent(sessionId)}/prompt_async`, {
         method: "POST",
@@ -159,8 +224,8 @@ export class RealOpenCodeRuntime implements OpenCodeRuntime {
         body: {
           model: { providerID: OPENCODE_PROVIDER_ID, modelID: OPENCODE_MODEL_ID },
           agent: "build",
-          system: options.settings.systemPrompt.trim() || undefined,
-          parts: [{ type: "text", text: options.prompt }]
+          system: openCodeSystemPrompt(options),
+          parts: [{ type: "text", text: openCodePrompt(options) }]
         },
         signal: abortController.signal,
           emptyOk: true
@@ -207,7 +272,7 @@ export class RealOpenCodeRuntime implements OpenCodeRuntime {
         }).catch(() => null)
         : null;
       if (snapshot?.parts) {
-        yield finalSnapshotEvent(snapshot.parts, normalizeGptOss);
+        yield finalSnapshotEvent(snapshot.parts, normalizeGptOss, latestAssistantMessageId);
       }
       yield { type: "turn.completed" };
       abortController.abort();
@@ -224,9 +289,11 @@ export class RealOpenCodeRuntime implements OpenCodeRuntime {
       if (server) {
         stopOpenCodeServer(server);
       }
+      providerEndpoint?.close();
       if (server && this.activeServer === server) {
         this.activeServer = null;
       }
+      abortController.signal.removeEventListener("abort", onAbort);
     }
   }
 
@@ -291,7 +358,7 @@ class AsyncEventQueue {
   }
 }
 
-function openCodeConfig(options: OpenCodeRunOptions): OpenCodeConfig {
+function openCodeConfig(options: OpenCodeConfigOptions): OpenCodeConfig {
   return {
     $schema: "https://opencode.ai/config.json",
     autoupdate: false,
@@ -312,7 +379,8 @@ function openCodeConfig(options: OpenCodeRunOptions): OpenCodeConfig {
             name: options.modelLabel || options.endpoint.modelId,
             options: {
               temperature: options.settings.temperature,
-              maxTokens: options.settings.maxTokens
+              maxTokens: options.settings.maxTokens,
+              reasoningEffort: options.settings.reasoningEffort
             }
           }
         }
@@ -320,6 +388,21 @@ function openCodeConfig(options: OpenCodeRunOptions): OpenCodeConfig {
     },
     permission: openCodePermissions(options.permissionMode)
   };
+}
+
+function openCodeSystemPrompt(options: OpenCodeRunOptions): string | undefined {
+  const userSystemPrompt = options.settings.systemPrompt.trim();
+  if (!options.nativeGptOss) {
+    return userSystemPrompt || undefined;
+  }
+  return [
+    renderGptOssOpenCodeSystemPrompt(options.settings),
+    userSystemPrompt ? `# User Instructions\n\n${userSystemPrompt}` : ""
+  ].filter(Boolean).join("\n\n");
+}
+
+function openCodePrompt(options: OpenCodeRunOptions): string {
+  return options.prompt;
 }
 
 function openCodePermissions(permissionMode: ChatPermissionMode): Record<string, unknown> {
@@ -353,6 +436,587 @@ async function startOpenCodeServer(options: { config: OpenCodeConfig; signal: Ab
   });
   const url = await waitForOpenCodeServer(server, port, options.signal);
   return { url, process: server };
+}
+
+async function openCodeProviderEndpoint(options: OpenCodeRunOptions, eventQueue: AsyncEventQueue): Promise<OpenCodeProviderEndpoint> {
+  if (!options.nativeGptOss || !options.endpoint.rawCompletionUrl) {
+    return {
+      baseUrl: options.endpoint.baseUrl,
+      modelId: options.endpoint.modelId,
+      close: () => undefined
+    };
+  }
+  return startGptOssOpenCodeProxy(options, eventQueue);
+}
+
+async function startGptOssOpenCodeProxy(options: OpenCodeRunOptions, eventQueue: AsyncEventQueue): Promise<OpenCodeProviderEndpoint> {
+  const port = await reserveLocalPort();
+  const toolSink: OpenCodeProxyToolEventSink = { cwd: options.cwd, queue: eventQueue, pending: new Map(), completed: [], sawReasoning: false, markerSecret: randomUUID() };
+  const upstreamAbortControllers = new Set<AbortController>();
+  const server = http.createServer((request, response) => {
+    void handleGptOssOpenCodeProxyRequest(request, response, options, toolSink, upstreamAbortControllers).catch((error) => {
+      if (!response.headersSent) {
+        response.writeHead(500, { "Content-Type": "application/json" });
+      }
+      response.end(JSON.stringify({ error: { message: errorMessage(error) } }));
+    });
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(port, "127.0.0.1", () => resolve());
+  });
+  return {
+    baseUrl: `http://127.0.0.1:${port}`,
+    modelId: OPENCODE_MODEL_ID,
+    markerSecret: toolSink.markerSecret,
+    close: () => {
+      for (const controller of upstreamAbortControllers) {
+        controller.abort();
+      }
+      server.close();
+    }
+  };
+}
+
+async function handleGptOssOpenCodeProxyRequest(
+  request: http.IncomingMessage,
+  response: http.ServerResponse,
+  options: OpenCodeRunOptions,
+  toolSink: OpenCodeProxyToolEventSink,
+  upstreamAbortControllers: Set<AbortController>
+): Promise<void> {
+  const url = new URL(request.url ?? "/", "http://127.0.0.1");
+  debugOpenCode("proxy.request", { method: request.method, path: url.pathname });
+  if (request.method === "GET" && url.pathname === "/v1/models") {
+    response.writeHead(200, { "Content-Type": "application/json" });
+    response.end(JSON.stringify({ data: [{ id: OPENCODE_MODEL_ID, object: "model" }] }));
+    return;
+  }
+  if (request.method !== "POST" || url.pathname !== "/v1/chat/completions") {
+    response.writeHead(404, { "Content-Type": "application/json" });
+    response.end(JSON.stringify({ error: { message: "Not found" } }));
+    return;
+  }
+  const body = await readJsonRequestBody(request);
+  debugOpenCode("proxy.chat.body", body);
+  emitCompletedOpenCodeProxyToolEvents(body, toolSink);
+  const prompt = renderGptOssOpenCodeProxyPrompt(body, options);
+  debugOpenCode("proxy.prompt", { prompt: prompt.slice(0, 2000) });
+  const upstreamAbortController = new AbortController();
+  upstreamAbortControllers.add(upstreamAbortController);
+  response.once("close", () => upstreamAbortController.abort());
+  const requestRawCompletion = async (rawPrompt: string, nPredict: number): Promise<ReadableStream<Uint8Array>> => {
+    const upstream = await fetch(options.endpoint.rawCompletionUrl!, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      signal: upstreamAbortController.signal,
+      body: JSON.stringify({
+        prompt: rawPrompt,
+        stream: true,
+        temperature: options.settings.temperature,
+        repeat_penalty: options.settings.repeatPenalty,
+        n_predict: nPredict,
+        cache_prompt: false,
+        id_slot: 0
+      })
+    });
+    if (!upstream.ok || !upstream.body) {
+      const errorBody = await upstream.text().catch(() => "");
+      throw new Error(errorBody || upstream.statusText);
+    }
+    return upstream.body;
+  };
+  try {
+    const upstreamBody = await requestRawCompletion(prompt, gptOssOpenCodeRequestMaxTokens(prompt, options.settings));
+    const shouldStream = !(isRecord(body) && body.stream === false);
+    if (shouldStream) {
+      response.writeHead(200, {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        Connection: "keep-alive"
+      });
+    }
+    try {
+      await streamGptOssOpenCodeProxyResponse(upstreamBody, response, openCodeProxyToolRecipientNames(body), toolSink, shouldStream, async (generatedText) => {
+        const continuationPrompt = gptOssOpenCodeFinalContinuationPrompt(prompt, generatedText);
+        debugOpenCode("proxy.final_continuation.prompt", { prompt: continuationPrompt.slice(-2000) });
+        return requestRawCompletion(continuationPrompt, gptOssOpenCodeFinalContinuationMaxTokens(options.settings));
+      });
+    } catch (error) {
+      toolSink.queue.push({ kind: "event", event: { type: "error", message: errorMessage(error) } });
+      if (!response.writableEnded) {
+        if (response.headersSent) {
+          response.write("data: [DONE]\n\n");
+          response.end();
+        } else {
+          response.writeHead(500, { "Content-Type": "application/json" });
+          response.end(JSON.stringify({ error: { message: errorMessage(error) } }));
+        }
+      }
+    }
+  } catch (error) {
+    if (!response.headersSent) {
+      response.writeHead(500, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ error: { message: errorMessage(error) } }));
+    } else if (!response.writableEnded) {
+      response.write("data: [DONE]\n\n");
+      response.end();
+    }
+  } finally {
+    upstreamAbortControllers.delete(upstreamAbortController);
+  }
+}
+
+async function readJsonRequestBody(request: http.IncomingMessage): Promise<unknown> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of request) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+  const text = Buffer.concat(chunks).toString("utf8");
+  return text ? JSON.parse(text) : {};
+}
+
+async function streamGptOssOpenCodeProxyResponse(
+  body: ReadableStream<Uint8Array>,
+  response: http.ServerResponse,
+  toolRecipients: string[],
+  toolSink: OpenCodeProxyToolEventSink,
+  stream: boolean,
+  continueToFinal: (generatedText: string) => Promise<ReadableStream<Uint8Array>>
+): Promise<void> {
+  let parser = new GptOssChannelParser({ defaultChannel: "analysis", toolRecipients });
+  let rawGeneratedText = "";
+  let content = "";
+  const markerState = { sentAnalysis: false, sentFinal: false, sentToolCompletion: false };
+  let finishedWithToolCall = false;
+  let toolCallFinishPending = false;
+  let sawReasoning = false;
+  let sawFinalContent = false;
+  const pendingChunks: Record<string, unknown>[] = [];
+  const completionId = `chatcmpl-${randomUUID()}`;
+  const created = Math.floor(Date.now() / 1000);
+  const writeDelta = (delta: Record<string, unknown>, finishReason?: string) => {
+    if (stream) {
+      writeOpenCodeProxyDelta(response, delta, finishReason, completionId, created);
+    } else {
+      pendingChunks.push({ delta, finishReason: finishReason ?? null });
+    }
+  };
+  if (stream) {
+    writeOpenCodeProxyDelta(response, { role: "assistant" }, undefined, completionId, created);
+  }
+  for (const completedToolCall of toolSink.completed.splice(0)) {
+    writeDelta({ content: openCodeToolCompleteMarker(completedToolCall) });
+    markerState.sentToolCompletion = true;
+  }
+  const applyParsedDelta = (delta: { content: string; reasoning: string; toolCallContent?: string }) => {
+    if (delta.reasoning) {
+      const prefix = markerState.sentAnalysis ? "" : "[[UNIT0_ANALYSIS]]";
+      markerState.sentAnalysis = true;
+      toolSink.sawReasoning = true;
+      sawReasoning = true;
+      writeDelta({ content: `${prefix}${delta.reasoning}` });
+    }
+    if (delta.toolCallContent) {
+      const result = writeOpenCodeProxyContentOrToolDelta(writeDelta, delta.toolCallContent, markerState, toolSink, toolRecipients, true);
+      finishedWithToolCall = result.toolCall || finishedWithToolCall;
+      toolCallFinishPending = result.toolCall || toolCallFinishPending;
+    } else if (delta.content) {
+      content += delta.content;
+      sawFinalContent = true;
+      const result = writeOpenCodeProxyContentOrToolDelta(writeDelta, delta.content, markerState, toolSink, toolRecipients, false);
+      finishedWithToolCall = result.toolCall || finishedWithToolCall;
+      toolCallFinishPending = result.toolCall || toolCallFinishPending;
+    }
+  };
+  const consumeBody = async (streamBody: ReadableStream<Uint8Array>) => {
+    await readOpenCodeProxyServerSentEvents(streamBody, (payload) => {
+      debugOpenCode("proxy.upstream", payload.slice(0, 1000));
+      if (payload === "[DONE]") {
+        return;
+      }
+      const parsed = JSON.parse(payload) as { content?: unknown };
+      const text = typeof parsed.content === "string" ? parsed.content : "";
+      if (!text) {
+        return;
+      }
+      rawGeneratedText += text;
+      applyParsedDelta(parser.push(text));
+    });
+    applyParsedDelta(parser.finish());
+  };
+  await consumeBody(body);
+  const endedWithReturn = /<\|return\|>\s*$/u.test(rawGeneratedText);
+  if (sawReasoning && !sawFinalContent && !finishedWithToolCall && endedWithReturn) {
+    parser = new GptOssChannelParser({ defaultChannel: "final", toolRecipients });
+    await consumeBody(await continueToFinal(rawGeneratedText));
+  }
+  if (toolCallFinishPending) {
+    writeDelta({}, "tool_calls");
+  } else if (!finishedWithToolCall) {
+    writeDelta({}, "stop");
+  }
+  if (!stream) {
+    response.writeHead(200, { "Content-Type": "application/json" });
+    response.end(JSON.stringify(openCodeProxyNonStreamResponse(pendingChunks)));
+    return;
+  }
+  response.write("data: [DONE]\n\n");
+  response.end();
+  void content;
+}
+
+function gptOssOpenCodeFinalContinuationPrompt(prompt: string, generatedText: string): string {
+  const withoutTerminal = generatedText.replace(/(?:<\|return\|>|<\|call\|>)\s*$/u, "");
+  const ended = withoutTerminal.endsWith("<|end|>") ? withoutTerminal : `${withoutTerminal}<|end|>`;
+  return `${prompt}${ended}<|start|>assistant<|channel|>final<|message|>`;
+}
+
+function gptOssOpenCodeFinalContinuationMaxTokens(settings: ChatRuntimeSettings): number {
+  return Math.max(64, Math.min(settings.maxTokens, 512));
+}
+
+function writeOpenCodeProxyContentOrToolDelta(
+  writeDelta: (delta: Record<string, unknown>, finishReason?: string) => void,
+  content: string,
+  markerState: { sentAnalysis: boolean; sentFinal: boolean; sentToolCompletion: boolean },
+  toolSink: OpenCodeProxyToolEventSink,
+  toolRecipients: string[],
+  allowToolCall: boolean
+): { toolCall: boolean } {
+  const toolCall = allowToolCall ? parseOpenCodeToolCallContent(content, toolRecipients) : null;
+  if (toolCall) {
+    const callId = `call_${randomUUID().replace(/-/g, "")}`;
+    const record = {
+      id: callId,
+      name: toolCall.name,
+      argumentsText: toolCall.arguments,
+      cwd: toolSink.cwd,
+      secret: toolSink.markerSecret
+    };
+    toolSink.pending.set(callId, record);
+    writeDelta({ content: openCodeToolStartMarker(record) });
+    writeDelta({
+      tool_calls: [{
+        index: 0,
+        id: callId,
+        type: "function",
+        function: {
+          name: toolCall.name,
+          arguments: toolCall.arguments
+        }
+      }]
+    });
+    return { toolCall: true };
+  }
+  if (!markerState.sentFinal && !markerState.sentAnalysis && !markerState.sentToolCompletion) {
+    throw new Error("OpenCode GPT-OSS emitted final output before streamed reasoning.");
+  }
+  const prefix = markerState.sentFinal ? "" : "[[UNIT0_FINAL]]";
+  markerState.sentFinal = true;
+  writeDelta({ content: `${prefix}${content}` });
+  return { toolCall: false };
+}
+
+function openCodeProxyNonStreamResponse(chunks: Record<string, unknown>[]): Record<string, unknown> {
+  let content = "";
+  let finishReason = "stop";
+  const toolCalls: unknown[] = [];
+  for (const chunk of chunks) {
+    const delta = isRecord(chunk.delta) ? chunk.delta : {};
+    if (typeof delta.content === "string") {
+      content += delta.content;
+    }
+    if (Array.isArray(delta.tool_calls)) {
+      toolCalls.push(...delta.tool_calls);
+    }
+    if (typeof chunk.finishReason === "string" && chunk.finishReason) {
+      finishReason = chunk.finishReason;
+    }
+  }
+  const message: Record<string, unknown> = { role: "assistant", content };
+  if (toolCalls.length > 0) {
+    message.tool_calls = toolCalls;
+  }
+  return {
+    id: `chatcmpl-${randomUUID()}`,
+    object: "chat.completion",
+    created: Math.floor(Date.now() / 1000),
+    model: OPENCODE_MODEL_ID,
+    choices: [{ index: 0, message, finish_reason: finishReason }]
+  };
+}
+
+function writeOpenCodeProxyDelta(response: http.ServerResponse, delta: Record<string, unknown>, finishReason: string | undefined, id: string, created: number): void {
+  const payload = {
+    id,
+    object: "chat.completion.chunk",
+    created,
+    model: OPENCODE_MODEL_ID,
+    choices: [{ index: 0, delta, finish_reason: finishReason ?? null }]
+  };
+  debugOpenCode("proxy.delta", payload);
+  response.write(`data: ${JSON.stringify(payload)}\n\n`);
+}
+
+function parseOpenCodeToolCallContent(content: string, toolRecipients: string[]): { name: string; arguments: string } | null {
+  const match = /^\s*<tool_call>\s*([\s\S]*?)\s*<\/tool_call>\s*$/u.exec(content);
+  if (!match) {
+    return null;
+  }
+  const decoded = JSON.parse(match[1]) as unknown;
+  if (!isRecord(decoded) || typeof decoded.tool !== "string" || !toolRecipients.includes(decoded.tool)) {
+    throw new Error("OpenCode GPT-OSS emitted an invalid tool call.");
+  }
+  const args = { ...decoded };
+  const tool = decoded.tool;
+  delete args.tool;
+  return { name: tool, arguments: JSON.stringify(args) };
+}
+
+function emitStartedOpenCodeProxyToolEvent(toolSink: OpenCodeProxyToolEventSink, toolCall: OpenCodeProxyToolCallRecord): void {
+  toolSink.queue.push({ kind: "event", event: openCodeProxyToolStartedRuntimeEvent({ ...toolCall, cwd: toolCall.cwd ?? toolSink.cwd }) });
+}
+
+function openCodeProxyToolStartedRuntimeEvent(toolCall: OpenCodeProxyToolCallRecord, sessionId?: string): OpenCodeRuntimeEvent {
+  return {
+    type: "timeline",
+    eventType: "item.started",
+    block: {
+      kind: "tool",
+      id: toolCall.id,
+      toolName: toolCall.name,
+      status: "started",
+      summary: `${toolCall.name} ${toolCall.argumentsText}`.trim(),
+      command: toolCall.argumentsText,
+      directory: toolCall.cwd,
+      initiallyExpanded: true
+    },
+    sessionId
+  };
+}
+
+function openCodeProxyToolCompletedRuntimeEvent(toolCall: OpenCodeProxyToolCallRecord, sessionId?: string): OpenCodeRuntimeEvent {
+  return {
+    type: "timeline",
+    eventType: "item.completed",
+    block: {
+      kind: "tool",
+      id: toolCall.id,
+      toolName: toolCall.name,
+      status: "completed",
+      summary: `${toolCall.name} ${toolCall.argumentsText}`.trim(),
+      command: toolCall.argumentsText,
+      directory: toolCall.cwd,
+      output: toolCall.output,
+      initiallyExpanded: false
+    },
+    sessionId
+  };
+}
+
+function openCodeToolStartMarker(toolCall: OpenCodeProxyToolCallRecord): string {
+  return `[[UNIT0_TOOL_START:${Buffer.from(JSON.stringify(toolCall), "utf8").toString("base64url")}]]`;
+}
+
+function openCodeToolCompleteMarker(toolCall: OpenCodeProxyToolCallRecord): string {
+  return `[[UNIT0_TOOL_COMPLETE:${Buffer.from(JSON.stringify(toolCall), "utf8").toString("base64url")}]]`;
+}
+
+function decodeOpenCodeToolStartMarker(encoded: string): OpenCodeProxyToolCallRecord | null {
+  try {
+    const decoded = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8")) as unknown;
+    if (!isRecord(decoded) || typeof decoded.id !== "string" || typeof decoded.name !== "string" || typeof decoded.argumentsText !== "string") {
+      return null;
+    }
+    return {
+      id: decoded.id,
+      name: decoded.name,
+      argumentsText: decoded.argumentsText,
+      cwd: typeof decoded.cwd === "string" ? decoded.cwd : undefined,
+      secret: typeof decoded.secret === "string" ? decoded.secret : undefined,
+      output: typeof decoded.output === "string" ? decoded.output : undefined
+    };
+  } catch {
+    return null;
+  }
+}
+
+function emitCompletedOpenCodeProxyToolEvents(body: unknown, toolSink: OpenCodeProxyToolEventSink): void {
+  if (!isRecord(body) || !Array.isArray(body.messages)) {
+    return;
+  }
+  for (const message of body.messages) {
+    if (!isRecord(message) || message.role !== "tool") {
+      continue;
+    }
+    const callId = typeof message.tool_call_id === "string" ? message.tool_call_id : "";
+    const toolCall = callId ? toolSink.pending.get(callId) : undefined;
+    if (!toolCall) {
+      continue;
+    }
+    toolSink.pending.delete(callId);
+    const output = openCodeProxyMessageContent(message.content);
+    toolSink.completed.push({ ...toolCall, cwd: toolCall.cwd ?? toolSink.cwd, output });
+  }
+}
+
+function renderGptOssOpenCodeProxyPrompt(body: unknown, options: OpenCodeRunOptions): string {
+  const messages = isRecord(body) && Array.isArray(body.messages) ? body.messages : [];
+  const parts = [
+    `<|start|>system<|message|>${renderGptOssOpenCodeSystemPrompt(options.settings)}<|end|>`,
+    `<|start|>developer<|message|># Environment\nWorking directory: ${escapeGptOssTranscriptText(options.cwd)}\nPlatform: win32<|end|>`,
+    options.settings.systemPrompt.trim() ? `<|start|>developer<|message|>${escapeGptOssTranscriptText(options.settings.systemPrompt.trim())}<|end|>` : "",
+    renderOpenCodeProxyToolInstructions(body)
+  ].filter(Boolean);
+  for (const message of messages) {
+    if (!isRecord(message)) {
+      continue;
+    }
+    const role = String(message.role ?? "user");
+    const content = openCodeProxyMessageContent(message.content);
+    if (!content.trim()) {
+      if (role !== "assistant") {
+        continue;
+      }
+    }
+    if (role === "assistant") {
+      parts.push(...renderOpenCodeProxyAssistantTranscript(message, content));
+    } else if (role === "tool") {
+      parts.push(`<|start|>developer<|message|># OpenCode Tool Result\n${escapeGptOssTranscriptText(content)}<|end|>`);
+    } else {
+      parts.push(`<|start|>${role === "system" ? "developer" : "user"}<|message|>${escapeGptOssTranscriptText(content)}<|end|>`);
+    }
+  }
+  parts.push("<|start|>assistant");
+  return parts.join("");
+}
+
+function renderOpenCodeProxyToolInstructions(body: unknown): string {
+  const tools = openCodeProxyToolDefinitions(body);
+  if (tools.length === 0) {
+    return "";
+  }
+  return [
+    "<|start|>developer<|message|># OpenCode Tool Calling",
+    "When a tool is needed, emit exactly one native GPT-OSS tool call in the commentary channel.",
+    "The tool call form is `<|channel|>commentary to=<tool_name> code<|message|>{json_arguments}<|call|>`.",
+    "Use only the tool names listed below. Do not invent `ls`, `list`, or `shell` recipients.",
+    "For listing files, use `glob` with a pattern such as `*`.",
+    "After receiving the tool result, continue with analysis if needed and then answer in the final channel.",
+    "",
+    JSON.stringify(tools),
+    "<|end|>"
+  ].join("\n");
+}
+
+function openCodeProxyToolRecipientNames(body: unknown): string[] {
+  return openCodeProxyToolDefinitions(body).map((tool) => tool.name);
+}
+
+function openCodeProxyToolDefinitions(body: unknown): Array<{ name: string; description?: string; parameters?: unknown }> {
+  if (!isRecord(body) || !Array.isArray(body.tools)) {
+    return [];
+  }
+  const tools: Array<{ name: string; description?: string; parameters?: unknown }> = [];
+  for (const tool of body.tools) {
+    if (!isRecord(tool)) {
+      continue;
+    }
+    const fn = isRecord(tool.function) ? tool.function : tool;
+    const name = typeof fn.name === "string" ? fn.name.trim() : "";
+    if (!name) {
+      continue;
+    }
+    tools.push({
+      name,
+      description: typeof fn.description === "string" ? fn.description : undefined,
+      parameters: isRecord(fn.parameters) ? fn.parameters : undefined
+    });
+  }
+  return tools;
+}
+
+function renderOpenCodeProxyAssistantTranscript(message: Record<string, unknown>, content: string): string[] {
+  const parts: string[] = [];
+  const parsed = parseDelimitedPlainOpenCodeText(content);
+  if (parsed.hasMarker && !parsed.malformed) {
+    if (parsed.reasoning.trim()) {
+      parts.push(`<|start|>assistant<|channel|>analysis<|message|>${escapeGptOssTranscriptText(parsed.reasoning)}<|end|>`);
+    }
+    if (parsed.content.trim()) {
+      parts.push(`<|start|>assistant<|channel|>final<|message|>${escapeGptOssTranscriptText(parsed.content)}<|end|>`);
+    }
+  } else if (content.trim()) {
+    const visible = plainGptOssTextWithoutProtocolMarkers(content).trim();
+    if (visible) {
+      parts.push(`<|start|>assistant<|channel|>final<|message|>${escapeGptOssTranscriptText(visible)}<|end|>`);
+    }
+  }
+  const toolCalls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
+  for (const toolCall of toolCalls) {
+    if (!isRecord(toolCall)) {
+      continue;
+    }
+    const fn = isRecord(toolCall.function) ? toolCall.function : {};
+    const name = typeof fn.name === "string" ? fn.name.trim() : "";
+    const args = typeof fn.arguments === "string" ? fn.arguments : "";
+    if (name) {
+      parts.push(`<|start|>assistant<|channel|>commentary to=${name} code<|message|>${escapeGptOssTranscriptText(args || "{}")}<|call|>`);
+    }
+  }
+  return parts;
+}
+
+function openCodeProxyMessageContent(value: unknown): string {
+  if (typeof value === "string") {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value.map((part) => isRecord(part) && typeof part.text === "string" ? part.text : "").join("");
+  }
+  return "";
+}
+
+function escapeGptOssTranscriptText(text: string): string {
+  return text.replace(/<\|/g, "< |");
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function gptOssOpenCodeRequestMaxTokens(prompt: string, settings: ChatRuntimeSettings): number {
+  const estimatedPromptTokens = Math.ceil(prompt.length / 3);
+  const remainingContextTokens = Math.max(0, settings.nCtx - estimatedPromptTokens);
+  const configuredMaxTokens = settings.maxTokens > 0 ? settings.maxTokens : remainingContextTokens;
+  return Math.min(configuredMaxTokens, remainingContextTokens);
+}
+
+async function readOpenCodeProxyServerSentEvents(body: ReadableStream<Uint8Array>, onPayload: (payload: string) => void): Promise<void> {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) {
+      buffer += decoder.decode();
+      break;
+    }
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split(/\r?\n/);
+    buffer = lines.pop() ?? "";
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (trimmed.startsWith("data:")) {
+        onPayload(trimmed.slice(5).trim());
+      }
+    }
+  }
+  const trimmed = buffer.trim();
+  if (trimmed.startsWith("data:")) {
+    onPayload(trimmed.slice(5).trim());
+  }
 }
 
 function waitForOpenCodeServer(server: ChildProcess, port: number, signal: AbortSignal): Promise<string> {
@@ -399,55 +1063,70 @@ function waitForOpenCodeServer(server: ChildProcess, port: number, signal: Abort
   });
 }
 
-async function readOpenCodeEvents(
+function readOpenCodeEvents(
   serverUrl: string,
   cwd: string,
   signal: AbortSignal,
   onEvent: (event: OpenCodeRuntimeEvent) => void,
   onErrorEvent: (message: string, details?: string) => void
-): Promise<void> {
-  const response = await fetch(openCodeUrl(serverUrl, "/event", cwd), {
-    headers: { Accept: "text/event-stream" },
-    signal
+): OpenCodeEventReader {
+  let resolveConnected!: () => void;
+  let rejectConnected!: (error: unknown) => void;
+  const connected = new Promise<void>((resolve, reject) => {
+    resolveConnected = resolve;
+    rejectConnected = reject;
   });
-  if (!response.ok || !response.body) {
-    throw new Error(`OpenCode event stream failed (${response.status}): ${response.statusText}`);
-  }
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-  const partSnapshots: OpenCodePartSnapshotState = new Map();
-  const processChunk = (chunk: string) => {
-    const data = sseData(chunk);
-    if (!data) {
-      return;
-    }
+  const done = (async () => {
     try {
-      for (const event of mapOpenCodeEvent(JSON.parse(data) as Record<string, unknown>, onErrorEvent, partSnapshots)) {
-        onEvent(event);
+      const response = await fetch(openCodeUrl(serverUrl, "/event", cwd), {
+        headers: { Accept: "text/event-stream" },
+        signal
+      });
+      if (!response.ok || !response.body) {
+        throw new Error(`OpenCode event stream failed (${response.status}): ${response.statusText}`);
+      }
+      resolveConnected();
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      const partSnapshots: OpenCodePartSnapshotState = new Map();
+      const processChunk = (chunk: string) => {
+        const data = sseData(chunk);
+        if (!data) {
+          return;
+        }
+        try {
+          for (const event of mapOpenCodeEvent(JSON.parse(data) as Record<string, unknown>, onErrorEvent, partSnapshots)) {
+            onEvent(event);
+          }
+        } catch (error) {
+          onErrorEvent("OpenCode emitted an event that Unit-0 could not parse.", error instanceof Error ? error.message : String(error));
+        }
+      };
+      while (!signal.aborted) {
+        const { value, done: readerDone } = await reader.read();
+        if (readerDone) {
+        buffer += decoder.decode();
+          const drained = splitSseFrames(buffer, true);
+          buffer = drained.rest;
+          for (const chunk of drained.frames) {
+            processChunk(chunk);
+          }
+          break;
+        }
+        buffer += decoder.decode(value, { stream: true });
+        const drained = splitSseFrames(buffer);
+        buffer = drained.rest;
+        for (const chunk of drained.frames) {
+          processChunk(chunk);
+        }
       }
     } catch (error) {
-      onErrorEvent("OpenCode emitted an event that Unit-0 could not parse.", error instanceof Error ? error.message : String(error));
+      rejectConnected(error);
+      throw error;
     }
-  };
-  while (!signal.aborted) {
-    const { value, done } = await reader.read();
-    if (done) {
-      buffer += decoder.decode();
-      const drained = splitSseFrames(buffer, true);
-      buffer = drained.rest;
-      for (const chunk of drained.frames) {
-        processChunk(chunk);
-      }
-      break;
-    }
-    buffer += decoder.decode(value, { stream: true });
-    const drained = splitSseFrames(buffer);
-    buffer = drained.rest;
-    for (const chunk of drained.frames) {
-      processChunk(chunk);
-    }
-  }
+  })();
+  return { connected, done };
 }
 
 export function splitSseFrames(buffer: string, flush = false): { frames: string[]; rest: string } {
@@ -471,6 +1150,7 @@ export function* mapOpenCodeEvent(raw: Record<string, unknown>, onErrorEvent: (m
   const type = String(raw.type ?? "");
   const properties = isRecord(raw.properties) ? raw.properties : {};
   if (type === "message.part.delta") {
+    debugOpenCode("opencode.event", raw);
     const sessionId = String(properties.sessionID ?? "");
     const messageId = String(properties.messageID ?? "message");
     const partId = String(properties.partID ?? randomUUID());
@@ -487,6 +1167,7 @@ export function* mapOpenCodeEvent(raw: Record<string, unknown>, onErrorEvent: (m
     return;
   }
   if (type === "message.part.updated") {
+    debugOpenCode("opencode.event", raw);
     const part = isRecord(properties.part) ? properties.part as OpenCodePart : {};
     const sessionId = String(properties.sessionID ?? part.sessionID ?? "");
     const delta = typeof properties.delta === "string" ? properties.delta : undefined;
@@ -667,11 +1348,14 @@ function appendPartSnapshotDelta(partSnapshots: OpenCodePartSnapshotState | unde
   partSnapshots.set(key, { text: `${partSnapshots.get(key)?.text ?? ""}${delta}`, streamed: true });
 }
 
-export function normalizeOpenCodeHarmonyEvent(event: OpenCodeRuntimeEvent, states: Map<string, OpenCodeHarmonyState>, nativeGptOss = true): OpenCodeRuntimeEvent[] {
-  if (event.type !== "assistant.delta") {
+export function normalizeOpenCodeHarmonyEvent(event: OpenCodeRuntimeEvent, states: Map<string, OpenCodeHarmonyState>, nativeGptOss = true, markerSecret = ""): OpenCodeRuntimeEvent[] {
+  if (!nativeGptOss) {
     return [event];
   }
-  if (!nativeGptOss) {
+  if (event.type === "reasoning.delta") {
+    return normalizeOpenCodeNativeReasoningEvent(event, states);
+  }
+  if (event.type !== "assistant.delta") {
     return [event];
   }
   const state = states.get(event.id) ?? {
@@ -679,11 +1363,13 @@ export function normalizeOpenCodeHarmonyEvent(event: OpenCodeRuntimeEvent, state
     rawText: "",
     sawHarmonyMarker: false,
     completed: false,
-    streamedFlattenedReasoningLength: 0,
-    streamedFlattenedReasoning: "",
-    flattenedContentStartIndex: null,
+    sawPlainProtocolMarker: false,
+    plainProtocolInvalid: false,
+    streamedPlainReasoningLength: 0,
     streamedFlattenedContentLength: 0,
-    harmonyParserStarted: false
+    harmonyParserStarted: false,
+    emittedToolMarkerIds: new Set(),
+    sawReasoning: false
   };
   states.set(event.id, state);
   if (event.replace) {
@@ -691,54 +1377,79 @@ export function normalizeOpenCodeHarmonyEvent(event: OpenCodeRuntimeEvent, state
     state.rawText = "";
     state.sawHarmonyMarker = false;
     state.completed = false;
-    state.streamedFlattenedReasoningLength = 0;
-    state.streamedFlattenedReasoning = "";
-    state.flattenedContentStartIndex = null;
+    state.sawPlainProtocolMarker = false;
+    state.plainProtocolInvalid = false;
+    state.streamedPlainReasoningLength = 0;
     state.streamedFlattenedContentLength = 0;
     state.harmonyParserStarted = false;
+    state.sawReasoning = false;
   } else if (state.completed) {
     return [];
   }
   state.rawText += event.text;
   state.sawHarmonyMarker = state.sawHarmonyMarker || containsHarmonyChannelMarker(event.text) || containsHarmonyChannelMarker(state.rawText);
   if (!state.sawHarmonyMarker) {
-    const parsed = parseFlattenedGptOssText(state.rawText);
-    const live = parseLiveFlattenedGptOssText(state.rawText, state.flattenedContentStartIndex);
-    if (!live.hasBoundary) {
-      if (!parsed.complete) {
-        return [];
-      }
-      state.completed = true;
-      return parsed.content ? [{ ...event, text: parsed.content, replace: event.replace || undefined }] : [];
+    const parsed = parseDelimitedPlainOpenCodeText(state.rawText, markerSecret);
+    if (parsed.malformed) {
+      state.plainProtocolInvalid = true;
+      return [{ type: "error", message: "OpenCode GPT-OSS emitted malformed channel delimiters." }];
     }
-    const nextReasoning = parsed.complete ? parsed.reasoning : live.reasoning;
-    if (!nextReasoning && !parsed.complete) {
+    state.sawPlainProtocolMarker = state.sawPlainProtocolMarker || parsed.hasMarker;
+    if (state.rawText.includes("<|return|>")) {
+      state.completed = true;
+    }
+    if (!parsed.hasMarker) {
       return [];
     }
     const events: OpenCodeRuntimeEvent[] = [];
-    if (nextReasoning.startsWith(state.streamedFlattenedReasoning)) {
-      const reasoningDelta = nextReasoning.slice(state.streamedFlattenedReasoningLength);
-      state.streamedFlattenedReasoning = nextReasoning;
-      state.streamedFlattenedReasoningLength = nextReasoning.length;
-      if (reasoningDelta) {
-        events.push({
-          type: "reasoning.delta",
-          id: `${event.id}:reasoning`,
-          status: event.status,
-          text: reasoningDelta,
-          replace: event.replace || undefined,
-          sessionId: event.sessionId
-        });
+    for (const segment of parsed.segments) {
+      if (segment.type === "reasoning") {
+        const from = event.replace ? segment.start : Math.max(segment.start, state.streamedPlainReasoningLength);
+        const reasoningDelta = segment.text.slice(from - segment.start);
+        state.streamedPlainReasoningLength = Math.max(state.streamedPlainReasoningLength, segment.end);
+        if (reasoningDelta || event.replace) {
+          state.sawReasoning = state.sawReasoning || reasoningDelta.trim().length > 0;
+          if (reasoningDelta.trim()) {
+            openCodeGlobalReasoningSeen(states).value = true;
+          }
+          events.push({
+            type: "reasoning.delta",
+            id: `${event.id}:reasoning`,
+            status: event.status,
+            text: reasoningDelta,
+            replace: event.replace || undefined,
+            sessionId: event.sessionId
+          });
+        }
+      } else if (segment.type === "toolStart") {
+        if (!openCodeGlobalReasoningSeen(states).value) {
+          return [{ type: "error", message: "OpenCode GPT-OSS emitted a tool call before streamed reasoning." }];
+        }
+        const seenToolIds = openCodeSeenToolMarkerIds(states);
+        if (!seenToolIds.has(segment.toolCall.id)) {
+          seenToolIds.add(segment.toolCall.id);
+          events.push(openCodeProxyToolStartedRuntimeEvent(segment.toolCall, event.sessionId));
+        }
+      } else if (segment.type === "toolComplete") {
+        if (!openCodeSeenToolMarkerIds(states).has(segment.toolCall.id)) {
+          return [{ type: "error", message: "OpenCode GPT-OSS emitted a tool result before the tool start." }];
+        }
+        const completedToolIds = openCodeSeenCompletedToolMarkerIds(states);
+        if (!completedToolIds.has(segment.toolCall.id)) {
+          completedToolIds.add(segment.toolCall.id);
+          events.push(openCodeProxyToolCompletedRuntimeEvent(segment.toolCall, event.sessionId));
+        }
+      } else if (segment.type === "content") {
+        const from = event.replace ? segment.start : Math.max(segment.start, state.streamedFlattenedContentLength);
+        const contentDelta = segment.text.slice(from - segment.start);
+        state.streamedFlattenedContentLength = Math.max(state.streamedFlattenedContentLength, segment.end);
+        if (contentDelta || event.replace) {
+          if (!openCodeGlobalReasoningSeen(states).value) {
+            return [{ type: "error", message: "OpenCode GPT-OSS emitted final output before streamed reasoning." }];
+          }
+          events.push({ ...event, text: contentDelta, replace: event.replace || undefined });
+        }
       }
-    }
-    if (parsed.complete) {
-      state.completed = true;
-      const finalContentDelta = parsed.content.slice(state.streamedFlattenedContentLength);
-      if (finalContentDelta) {
-        state.streamedFlattenedContentLength = parsed.content.length;
-        events.push({ ...event, text: finalContentDelta, replace: event.replace || undefined });
-      }
-      events.sort((left, right) => (left.type === "assistant.delta" ? 1 : 0) - (right.type === "assistant.delta" ? 1 : 0));
     }
     return events;
   }
@@ -747,36 +1458,144 @@ export function normalizeOpenCodeHarmonyEvent(event: OpenCodeRuntimeEvent, state
   const parsed = state.parser.push(textForParser);
   const events: OpenCodeRuntimeEvent[] = [];
   if (parsed.reasoning) {
-    events.push({
+    state.sawReasoning = true;
+    openCodeGlobalReasoningSeen(states).value = true;
+    const reasoningEvent = normalizeParsedOpenCodeReasoningEvent({
       type: "reasoning.delta",
       id: `${event.id}:reasoning`,
       status: event.status,
       text: parsed.reasoning,
       replace: event.replace || undefined,
       sessionId: event.sessionId
-    });
+    }, states);
+    if (reasoningEvent) {
+      if (reasoningEvent.type === "error") {
+        return [reasoningEvent];
+      }
+      events.push(reasoningEvent);
+    }
   }
   if (parsed.content) {
+    if (!openCodeGlobalReasoningSeen(states).value) {
+      return [{ type: "error", message: "OpenCode GPT-OSS emitted final output before streamed reasoning." }];
+    }
     events.push({ ...event, text: parsed.content, replace: event.replace || undefined });
   }
   return events;
 }
 
-function finalSnapshotEvent(parts: OpenCodePart[], nativeGptOss: boolean): OpenCodeRuntimeEvent {
+function normalizeOpenCodeNativeReasoningEvent(event: Extract<OpenCodeRuntimeEvent, { type: "reasoning.delta" }>, states: Map<string, OpenCodeHarmonyState>): OpenCodeRuntimeEvent[] {
+  const source = openCodeReasoningSourceState(states, event);
+  const nextNativeText = event.replace ? event.text : `${source.nativeText}${event.text}`;
+  let visibleText = event.text;
+  let replace = event.replace;
+  if (source.parsedText) {
+    if (source.parsedText === nextNativeText || source.parsedText.startsWith(nextNativeText)) {
+      source.nativeText = nextNativeText;
+      return [];
+    }
+    if (nextNativeText.startsWith(source.parsedText)) {
+      visibleText = nextNativeText.slice(source.parsedText.length);
+      replace = false;
+    } else {
+      return [{ type: "error", message: "OpenCode GPT-OSS emitted divergent native and parsed reasoning." }];
+    }
+  }
+  source.nativeText = nextNativeText;
+  if (visibleText.trim().length > 0) {
+    openCodeGlobalReasoningSeen(states).value = true;
+  }
+  return visibleText || replace ? [{ ...event, text: visibleText, replace: replace || undefined }] : [];
+}
+
+function normalizeParsedOpenCodeReasoningEvent(event: Extract<OpenCodeRuntimeEvent, { type: "reasoning.delta" }>, states: Map<string, OpenCodeHarmonyState>): OpenCodeRuntimeEvent | null {
+  const source = openCodeReasoningSourceState(states, event);
+  const nextParsedText = event.replace ? event.text : `${source.parsedText}${event.text}`;
+  if (source.nativeText) {
+    source.parsedText = nextParsedText;
+    if (source.nativeText === nextParsedText || source.nativeText.startsWith(nextParsedText)) {
+      return null;
+    }
+    if (!nextParsedText.startsWith(source.nativeText)) {
+      return { type: "error", message: "OpenCode GPT-OSS emitted divergent native and parsed reasoning." };
+    }
+    const text = nextParsedText.slice(source.nativeText.length);
+    return text ? { ...event, text, replace: undefined } : null;
+  }
+  source.parsedText = nextParsedText;
+  return event.text || event.replace ? event : null;
+}
+
+function openCodeReasoningSourceState(states: Map<string, OpenCodeHarmonyState>, event: Extract<OpenCodeRuntimeEvent, { type: "reasoning.delta" }>): OpenCodeReasoningSourceState {
+  let sourceStates = openCodeReasoningSourceStates.get(states);
+  if (!sourceStates) {
+    sourceStates = new Map();
+    openCodeReasoningSourceStates.set(states, sourceStates);
+  }
+  const key = `${event.sessionId ?? ""}:${messageIdFromPartId(event.id)}`;
+  const state = sourceStates.get(key) ?? { nativeText: "", parsedText: "" };
+  sourceStates.set(key, state);
+  return state;
+}
+
+function openCodeSeenToolMarkerIds(states: Map<string, OpenCodeHarmonyState>): Set<string> {
+  let ids = openCodeToolMarkerIds.get(states);
+  if (!ids) {
+    ids = new Set();
+    openCodeToolMarkerIds.set(states, ids);
+  }
+  return ids;
+}
+
+function openCodeSeenCompletedToolMarkerIds(states: Map<string, OpenCodeHarmonyState>): Set<string> {
+  let ids = openCodeCompletedToolMarkerIds.get(states);
+  if (!ids) {
+    ids = new Set();
+    openCodeCompletedToolMarkerIds.set(states, ids);
+  }
+  return ids;
+}
+
+function openCodeGlobalReasoningSeen(states: Map<string, OpenCodeHarmonyState>): { value: boolean } {
+  let seen = openCodeReasoningSeen.get(states);
+  if (!seen) {
+    seen = { value: false };
+    openCodeReasoningSeen.set(states, seen);
+  }
+  return seen;
+}
+
+function finalSnapshotEvent(parts: OpenCodePart[], nativeGptOss: boolean, messageId = ""): OpenCodeRuntimeEvent {
   const text = partsText(parts, "text");
   const nativeReasoning = partsText(parts, "reasoning");
   if (!nativeGptOss) {
     return {
       type: "final.snapshot",
       content: text,
-      reasoning: nativeReasoning
+      reasoning: nativeReasoning,
+      messageId
+    };
+  }
+  if (!containsHarmonyChannelMarker(text)) {
+    const delimited = parseDelimitedPlainOpenCodeText(text);
+    return {
+      type: "final.snapshot",
+      content: delimited.malformed ? "" : delimited.content,
+      reasoning: nativeReasoning || (delimited.malformed ? "" : delimited.reasoning),
+      strict: true,
+      malformed: delimited.malformed || undefined,
+      messageId
     };
   }
   const parsed = parseOpenCodeHarmonySnapshot(text);
+  const malformed = Boolean(parsed.content && !(nativeReasoning || parsed.reasoning));
   return {
     type: "final.snapshot",
-    content: parsed.content,
-    reasoning: `${nativeReasoning}${parsed.reasoning}`
+    content: malformed ? "" : parsed.content,
+    reasoning: malformed ? "" : nativeReasoning || parsed.reasoning,
+    strict: nativeGptOss || undefined,
+    malformed: malformed || undefined,
+    messageId
   };
 }
 
@@ -784,8 +1603,12 @@ export function parseOpenCodeHarmonySnapshot(text: string): { content: string; r
   if (!text) {
     return { content: "", reasoning: "" };
   }
-  if (!containsHarmonyChannelMarker(text) && text.includes("<|return|>")) {
-    return splitFlattenedGptOssReturnText(text);
+  if (!containsHarmonyChannelMarker(text)) {
+    const parsed = parseDelimitedPlainOpenCodeText(text);
+    if (parsed.malformed) {
+      return { content: "", reasoning: "" };
+    }
+    return { content: parsed.content, reasoning: parsed.reasoning };
   }
   const parser = new GptOssChannelParser({ defaultChannel: "final", toolRecipients: ["shell"] });
   const first = parser.push(text);
@@ -796,68 +1619,141 @@ export function parseOpenCodeHarmonySnapshot(text: string): { content: string; r
   };
 }
 
-function splitFlattenedGptOssReturnText(text: string): { content: string; reasoning: string } {
-  const parsed = parseFlattenedGptOssText(text);
-  return { content: parsed.content, reasoning: parsed.reasoning };
+function plainGptOssTextWithoutProtocolMarkers(text: string): string {
+  const returnIndex = text.indexOf("<|return|>");
+  const beforeReturn = returnIndex >= 0 ? text.slice(0, returnIndex) : text;
+  return stripIncompleteHarmonyMarker(stripHarmonyMarkers(beforeReturn));
 }
 
-function parseFlattenedGptOssText(text: string): { content: string; reasoning: string; hasBoundary: boolean; complete: boolean } {
-  const returnIndex = text.indexOf("<|return|>");
-  const complete = returnIndex >= 0;
-  const beforeReturn = complete ? text.slice(0, returnIndex) : text;
-  const cleanedRaw = stripIncompleteHarmonyMarker(stripHarmonyMarkers(beforeReturn));
-  const cleaned = cleanedRaw.trim();
-  if (!cleaned) {
-    return { content: "", reasoning: "", hasBoundary: false, complete };
+function parseDelimitedPlainOpenCodeText(text: string, markerSecret = ""): {
+  reasoning: string;
+  content: string;
+  hasMarker: boolean;
+  malformed: boolean;
+  toolStarts: OpenCodeProxyToolCallRecord[];
+  toolCompletes: OpenCodeProxyToolCallRecord[];
+  segments: OpenCodeDelimitedSegment[];
+} {
+  const analysisMarker = "[[UNIT0_ANALYSIS]]";
+  const finalMarker = "[[UNIT0_FINAL]]";
+  const markerPattern = /\[\[UNIT0_(ANALYSIS|FINAL|TOOL_START:([A-Za-z0-9_-]+)|TOOL_COMPLETE:([A-Za-z0-9_-]+))\]\]/gu;
+  const withoutPartialMarkers = stripTrailingPartialOpenCodeMarker(plainGptOssTextWithoutProtocolMarkers(text));
+  const markers = [...withoutPartialMarkers.matchAll(markerPattern)];
+  const toolStarts: OpenCodeProxyToolCallRecord[] = [];
+  const toolCompletes: OpenCodeProxyToolCallRecord[] = [];
+  const segments: OpenCodeDelimitedSegment[] = [];
+  if (markers.length === 0) {
+    return { reasoning: "", content: "", hasMarker: false, malformed: false, toolStarts, toolCompletes, segments };
   }
-  const paragraphSplit = /\r?\n\s*\r?\n/u;
-  const hasParagraphBoundary = paragraphSplit.test(cleanedRaw);
-  const endsWithParagraphBoundary = /\r?\n\s*\r?\n\s*$/u.test(cleanedRaw);
-  if (!complete && endsWithParagraphBoundary) {
-    return {
-      reasoning: cleaned,
-      content: "",
-      hasBoundary: true,
-      complete
-    };
+  let reasoning = "";
+  let content = "";
+  let cursor = 0;
+  let inAnalysis = false;
+  let inFinal = false;
+  let sawAnalysis = false;
+  let sawToolComplete = false;
+  let sawFinal = false;
+  let malformed = false;
+  for (const marker of markers) {
+    const markerStart = marker.index;
+    const markerEnd = markerStart + marker[0].length;
+    const precedingText = withoutPartialMarkers.slice(cursor, markerStart);
+    if (inFinal) {
+      const start = content.length;
+      content += precedingText;
+      if (precedingText) {
+        segments.push({ type: "content", text: precedingText, start, end: content.length });
+      }
+    } else if (inAnalysis) {
+      const start = reasoning.length;
+      reasoning += precedingText;
+      if (precedingText) {
+        segments.push({ type: "reasoning", text: precedingText, start, end: reasoning.length });
+      }
+    } else if (precedingText.trim()) {
+      malformed = true;
+    }
+    const kind = marker[1];
+    if (kind === "ANALYSIS") {
+      if (inFinal) {
+        malformed = true;
+      }
+      inAnalysis = true;
+      sawAnalysis = true;
+    } else if (kind === "FINAL") {
+      if ((!sawAnalysis && !sawToolComplete) || sawFinal) {
+        malformed = true;
+      }
+      inAnalysis = false;
+      inFinal = true;
+      sawFinal = true;
+    } else if (kind.startsWith("TOOL_START:")) {
+      if (inFinal) {
+        malformed = true;
+      }
+      const decoded = decodeOpenCodeToolStartMarker(marker[2] ?? "");
+      if (decoded && (!markerSecret || decoded.secret === markerSecret)) {
+        toolStarts.push(decoded);
+        segments.push({ type: "toolStart", toolCall: decoded });
+      }
+    } else if (kind.startsWith("TOOL_COMPLETE:")) {
+      if (inFinal) {
+        malformed = true;
+      }
+      const decoded = decodeOpenCodeToolStartMarker(marker[3] ?? "");
+      if (decoded && (!markerSecret || decoded.secret === markerSecret)) {
+        toolCompletes.push(decoded);
+        segments.push({ type: "toolComplete", toolCall: decoded });
+        sawToolComplete = true;
+      }
+    }
+    cursor = markerEnd;
   }
-  const paragraphs = cleanedRaw.split(paragraphSplit).map((part) => part.trim()).filter(Boolean);
-  if (paragraphs.length > 1) {
-    return {
-      reasoning: paragraphs.slice(0, -1).join("\n\n"),
-      content: paragraphs.at(-1) ?? "",
-      hasBoundary: true,
-      complete
-    };
+  const tail = withoutPartialMarkers.slice(cursor);
+  if (inFinal) {
+    const start = content.length;
+    content += tail;
+    if (tail) {
+      segments.push({ type: "content", text: tail, start, end: content.length });
+    }
+  } else if (inAnalysis) {
+    const start = reasoning.length;
+    reasoning += tail;
+    if (tail) {
+      segments.push({ type: "reasoning", text: tail, start, end: reasoning.length });
+    }
+  } else if (tail.trim()) {
+    malformed = true;
   }
   return {
-    content: complete ? cleaned : "",
-    reasoning: "",
-    hasBoundary: hasParagraphBoundary,
-    complete
+    reasoning,
+    content: content.replace(/^\s+/u, ""),
+    hasMarker: true,
+    malformed,
+    toolStarts,
+    toolCompletes,
+    segments
   };
 }
 
-function parseLiveFlattenedGptOssText(text: string, lockedContentStartIndex: number | null): { content: string; reasoning: string; hasBoundary: boolean; contentStartIndex: number } {
-  const returnIndex = text.indexOf("<|return|>");
-  const beforeReturn = returnIndex >= 0 ? text.slice(0, returnIndex) : text;
-  const cleanedRaw = stripIncompleteHarmonyMarker(stripHarmonyMarkers(beforeReturn));
-  void lockedContentStartIndex;
-  const paragraphSplit = /\r?\n\s*\r?\n/u;
-  const hasBoundary = paragraphSplit.test(cleanedRaw);
-  if (!hasBoundary) {
-    return { content: "", reasoning: "", hasBoundary: false, contentStartIndex: 0 };
+function stripTrailingPartialOpenCodeMarker(text: string): string {
+  const partialToolIndex = text.lastIndexOf("[[UNIT0_TOOL_START:");
+  if (partialToolIndex >= 0 && text.indexOf("]]", partialToolIndex) < 0) {
+    return text.slice(0, partialToolIndex);
   }
-  const paragraphs = cleanedRaw.split(paragraphSplit).map((part) => part.trim()).filter(Boolean);
-  if (paragraphs.length === 0) {
-    return { content: "", reasoning: "", hasBoundary: false, contentStartIndex: 0 };
+  const partialToolCompleteIndex = text.lastIndexOf("[[UNIT0_TOOL_COMPLETE:");
+  if (partialToolCompleteIndex >= 0 && text.indexOf("]]", partialToolCompleteIndex) < 0) {
+    return text.slice(0, partialToolCompleteIndex);
   }
-  const endsWithBoundary = /\r?\n\s*\r?\n\s*$/u.test(cleanedRaw);
-  const reasoningParagraphs = paragraphs.length === 1 && endsWithBoundary ? paragraphs : paragraphs.slice(0, -1);
-  const reasoning = reasoningParagraphs.join("\n\n");
-  const content = paragraphs.length > reasoningParagraphs.length ? paragraphs.at(-1) ?? "" : "";
-  const contentStartIndex = Math.max(0, cleanedRaw.length - content.length);
-  return { content, reasoning, hasBoundary: true, contentStartIndex };
+  const markers = ["[[UNIT0_ANALYSIS]]", "[[UNIT0_FINAL]]", "[[UNIT0_TOOL_START:", "[[UNIT0_TOOL_COMPLETE:"];
+  for (const marker of markers) {
+    for (let length = Math.min(marker.length - 1, text.length); length > 0; length -= 1) {
+      if (marker.startsWith(text.slice(-length))) {
+        return text.slice(0, -length);
+      }
+    }
+  }
+  return text;
 }
 
 function stripHarmonyMarkers(text: string): string {
@@ -1032,4 +1928,11 @@ function eventSessionIdOf(event: OpenCodeRuntimeEvent): string {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function debugOpenCode(label: string, data: unknown): void {
+  if (!OPENCODE_DEBUG_LOG) {
+    return;
+  }
+  fs.appendFileSync(OPENCODE_DEBUG_LOG, `${JSON.stringify({ ts: new Date().toISOString(), label, data })}\n`);
 }

@@ -18,6 +18,7 @@ import type {
 } from "../shared/types.js";
 import { normalizeBrowserNavigationUrl } from "../shared/browserUrls.js";
 import { templateLayoutToWorkspaceLayout } from "../shared/templatePlanner.js";
+import { insertAppletLeafWithRatio, replaceLayoutLeaf } from "../shared/workspaceLayout.js";
 import { workspaceTemplateById } from "../shared/workspaceTemplates.js";
 
 export type WorkspaceStateModel = {
@@ -571,7 +572,7 @@ export class WorkspaceStateStore {
     return nextWorkspace;
   }
 
-  unshelveAppletInstance(workspaceId: string, appletInstanceId: string): Workspace {
+  unshelveAppletInstance(workspaceId: string, appletInstanceId: string, splitRatio: number): Workspace {
     const model = this.load();
     const workspace = model.workspaces[workspaceId];
     if (!workspace) {
@@ -585,7 +586,7 @@ export class WorkspaceStateStore {
       appletInstanceId,
       undefined,
       "row",
-      1 - model.settings.expandedSidebarWidthRatio
+      splitRatio
     );
     const nextWorkspace = {
       ...workspace,
@@ -1117,11 +1118,27 @@ function normalizeAppletSessionState(state: AppletSessionState): AppletSessionSt
   const nextState: AppletSessionState = {};
   const rootPath = state.fileViewer?.rootPath;
   const syntaxHighlighting = state.fileViewer?.syntaxHighlighting;
+  const selectedFileId = state.fileViewer?.selectedFileId;
+  const fileTreeWidth = state.fileViewer?.fileTreeWidth;
+  const fileTreePinned = state.fileViewer?.fileTreePinned;
+  const fileTreeCollapsed = state.fileViewer?.fileTreeCollapsed;
   if (typeof rootPath === "string" && rootPath.trim()) {
     nextState.fileViewer = { rootPath: rootPath.trim() };
   }
   if (syntaxHighlighting === "one-dark" || syntaxHighlighting === "vscode-dark" || syntaxHighlighting === "codemirror" || syntaxHighlighting === "muted") {
     nextState.fileViewer = { ...nextState.fileViewer, syntaxHighlighting };
+  }
+  if (typeof selectedFileId === "string" && selectedFileId.trim()) {
+    nextState.fileViewer = { ...nextState.fileViewer, selectedFileId: selectedFileId.trim() };
+  }
+  if (typeof fileTreeWidth === "number" && Number.isFinite(fileTreeWidth)) {
+    nextState.fileViewer = { ...nextState.fileViewer, fileTreeWidth: Math.max(168, Math.min(520, Math.round(fileTreeWidth))) };
+  }
+  if (typeof fileTreePinned === "boolean") {
+    nextState.fileViewer = { ...nextState.fileViewer, fileTreePinned };
+  }
+  if (typeof fileTreeCollapsed === "boolean") {
+    nextState.fileViewer = { ...nextState.fileViewer, fileTreeCollapsed };
   }
   const browserUrl = state.browser?.url;
   if (typeof browserUrl === "string" && browserUrl.trim()) {
@@ -1153,68 +1170,6 @@ function insertAppletLeaf(
   splitDirection: "row" | "column"
 ): WorkspaceLayoutNode {
   return insertAppletLeafWithRatio(layout, appletInstanceId, targetLeafId, splitDirection, 0.5);
-}
-
-function insertAppletLeafWithRatio(
-  layout: WorkspaceLayoutNode | null,
-  appletInstanceId: string,
-  targetLeafId: string | undefined,
-  splitDirection: "row" | "column",
-  ratio: number
-): WorkspaceLayoutNode {
-  const leafNode: WorkspaceLayoutNode = {
-    id: `leaf-${appletInstanceId}`,
-    type: "leaf",
-    appletInstanceId
-  };
-  const splitRatio = Math.max(0.05, Math.min(0.95, ratio));
-  if (!layout) {
-    if (targetLeafId) {
-      throw new Error(`Cannot split missing layout leaf ${targetLeafId}`);
-    }
-    return leafNode;
-  }
-  if (!targetLeafId) {
-    return {
-      id: `split-root-${appletInstanceId}`,
-      type: "split",
-      direction: splitDirection,
-      ratio: splitRatio,
-      first: layout,
-      second: leafNode
-    };
-  }
-  const result = replaceLayoutLeaf(layout, targetLeafId, (targetLeaf) => ({
-    id: `split-${targetLeaf.id}-${appletInstanceId}`,
-    type: "split",
-    direction: splitDirection,
-    ratio: splitRatio,
-    first: targetLeaf,
-    second: leafNode
-  }));
-  if (!result.replaced) {
-    throw new Error(`Layout leaf ${targetLeafId} does not exist`);
-  }
-  return result.node;
-}
-
-function replaceLayoutLeaf(
-  node: WorkspaceLayoutNode,
-  leafId: string,
-  replace: (leaf: WorkspaceLayoutLeaf) => WorkspaceLayoutNode
-): { node: WorkspaceLayoutNode; replaced: boolean } {
-  if (node.type === "leaf") {
-    return node.id === leafId ? { node: replace(node), replaced: true } : { node, replaced: false };
-  }
-  const first = replaceLayoutLeaf(node.first, leafId, replace);
-  if (first.replaced) {
-    return { node: { ...node, first: first.node }, replaced: true };
-  }
-  const second = replaceLayoutLeaf(node.second, leafId, replace);
-  if (second.replaced) {
-    return { node: { ...node, second: second.node }, replaced: true };
-  }
-  return { node, replaced: false };
 }
 
 function removeAppletLeaf(layout: WorkspaceLayoutNode | null, appletInstanceId: string): WorkspaceLayoutNode | null {

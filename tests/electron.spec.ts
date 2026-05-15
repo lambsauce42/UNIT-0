@@ -466,6 +466,59 @@ test("renders global chat state and persists local model selection", async () =>
   await app.close();
 });
 
+test("chat assistant markdown hard breaks render as compact poem lines", async () => {
+  const dataDir = makeDataDir();
+  const store = new ChatStore(path.join(dataDir, "unit0.sqlite"));
+  const state = store.loadState();
+  store.createMessage(state.selectedThreadId, "assistant", [
+    "Sonne leise,  ",
+    "Traume sacht.  ",
+    "Winde wehen,  ",
+    "Schatten weichen.",
+    "",
+    "Flusse ziehen,  ",
+    "Wege weit.  ",
+    "Echo klingt,  ",
+    "Stille bleibt."
+  ].join("\n"), "complete", {
+    label: "gpt-oss-test",
+    sourceLabel: "Built-in"
+  });
+
+  const app = await launchApp(dataDir);
+  try {
+    const page = await firstWindow(app);
+    const body = page.getByTestId("chat-message-assistant").last().locator(".assistant-content-block");
+    await expect(body).toContainText("Schatten weichen.");
+    await expect(body.locator("p")).toHaveCount(2);
+    const metrics = await body.evaluate((element) => {
+      const paragraphs = Array.from(element.querySelectorAll("p"));
+      const first = paragraphs[0];
+      const second = paragraphs[1];
+      if (!first || !second) {
+        throw new Error("Expected two rendered stanza paragraphs");
+      }
+      const style = getComputedStyle(first);
+      const lineHeight = Number.parseFloat(style.lineHeight);
+      const firstRect = first.getBoundingClientRect();
+      const secondRect = second.getBoundingClientRect();
+      return {
+        firstLineBoxes: first.querySelectorAll("br").length + 1,
+        firstVisualLines: firstRect.height / lineHeight,
+        stanzaGap: secondRect.top - firstRect.bottom,
+        whiteSpace: style.whiteSpace
+      };
+    });
+    expect(metrics.firstLineBoxes).toBe(4);
+    expect(metrics.firstVisualLines).toBeGreaterThan(3.5);
+    expect(metrics.firstVisualLines).toBeLessThan(5);
+    expect(metrics.stanzaGap).toBeGreaterThan(0);
+    expect(metrics.whiteSpace).toBe("normal");
+  } finally {
+    await app.close();
+  }
+});
+
 test("chat renders OpenCode streaming timeline blocks in DOM order", async () => {
   const dataDir = makeDataDir();
   const store = new ChatStore(path.join(dataDir, "unit0.sqlite"));
@@ -600,14 +653,14 @@ test("chat OpenCode mode runs through real local model harness", async () => {
         builtinModelId: state.selectedModelId,
         permissionMode: "default_permissions",
         runtimeSettings: {
-          nCtx: 16384,
+          nCtx: 32768,
           nGpuLayers: localGpuLayers,
-          maxTokens: 256,
-          temperature: 0.2,
-          systemPrompt: "For this test, answer in exactly two paragraphs. The first paragraph is one short reasoning sentence. The second paragraph is only the final answer."
+          maxTokens: 512,
+          temperature: 0,
+          systemPrompt: "For this test, keep reasoning in the reasoning channel. The final answer must be exactly opencode-ok and nothing else."
         }
       });
-      const submit = window.unitApi.chat.submit({ text: "First paragraph: one short reason that the required final answer is opencode-ok. Second paragraph: exactly opencode-ok and nothing else." });
+      const submit = window.unitApi.chat.submit({ text: "Answer with final exactly opencode-ok and nothing else." });
       const frames: Array<{ content: string; reasoning: string; timelineKinds: string[]; status: string; generationStatus: string }> = [];
       const startedAt = Date.now();
       while (Date.now() - startedAt < 240_000) {
@@ -634,6 +687,16 @@ test("chat OpenCode mode runs through real local model harness", async () => {
       return { finalState: await window.unitApi.chat.bootstrap(), frames };
     }, { modelPath, projectDir, gpuLayers });
     const finalState = e2eResult.finalState;
+    if (finalState.generation.status === "error") {
+      const assistant = finalState.messages.filter((message) => message.role === "assistant").at(-1);
+      throw new Error(JSON.stringify({
+        generation: finalState.generation,
+        assistantStatus: assistant?.status,
+        content: assistant?.content,
+        reasoning: assistant?.reasoning,
+        timelineBlocks: assistant?.timelineBlocks
+      }, null, 2));
+    }
     expect(finalState.generation.status).not.toBe("error");
 
     let finalAssistantReasoning = "";
@@ -670,22 +733,213 @@ test("chat OpenCode mode runs through real local model harness", async () => {
     for (const frame of e2eResult.frames) {
       expect(frame.content).not.toContain("<|return|>");
       expect(frame.reasoning).not.toContain("<|return|>");
+      expect(frame.content).not.toContain("[[UNIT0_ANALYSIS]]");
+      expect(frame.content).not.toContain("[[UNIT0_FINAL]]");
+      expect(frame.reasoning).not.toContain("[[UNIT0_ANALYSIS]]");
+      expect(frame.reasoning).not.toContain("[[UNIT0_FINAL]]");
     }
     const answerFrames = e2eResult.frames.map((frame) => frame.content).filter(Boolean);
     for (let index = 1; index < answerFrames.length; index += 1) {
-      expect(answerFrames[index]).toContain(answerFrames[index - 1]);
+      expect(answerFrames[index].startsWith(answerFrames[index - 1])).toBe(true);
     }
     const rendered = page.getByTestId("chat-message-assistant").last();
     expect(await rendered.locator("details.reasoning-shell").count()).toBeGreaterThan(0);
     const body = rendered.locator(".codex-assistant-message-block").last();
     await expect(body).toHaveText("opencode-ok");
     await expect(body).not.toContainText("<|return|>");
+    await expect(body).not.toContainText("[[UNIT0_ANALYSIS]]");
+    await expect(body).not.toContainText("[[UNIT0_FINAL]]");
     await expect(body).not.toContainText("We need");
     await expect(body).not.toContainText("User says");
     const bodyText = await body.innerText();
     const reasoningProbe = finalAssistantReasoning.slice(0, Math.min(80, finalAssistantReasoning.length));
     expect(reasoningProbe.length).toBeGreaterThan(0);
     expect(bodyText).not.toContain(reasoningProbe);
+  } finally {
+    await app.close();
+    fs.rmSync(projectDir, { recursive: true, force: true });
+  }
+});
+
+test("chat OpenCode mode completes short local model greeting prompts", async () => {
+  test.setTimeout(300_000);
+  const modelPath = process.env.UNIT0_E2E_OPENCODE_LOCAL_MODEL || "C:\\Users\\Max\\Models\\gpt-oss-20b-GGUF\\gpt-oss-20b-mxfp4.gguf";
+  const gpuLayers = Number(process.env.UNIT0_E2E_GGUF_GPU_LAYERS ?? "0");
+  test.skip(!fs.existsSync(modelPath), `OpenCode local model not found: ${modelPath}`);
+  const dataDir = makeDataDir();
+  const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), "unit-0-opencode-hi-e2e-project-"));
+  const app = await launchApp(dataDir);
+  try {
+    const page = await firstWindow(app);
+    const result = await page.evaluate(async ({ modelPath: localModelPath, projectDir: localProjectDir, gpuLayers: localGpuLayers }) => {
+      let state = await window.unitApi.chat.bootstrap();
+      await window.unitApi.chat.updateProjectSettings({
+        projectId: state.selectedProjectId,
+        title: "OpenCode Hi E2E",
+        directory: localProjectDir
+      });
+      state = await window.unitApi.chat.addLocalModel({ path: localModelPath });
+      state = await window.unitApi.chat.updateThreadSettings({
+        threadId: state.selectedThreadId,
+        providerMode: "builtin",
+        builtinAgenticFramework: "opencode",
+        builtinModelId: state.selectedModelId,
+        permissionMode: "default_permissions",
+        runtimeSettings: {
+          nCtx: 32768,
+          nGpuLayers: localGpuLayers,
+          maxTokens: 128,
+          temperature: 0,
+          systemPrompt: ""
+        }
+      });
+      const submit = window.unitApi.chat.submit({ text: "hi" });
+      const frames: Array<{ content: string; reasoning: string; generationStatus: string; status: string }> = [];
+      const startedAt = Date.now();
+      while (Date.now() - startedAt < 240_000) {
+        const snapshot = await window.unitApi.chat.bootstrap();
+        const assistant = snapshot.messages.filter((message) => message.role === "assistant").at(-1);
+        if (assistant) {
+          frames.push({
+            content: assistant.content ?? "",
+            reasoning: assistant.reasoning ?? "",
+            generationStatus: snapshot.generation.status,
+            status: assistant.status
+          });
+        }
+        if (snapshot.generation.status === "idle" && assistant?.status === "complete") {
+          break;
+        }
+        if (snapshot.generation.status === "error" || assistant?.status === "error") {
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      await submit;
+      return { finalState: await window.unitApi.chat.bootstrap(), frames };
+    }, { modelPath, projectDir, gpuLayers });
+    const assistant = result.finalState.messages.filter((message) => message.role === "assistant").at(-1);
+    if (result.finalState.generation.status === "error") {
+      throw new Error(JSON.stringify({
+        generation: result.finalState.generation,
+        assistantStatus: assistant?.status,
+        content: assistant?.content,
+        reasoning: assistant?.reasoning,
+        timelineBlocks: assistant?.timelineBlocks
+      }, null, 2));
+    }
+    expect(result.finalState.generation.status).toBe("idle");
+    expect(assistant?.status).toBe("complete");
+    expect(assistant?.reasoning?.trim().length).toBeGreaterThan(0);
+    expect(assistant?.content?.trim().length).toBeGreaterThan(0);
+    expect(assistant?.content ?? "").not.toContain("<|");
+    expect(assistant?.reasoning ?? "").not.toContain("<|");
+    expect(result.frames.some((frame) => frame.reasoning.trim().length > 0)).toBe(true);
+    expect(result.frames.some((frame) => frame.content.trim().length > 0)).toBe(true);
+  } finally {
+    await app.close();
+    fs.rmSync(projectDir, { recursive: true, force: true });
+  }
+});
+
+test("chat OpenCode mode renders real local model tool calls for directory search", async () => {
+  test.setTimeout(300_000);
+  const modelPath = process.env.UNIT0_E2E_OPENCODE_LOCAL_MODEL || "C:\\Users\\Max\\Models\\gpt-oss-20b-GGUF\\gpt-oss-20b-mxfp4.gguf";
+  const gpuLayers = Number(process.env.UNIT0_E2E_GGUF_GPU_LAYERS ?? "0");
+  test.skip(!fs.existsSync(modelPath), `OpenCode local model not found: ${modelPath}`);
+  const dataDir = makeDataDir();
+  const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), "unit-0-opencode-tool-e2e-project-"));
+  fs.writeFileSync(path.join(projectDir, "benchmark_report.md"), "# Benchmark\n");
+  fs.writeFileSync(path.join(projectDir, "hello.c"), "int main(void) { return 0; }\n");
+  fs.writeFileSync(path.join(projectDir, "hello.exe"), "fake exe\n");
+  const app = await launchApp(dataDir);
+  try {
+    const page = await firstWindow(app);
+    const e2eResult = await page.evaluate(async ({ modelPath: localModelPath, projectDir: localProjectDir, gpuLayers: localGpuLayers }) => {
+      let state = await window.unitApi.chat.bootstrap();
+      await window.unitApi.chat.updateProjectSettings({
+        projectId: state.selectedProjectId,
+        title: "OpenCode Tool E2E",
+        directory: localProjectDir
+      });
+      state = await window.unitApi.chat.addLocalModel({ path: localModelPath });
+      state = await window.unitApi.chat.updateThreadSettings({
+        threadId: state.selectedThreadId,
+        providerMode: "builtin",
+        builtinAgenticFramework: "opencode",
+        builtinModelId: state.selectedModelId,
+        permissionMode: "default_permissions",
+        runtimeSettings: {
+          nCtx: 32768,
+          nGpuLayers: localGpuLayers,
+          maxTokens: 512,
+          temperature: 0,
+          systemPrompt: "Use the available OpenCode file listing/search tools when the user asks what files are in the current directory. After the tool result, answer with only the filenames you found."
+        }
+      });
+      const submit = window.unitApi.chat.submit({ text: "Use search/list to check what files are in the current directory, then answer only with the file names." });
+      const frames: Array<{ content: string; reasoning: string; timelineKinds: string[]; toolCount: number; status: string; generationStatus: string }> = [];
+      const startedAt = Date.now();
+      while (Date.now() - startedAt < 240_000) {
+        const snapshot = await window.unitApi.chat.bootstrap();
+        const assistant = snapshot.messages.filter((message) => message.role === "assistant").at(-1);
+        if (assistant) {
+          frames.push({
+            content: assistant.content ?? "",
+            reasoning: assistant.reasoning ?? "",
+            timelineKinds: assistant.timelineBlocks?.map((block) => block.kind) ?? [],
+            toolCount: assistant.timelineBlocks?.filter((block) => block.kind === "tool").length ?? 0,
+            status: assistant.status,
+            generationStatus: snapshot.generation.status
+          });
+        }
+        if (snapshot.generation.status === "idle" && assistant?.status === "complete") {
+          break;
+        }
+        if (snapshot.generation.status === "error" || assistant?.status === "error") {
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      await submit;
+      return { finalState: await window.unitApi.chat.bootstrap(), frames };
+    }, { modelPath, projectDir, gpuLayers });
+
+    const finalState = e2eResult.finalState;
+    const assistant = finalState.messages.filter((message) => message.role === "assistant").at(-1);
+    if (finalState.generation.status === "error") {
+      throw new Error(JSON.stringify({
+        generation: finalState.generation,
+        assistantStatus: assistant?.status,
+        content: assistant?.content,
+        reasoning: assistant?.reasoning,
+        timelineBlocks: assistant?.timelineBlocks
+      }, null, 2));
+    }
+    expect(finalState.generation.status).toBe("idle");
+    expect(assistant?.status).toBe("complete");
+    const toolBlocks = assistant?.timelineBlocks?.filter((block) => block.kind === "tool") ?? [];
+    expect(toolBlocks.length).toBeGreaterThan(0);
+    const renderedToolText = toolBlocks.map((block) => [block.toolName, block.command, block.directory, block.output, block.summary].filter(Boolean).join("\n")).join("\n");
+    expect(renderedToolText).toContain(projectDir);
+    expect(renderedToolText).toMatch(/benchmark_report\.md|hello\.c|hello\.exe/u);
+    expect(e2eResult.frames.some((frame) => frame.toolCount > 0)).toBe(true);
+    expect(assistant?.content ?? "").toContain("benchmark_report.md");
+    expect(assistant?.content ?? "").toContain("hello.c");
+    expect(assistant?.content ?? "").toContain("hello.exe");
+    expect(assistant?.content ?? "").not.toContain("<|return|>");
+    expect(assistant?.reasoning ?? "").not.toContain("<|return|>");
+    expect(assistant?.content ?? "").not.toContain("[[UNIT0_ANALYSIS]]");
+    expect(assistant?.content ?? "").not.toContain("[[UNIT0_FINAL]]");
+    expect(assistant?.reasoning ?? "").not.toContain("[[UNIT0_ANALYSIS]]");
+    expect(assistant?.reasoning ?? "").not.toContain("[[UNIT0_FINAL]]");
+    const rendered = page.getByTestId("chat-message-assistant").last();
+    await expect(rendered.locator(".codex-tool-card").first()).toBeVisible();
+    await expect(rendered.locator(".codex-assistant-message-block").last()).toContainText("benchmark_report.md");
+    await expect(rendered.locator(".codex-assistant-message-block").last()).not.toContainText("We have");
+    await expect(rendered.locator(".codex-assistant-message-block").last()).not.toContainText("So output");
+    await expect(rendered).not.toContainText("[[UNIT0_ANALYSIS]]");
+    await expect(rendered).not.toContainText("[[UNIT0_FINAL]]");
   } finally {
     await app.close();
     fs.rmSync(projectDir, { recursive: true, force: true });

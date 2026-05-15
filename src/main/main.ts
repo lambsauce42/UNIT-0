@@ -467,7 +467,11 @@ class TabRegistry {
     if (!workspace || this.dragSession) {
       throw new Error(`Cannot return applet instance ${payload.appletInstanceId} to tiles`);
     }
-    this.workspaces[payload.workspaceId] = this.store.unshelveAppletInstance(payload.workspaceId, payload.appletInstanceId);
+    this.workspaces[payload.workspaceId] = this.store.unshelveAppletInstance(
+      payload.workspaceId,
+      payload.appletInstanceId,
+      payload.splitRatio
+    );
   }
 
   changeAppletInstanceKind(payload: ChangeAppletInstanceKindPayload): { sessionId: string; previousKind: AppletKind } {

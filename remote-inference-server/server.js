@@ -871,6 +871,11 @@ class GptOssChannelParser {
         this.buffer = this.buffer.slice(endIndex + terminator.marker.length);
         this.activeChannel = null;
         this.activeToolRecipient = "";
+        if (terminator.marker === GPTOSS_RETURN_MARKER || terminator.marker === GPTOSS_CALL_MARKER) {
+          this.buffer = "";
+          this.done = true;
+          return { content: content.join(""), reasoning: reasoning.join("") };
+        }
         if (!this.buffer) {
           return { content: content.join(""), reasoning: reasoning.join("") };
         }
@@ -960,29 +965,28 @@ class GptOssChannelParser {
     }
     const prefix = this.buffer.slice(0, messageIndex + messageMarker.length);
     this.buffer = this.buffer.slice(messageIndex + messageMarker.length);
-    const toolRecipient = this.commentaryToolRecipient(prefix);
+    const commentaryTarget = commentaryRecipient(prefix);
+    const toolRecipient = this.commentaryToolRecipient(commentaryTarget);
     if (toolRecipient) {
       this.activeToolRecipient = toolRecipient;
       return "tool_json";
     }
-    if (prefix.includes("to=final") && prefix.includes("<|constrain|>json")) {
+    if (commentaryTarget === "final" && prefix.includes("<|constrain|>json")) {
       return "final_json";
     }
-    if (prefix.includes("to=final")) {
+    if (commentaryTarget === "final") {
       return "final";
     }
-    return "analysis";
+    throw new Error(`GPT-OSS emitted unsupported commentary recipient: ${commentaryTarget || "(none)"}.`);
   }
 
-  commentaryToolRecipient(prefix) {
+  commentaryToolRecipient(commentaryTarget) {
     const recipients = this.options.toolRecipients || [];
     if (recipients.length === 0) {
       return "";
     }
-    const normalized = prefix.replace(/\s+/g, " ");
     for (const recipient of recipients) {
-      const escaped = recipient.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      if (new RegExp(`(?:^|\\s)to=${escaped}(?:\\s|<|$)`, "u").test(normalized)) {
+      if (commentaryTarget === recipient) {
         return recipient;
       }
     }
@@ -1003,6 +1007,13 @@ class GptOssChannelParser {
 
 function awaitingKnownPrefix(text, markers) {
   return Boolean(text) && markers.some((marker) => marker.startsWith(text));
+}
+
+function commentaryRecipient(prefix) {
+  const markerIndex = prefix.indexOf("<|message|>");
+  const header = markerIndex >= 0 ? prefix.slice(0, markerIndex) : prefix;
+  const match = /(?:^|\s)to=([^\s<]+)/u.exec(header);
+  return match?.[1] ?? "";
 }
 
 function firstSpecialTerminator(text) {
@@ -1046,9 +1057,9 @@ function appendCommentaryFinalJson(text, content) {
       }
     }
   } catch {
-    // Fall through to preserving the raw constrained payload.
+    throw new Error("GPT-OSS emitted malformed constrained final JSON.");
   }
-  content.push(normalized);
+  throw new Error("GPT-OSS emitted constrained final JSON without final content.");
 }
 
 function appendCommentaryToolCallJson(toolRecipient, text, content) {
@@ -1063,9 +1074,9 @@ function appendCommentaryToolCallJson(toolRecipient, text, content) {
       return;
     }
   } catch {
-    // Keep malformed tool JSON visible to the strict document tool-call parser.
+    throw new Error("GPT-OSS emitted malformed tool-call JSON.");
   }
-  content.push(`<tool_call>${normalized}</tool_call>`);
+  throw new Error("GPT-OSS emitted malformed tool-call JSON.");
 }
 
 function sendJson(response, request, requestPath, config, payload, statusCode = 200) {

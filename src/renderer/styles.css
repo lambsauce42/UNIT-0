@@ -464,7 +464,7 @@ button {
 .workspace-surface {
   position: relative;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 0 0 40px;
+  grid-template-columns: minmax(0, 1fr) 0 40px;
   gap: 0;
   height: 100%;
   min-height: 0;
@@ -477,6 +477,10 @@ button {
   user-select: none;
 }
 
+.workspace-surface.sidebar-returning-to-tiles {
+  transition: none;
+}
+
 .workspace-main-stage {
   position: relative;
   min-width: 0;
@@ -487,36 +491,46 @@ button {
 }
 
 .workspace-sidebar-resizer {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: calc(100% - var(--workspace-sidebar-width, 25%));
+  z-index: 4;
   box-sizing: border-box;
-  width: 100%;
+  width: 10px;
   min-width: 0;
-  height: 100%;
   overflow: hidden;
   border: 0;
-  border-left: 1px solid var(--border-subtle);
-  border-right: 1px solid var(--border-subtle);
-  background: var(--bg-shell);
+  background: transparent;
   cursor: ew-resize;
   opacity: 0;
   pointer-events: none;
-  transition: opacity 180ms ease, background 140ms ease;
+  transform: translateX(-50%);
+  transition: left 220ms ease;
 }
 
 .sidebar-expanded .workspace-sidebar-resizer {
-  opacity: 1;
   pointer-events: auto;
 }
 
 .workspace-sidebar-resizer:hover,
 .workspace-sidebar-resizer:focus-visible {
-  background: var(--bg-hover);
+  background: transparent;
+}
+
+.workspace-surface.sidebar-resizing .workspace-sidebar-resizer {
+  transition: none;
+}
+
+.workspace-surface.sidebar-returning-to-tiles .workspace-sidebar-resizer,
+.workspace-surface.sidebar-returning-to-tiles .workspace-sidebar-panel {
+  transition: none;
 }
 
 .workspace-sidebar-panel {
-  display: grid;
+  justify-self: stretch;
   min-width: 0;
   min-height: 0;
-  grid-template-rows: 38px minmax(0, 1fr);
   overflow: hidden;
   contain: layout paint;
   border-left: 1px solid var(--border-subtle);
@@ -532,6 +546,16 @@ button {
   pointer-events: auto;
   visibility: visible;
   transition: opacity 180ms ease;
+}
+
+.workspace-sidebar-panel-content {
+  display: grid;
+  width: var(--workspace-sidebar-panel-width, 320px);
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  margin-left: auto;
+  grid-template-rows: 38px minmax(0, 1fr);
 }
 
 .workspace-sidebar-header {
@@ -1490,6 +1514,20 @@ button {
   display: flex;
 }
 
+.layout-leaf-sidebar-return-target {
+  visibility: hidden;
+}
+
+.sidebar-return-clone {
+  position: fixed;
+  z-index: 21;
+  display: grid;
+  overflow: hidden;
+  pointer-events: none;
+  transform-origin: 0 0;
+  will-change: transform;
+}
+
 .layout-leaf > .applet-frame {
   flex: 1 1 auto;
 }
@@ -1850,8 +1888,13 @@ button {
   display: grid;
   height: 100%;
   min-height: 0;
-  grid-template-columns: 236px minmax(0, 1fr);
+  grid-template-columns: var(--file-tree-width, 236px) minmax(0, 1fr);
   background: var(--bg-panel);
+  transition: grid-template-columns 180ms ease;
+}
+
+.file-viewer[data-tree-expanded="0"] {
+  grid-template-columns: 0 minmax(0, 1fr);
 }
 
 .discard-backdrop {
@@ -2026,12 +2069,20 @@ button {
   min-width: 0;
   min-height: 0;
   grid-template-rows: 35px minmax(0, 1fr);
+  overflow: hidden;
   border-right: 1px solid var(--border-subtle);
+  opacity: 1;
+  transition: opacity 140ms ease;
+}
+
+.file-viewer[data-tree-expanded="0"] .file-tree-panel {
+  opacity: 0;
+  pointer-events: none;
 }
 
 .file-tree-root {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 28px;
+  grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
   gap: 4px;
   overflow: hidden;
@@ -2047,7 +2098,48 @@ button {
   white-space: nowrap;
 }
 
+.file-tree-controls {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.file-tree-controls .icon-button {
+  width: 24px;
+  height: 24px;
+}
+
+.file-tree-controls .icon-button.active {
+  background: var(--accent-muted);
+  color: var(--accent-strong);
+}
+
+.file-tree-resizer {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: var(--file-tree-width, 236px);
+  z-index: 3;
+  width: 10px;
+  min-width: 0;
+  border: 0;
+  background: transparent;
+  cursor: col-resize;
+  transform: translateX(-50%);
+  transition: left 180ms ease;
+}
+
+.file-tree-resizer:hover,
+.file-tree-resizer:focus-visible {
+  background: transparent;
+}
+
+.file-viewer[data-tree-expanded="0"] .file-tree-resizer {
+  pointer-events: none;
+}
+
 .file-tree-host {
+  height: 100%;
   min-height: 0;
   overflow: hidden;
   padding: 4px 5px 8px;
@@ -2114,20 +2206,54 @@ button {
   display: flex;
   min-width: 0;
   align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 0 12px;
+  gap: 0;
+  padding: 0 10px 0 6px;
   border-bottom: 1px solid var(--border-subtle);
   color: var(--text-primary);
   font-size: 12px;
   font-weight: 650;
+  transition: padding-left 180ms ease;
 }
 
-.file-code-header span,
+.file-viewer[data-tree-expanded="1"] .file-code-header {
+  padding-left: 12px;
+}
+
+.file-tree-header-toggle-slot {
+  display: grid;
+  flex: 0 0 24px;
+  width: 24px;
+  margin-right: 8px;
+  min-width: 0;
+  place-items: center;
+  opacity: 1;
+  overflow: hidden;
+  transition: flex-basis 180ms ease, width 180ms ease, margin-right 180ms ease, opacity 120ms ease;
+}
+
+.file-tree-header-toggle-slot[data-visible="0"] {
+  flex-basis: 0;
+  width: 0;
+  margin-right: 0;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.file-tree-header-toggle {
+  width: 24px;
+  height: 24px;
+}
+
+.file-code-title,
 .file-code-header small {
   overflow: hidden;
+  min-width: 0;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.file-code-title {
+  flex: 1 1 auto;
 }
 
 .file-code-header small {
@@ -2139,6 +2265,7 @@ button {
   display: flex;
   align-items: center;
   gap: 8px;
+  margin-left: 8px;
   min-width: 0;
 }
 
@@ -3187,8 +3314,11 @@ button {
 
 .chat-message p {
   margin: 0;
-  white-space: pre-wrap;
   line-height: 1.55;
+}
+
+.chat-formatted-view p {
+  white-space: normal;
 }
 
 .chat-formatted-view > * + * {

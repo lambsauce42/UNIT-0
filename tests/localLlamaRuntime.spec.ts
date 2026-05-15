@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { EventEmitter } from "node:events";
 import { buildEmbeddingServerCommand } from "../src/main/embeddingRuntime";
-import { buildLlamaServerCommand, LocalLlamaRuntime, resolveBundledLlamaServerBinary } from "../src/main/localLlamaRuntime";
+import { buildLlamaServerCommand, GptOssChannelParser, LocalLlamaRuntime, resolveBundledLlamaServerBinary } from "../src/main/localLlamaRuntime";
 
 test("builds a llama-server command for one local slot", () => {
   const command = buildLlamaServerCommand({
@@ -96,6 +96,34 @@ test("enables special token output when GPT-OSS is detected outside the file pat
   });
 
   expect(command.args).toContain("--special");
+});
+
+test("stops GPT-OSS channel parsing after terminal return and call markers", () => {
+  const finalParser = new GptOssChannelParser({ defaultChannel: "analysis" });
+  expect(finalParser.push("<|channel|>final<|message|>ok<|return|>leaked")).toEqual({
+    content: "ok",
+    reasoning: ""
+  });
+  expect(finalParser.finish()).toEqual({ content: "", reasoning: "" });
+
+  const toolParser = new GptOssChannelParser({ defaultChannel: "analysis", toolRecipients: ["glob"] });
+  expect(toolParser.push('<|channel|>commentary to=glob code<|message|>{"pattern":"*"}<|call|>leaked')).toEqual({
+    content: '<tool_call>{"pattern":"*","tool":"glob"}</tool_call>',
+    reasoning: "",
+    toolCallContent: '<tool_call>{"pattern":"*","tool":"glob"}</tool_call>'
+  });
+  expect(toolParser.finish()).toEqual({ content: "", reasoning: "" });
+});
+
+test("rejects malformed GPT-OSS constrained JSON instead of exposing it as text", () => {
+  const finalParser = new GptOssChannelParser({ defaultChannel: "analysis" });
+  expect(() => finalParser.push("<|channel|>commentary to=final <|constrain|>json<|message|>{not-json}<|return|>")).toThrow("malformed constrained final JSON");
+
+  const toolParser = new GptOssChannelParser({ defaultChannel: "analysis", toolRecipients: ["glob"] });
+  expect(() => toolParser.push("<|channel|>commentary to=glob code<|message|>{not-json}<|call|>")).toThrow("malformed tool-call JSON");
+
+  const unknownRecipientParser = new GptOssChannelParser({ defaultChannel: "analysis", toolRecipients: ["glob"] });
+  expect(() => unknownRecipientParser.push('<|channel|>commentary to=shell code<|message|>{"command":"dir"}<|call|>')).toThrow("unsupported commentary recipient");
 });
 
 test("builds a dedicated embedding llama-server command", () => {
