@@ -1658,6 +1658,32 @@ test("maps OpenCode message deltas and diffs full part snapshots", () => {
   }]);
 });
 
+test("maps OpenCode permission replies to normalized approval decisions", () => {
+  const errors: string[] = [];
+  const events = Array.from(mapOpenCodeEvent({
+    type: "permission.replied",
+    properties: {
+      sessionID: "ses_123",
+      requestID: "per_123",
+      reply: "once"
+    }
+  }, (message) => errors.push(message)));
+
+  expect(errors).toEqual([]);
+  expect(events).toEqual([{
+    type: "timeline",
+    eventType: "item.completed",
+    sessionId: "ses_123",
+    block: {
+      kind: "approval",
+      id: "per_123",
+      status: "completed",
+      title: "Approval answered",
+      decision: "accepted"
+    }
+  }]);
+});
+
 test("fails OpenCode turns when streamed final text differs from the final snapshot", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-opencode-snapshot-mismatch-test-"));
   const modelPath = path.join(dir, "model.gguf");
@@ -1940,6 +1966,153 @@ test("does not complete OpenCode question blocks when answer submission fails", 
     const question = state.messages.find((message) => message.id === assistant.id)?.timelineBlocks?.find((block) => block.kind === "question");
     expect(question).toMatchObject({ kind: "question", status: "requested" });
     expect(question && "answers" in question ? question.answers : undefined).toBeUndefined();
+  } finally {
+    service.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("does not complete OpenCode approval blocks when approval submission fails", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-opencode-approval-failure-test-"));
+  const modelPath = path.join(dir, "model.gguf");
+  fs.writeFileSync(modelPath, "");
+  const store = new ChatStore(path.join(dir, "chat.sqlite"));
+  class RejectingApprovalOpenCodeRuntime extends ScriptedOpenCodeRuntime {
+    override async answerApproval(): Promise<void> {
+      throw new Error("approval reply failed");
+    }
+  }
+  const openCodeRuntime = new RejectingApprovalOpenCodeRuntime();
+  const service = new ChatService(store, new EndpointOnlyLlamaRuntime(), new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined, new TestEmbeddingRuntime(), openCodeRuntime);
+  try {
+    let state = store.loadState();
+    store.updateProjectSettings(state.selectedProjectId, "OpenCode Approval Failure Project", dir);
+    store.addLocalModel(modelPath);
+    state = store.loadState();
+    store.updateThreadSettings(state.selectedThreadId, {
+      builtinAgenticFramework: "opencode",
+      builtinModelId: state.selectedModelId
+    });
+    const assistant = store.createMessage(state.selectedThreadId, "assistant", "", "streaming", {
+      timelineBlocks: [{
+        kind: "approval",
+        id: "perm_fail",
+        status: "requested",
+        title: "OpenCode approval required: webfetch",
+        details: "https://example.com",
+        requestMethod: "opencode"
+      }]
+    });
+
+    await expect(service.timelineAction({ messageId: assistant.id, blockId: "perm_fail", action: "approve" })).rejects.toThrow("approval reply failed");
+
+    state = store.loadState();
+    const approval = state.messages.find((message) => message.id === assistant.id)?.timelineBlocks?.find((block) => block.kind === "approval");
+    expect(approval).toMatchObject({ kind: "approval", status: "requested" });
+    expect(approval && "decision" in approval ? approval.decision : undefined).toBeUndefined();
+  } finally {
+    service.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("completes OpenCode approval blocks only after approval submission succeeds", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-opencode-approval-success-test-"));
+  const modelPath = path.join(dir, "model.gguf");
+  fs.writeFileSync(modelPath, "");
+  const store = new ChatStore(path.join(dir, "chat.sqlite"));
+  const openCodeRuntime = new ScriptedOpenCodeRuntime();
+  const service = new ChatService(store, new EndpointOnlyLlamaRuntime(), new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined, new TestEmbeddingRuntime(), openCodeRuntime);
+  try {
+    let state = store.loadState();
+    store.updateProjectSettings(state.selectedProjectId, "OpenCode Approval Success Project", dir);
+    store.addLocalModel(modelPath);
+    state = store.loadState();
+    store.updateThreadSettings(state.selectedThreadId, {
+      builtinAgenticFramework: "opencode",
+      builtinModelId: state.selectedModelId
+    });
+    const assistant = store.createMessage(state.selectedThreadId, "assistant", "", "streaming", {
+      timelineBlocks: [{
+        kind: "approval",
+        id: "perm_ok",
+        status: "requested",
+        title: "OpenCode approval required: webfetch",
+        details: "https://example.com",
+        requestMethod: "opencode"
+      }]
+    });
+
+    await service.timelineAction({ messageId: assistant.id, blockId: "perm_ok", action: "approve" });
+
+    expect(openCodeRuntime.approvals).toEqual([{ permissionId: "perm_ok", decision: "approve" }]);
+    state = store.loadState();
+    const approval = state.messages.find((message) => message.id === assistant.id)?.timelineBlocks?.find((block) => block.kind === "approval");
+    expect(approval).toMatchObject({ kind: "approval", status: "completed", decision: "accepted" });
+  } finally {
+    service.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("preserves OpenCode approval prompt fields when the server completes the approval", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-opencode-approval-complete-test-"));
+  const modelPath = path.join(dir, "model.gguf");
+  fs.writeFileSync(modelPath, "");
+  const store = new ChatStore(path.join(dir, "chat.sqlite"));
+  const openCodeRuntime = new ScriptedOpenCodeRuntime([[
+    {
+      type: "timeline",
+      eventType: "item.started",
+      block: {
+        kind: "approval",
+        id: "perm_done",
+        status: "requested",
+        title: "OpenCode approval required: webfetch",
+        details: "Patterns: https://example.com",
+        requestMethod: "opencode",
+        toolCallId: "ses_done"
+      }
+    },
+    {
+      type: "timeline",
+      eventType: "item.completed",
+      block: {
+        kind: "approval",
+        id: "perm_done",
+        status: "completed",
+        title: "Approval answered",
+        decision: "accepted"
+      }
+    },
+    { type: "assistant.delta", id: "msg_1:prt_1", status: "updated", text: "Done." },
+    { type: "final.snapshot", content: "Done.", reasoning: "" }
+  ]]);
+  const service = new ChatService(store, new EndpointOnlyLlamaRuntime(), new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined, new TestEmbeddingRuntime(), openCodeRuntime);
+  try {
+    let state = store.loadState();
+    store.updateProjectSettings(state.selectedProjectId, "OpenCode Approval Complete Project", dir);
+    store.addLocalModel(modelPath);
+    state = store.loadState();
+    store.updateThreadSettings(state.selectedThreadId, {
+      builtinAgenticFramework: "opencode",
+      builtinModelId: state.selectedModelId
+    });
+
+    await service.submit({ text: "approve and continue" });
+    await expect.poll(() => service.state().generation.status).toBe("idle");
+
+    state = store.loadState();
+    const approval = state.messages.find((message) => message.role === "assistant")?.timelineBlocks?.find((block) => block.kind === "approval");
+    expect(approval).toMatchObject({
+      kind: "approval",
+      status: "completed",
+      title: "OpenCode approval required: webfetch",
+      details: "Patterns: https://example.com",
+      requestMethod: "opencode",
+      toolCallId: "ses_done",
+      decision: "accepted"
+    });
   } finally {
     service.close();
     fs.rmSync(dir, { recursive: true, force: true });

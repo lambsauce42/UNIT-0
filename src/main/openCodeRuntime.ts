@@ -13,6 +13,8 @@ const OPENCODE_PROVIDER_ID = "unit0-local";
 const OPENCODE_MODEL_ID = "unit0-model";
 const OPENCODE_DEBUG_LOG = process.env.UNIT0_OPENCODE_DEBUG_LOG;
 const OPENCODE_MIN_COMPLETION_TOKENS = 64;
+const OPENCODE_FINAL_CONTINUATION_PREFIX = "<|start|>assistant<|channel|>final<|message|>";
+const OPENCODE_FINAL_CONTINUATION_MARKER = `<|end|>${OPENCODE_FINAL_CONTINUATION_PREFIX}`;
 
 export type OpenCodeRunOptions = {
   cwd: string;
@@ -208,7 +210,7 @@ export class RealOpenCodeRuntime implements OpenCodeRuntime {
           latestAssistantMessageId = messageIdFromPartId(event.id);
         }
         if (event.type === "timeline" && server) {
-          if (event.block.kind === "approval") {
+          if (shouldTrackOpenCodePendingApproval(event)) {
             this.pendingPermissions.set(event.block.id, {
               serverUrl: server.url,
               cwd: options.cwd
@@ -320,13 +322,13 @@ export class RealOpenCodeRuntime implements OpenCodeRuntime {
     if (!pending) {
       throw new Error(`Unknown OpenCode permission id: ${permissionId}`);
     }
-    this.pendingPermissions.delete(permissionId);
     await openCodeJson<boolean>(pending.serverUrl, `/permission/${encodeURIComponent(permissionId)}/reply`, {
       method: "POST",
       cwd: pending.cwd,
       body: { reply: decision === "approve" ? "once" : "reject" },
       emptyOk: true
     });
+    this.pendingPermissions.delete(permissionId);
   }
 
   async answerUserInput(requestId: string, answers: Record<string, string>): Promise<void> {
@@ -368,6 +370,10 @@ export class RealOpenCodeRuntime implements OpenCodeRuntime {
     this.pendingPermissions.clear();
     this.pendingQuestions.clear();
   }
+}
+
+export function shouldTrackOpenCodePendingApproval(event: OpenCodeRuntimeEvent): boolean {
+  return event.type === "timeline" && event.block.kind === "approval" && event.eventType === "item.started" && event.block.status === "requested";
 }
 
 class AsyncEventQueue {
@@ -573,7 +579,7 @@ async function handleGptOssOpenCodeProxyRequest(
     return upstream.body;
   };
   try {
-    const upstreamBody = await requestRawCompletion(prompt, gptOssOpenCodeRequestMaxTokens(prompt, options.settings));
+    const upstreamBody = await requestRawCompletion(prompt, gptOssOpenCodeRequestMaxTokens(prompt, options.settings, true));
     const shouldStream = !(isRecord(body) && body.stream === false);
     if (shouldStream) {
       response.writeHead(200, {
@@ -586,7 +592,7 @@ async function handleGptOssOpenCodeProxyRequest(
       await streamGptOssOpenCodeProxyResponse(upstreamBody, response, openCodeProxyToolRecipientNames(body), toolSink, shouldStream, async (generatedText) => {
         const continuationPrompt = gptOssOpenCodeFinalContinuationPrompt(prompt, generatedText);
         debugOpenCode("proxy.final_continuation.prompt", { prompt: continuationPrompt.slice(-2000) });
-        return requestRawCompletion(continuationPrompt, gptOssOpenCodeFinalContinuationMaxTokens(options.settings));
+        return requestRawCompletion(continuationPrompt, gptOssOpenCodeFinalContinuationMaxTokens(continuationPrompt, options.settings));
       });
     } catch (error) {
       toolSink.queue.push({ kind: "event", event: { type: "error", message: errorMessage(error) } });
@@ -719,11 +725,11 @@ async function streamGptOssOpenCodeProxyResponse(
 function gptOssOpenCodeFinalContinuationPrompt(prompt: string, generatedText: string): string {
   const withoutTerminal = generatedText.replace(/(?:<\|return\|>|<\|call\|>)\s*$/u, "");
   const ended = withoutTerminal.endsWith("<|end|>") ? withoutTerminal : `${withoutTerminal}<|end|>`;
-  return `${prompt}${ended}<|start|>assistant<|channel|>final<|message|>`;
+  return `${prompt}${ended}${OPENCODE_FINAL_CONTINUATION_PREFIX}`;
 }
 
-function gptOssOpenCodeFinalContinuationMaxTokens(settings: ChatRuntimeSettings): number {
-  return Math.max(64, Math.min(settings.maxTokens, 512));
+function gptOssOpenCodeFinalContinuationMaxTokens(prompt: string, settings: ChatRuntimeSettings): number {
+  return Math.min(gptOssOpenCodeRequestMaxTokens(prompt, settings), Math.min(settings.maxTokens, 512));
 }
 
 function writeOpenCodeProxyCommentaryDelta(
@@ -1114,11 +1120,15 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-export function gptOssOpenCodeRequestMaxTokens(prompt: string, settings: ChatRuntimeSettings): number {
+export function gptOssOpenCodeRequestMaxTokens(prompt: string, settings: ChatRuntimeSettings, reserveContinuation = false): number {
   const estimatedPromptTokens = Math.ceil(prompt.length / 3);
   const remainingContextTokens = Math.max(0, settings.nCtx - estimatedPromptTokens);
   const configuredMaxTokens = settings.maxTokens > 0 ? settings.maxTokens : remainingContextTokens;
-  return Math.min(configuredMaxTokens, remainingContextTokens);
+  const continuationReserveTokens = OPENCODE_MIN_COMPLETION_TOKENS + Math.ceil(OPENCODE_FINAL_CONTINUATION_MARKER.length / 3);
+  const continuationReserve = reserveContinuation
+    ? Math.min(continuationReserveTokens, Math.max(0, remainingContextTokens - 1))
+    : 0;
+  return Math.min(configuredMaxTokens, Math.max(0, remainingContextTokens - continuationReserve));
 }
 
 function gptOssOpenCodePromptBudgetCharacters(settings: ChatRuntimeSettings): number {
@@ -1351,7 +1361,7 @@ export function* mapOpenCodeEvent(raw: Record<string, unknown>, onErrorEvent: (m
           id: permissionId,
           status: "completed",
           title: "Approval answered",
-          decision: String(properties.reply ?? "")
+          decision: openCodeApprovalDecision(properties.reply)
         },
         sessionId
       };
@@ -1480,6 +1490,17 @@ function partToRuntimeEvent(part: OpenCodePart, delta?: string, sessionId = "", 
     };
   }
   return null;
+}
+
+function openCodeApprovalDecision(value: unknown): string {
+  const decision = String(value ?? "").trim().toLowerCase();
+  if (decision === "once" || decision === "always" || decision === "approve" || decision === "approved" || decision === "accept" || decision === "accepted") {
+    return "accepted";
+  }
+  if (decision === "reject" || decision === "rejected" || decision === "deny" || decision === "denied" || decision === "decline" || decision === "declined") {
+    return "declined";
+  }
+  return decision;
 }
 
 function parseOpenCodeQuestions(value: unknown, requestId: string): Array<{ id: string; label: string; options?: string[]; allowsCustomAnswer?: boolean }> {

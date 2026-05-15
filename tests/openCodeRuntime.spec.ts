@@ -3,7 +3,7 @@ import fs from "node:fs";
 import http, { type Server } from "node:http";
 import os from "node:os";
 import path from "node:path";
-import { gptOssOpenCodeRequestMaxTokens, openCodeConfig, RealOpenCodeRuntime, renderGptOssOpenCodeProxyPrompt, type OpenCodeRuntimeEvent, type OpenCodeRunOptions } from "../src/main/openCodeRuntime";
+import { gptOssOpenCodeRequestMaxTokens, openCodeConfig, RealOpenCodeRuntime, renderGptOssOpenCodeProxyPrompt, shouldTrackOpenCodePendingApproval, type OpenCodeRuntimeEvent, type OpenCodeRunOptions } from "../src/main/openCodeRuntime";
 import type { ChatRuntimeSettings } from "../src/shared/types";
 
 const baseSettings: ChatRuntimeSettings = {
@@ -53,6 +53,53 @@ test("OpenCode config maps Unit-0 full access to OpenCode web permissions", () =
     webfetch: "ask",
     websearch: "ask"
   });
+});
+
+test("real OpenCode approval reply remains retryable after a failed POST", async () => {
+  const server = await startApprovalReplyServer();
+  const runtime = new RealOpenCodeRuntime();
+  try {
+    (runtime as unknown as { pendingPermissions: Map<string, { serverUrl: string; cwd: string }> }).pendingPermissions.set("perm_retry", {
+      serverUrl: server.url,
+      cwd: "C:\\Project"
+    });
+
+    await expect(runtime.answerApproval("perm_retry", "approve")).rejects.toThrow("first approval failure");
+    await runtime.answerApproval("perm_retry", "approve");
+
+    expect(server.replies).toEqual(["once", "once"]);
+  } finally {
+    runtime.close();
+    await server.close();
+  }
+});
+
+test("OpenCode tracks only requested approval events as pending approvals", () => {
+  const requested = {
+    type: "timeline" as const,
+    eventType: "item.started" as const,
+    block: {
+      kind: "approval" as const,
+      id: "perm_done",
+      status: "requested",
+      title: "OpenCode approval required: webfetch",
+      requestMethod: "opencode"
+    }
+  };
+  const completed = {
+    type: "timeline" as const,
+    eventType: "item.completed" as const,
+    block: {
+      kind: "approval" as const,
+      id: "perm_done",
+      status: "completed",
+      title: "Approval answered",
+      decision: "accepted"
+    }
+  };
+
+  expect(shouldTrackOpenCodePendingApproval(requested)).toBe(true);
+  expect(shouldTrackOpenCodePendingApproval(completed)).toBe(false);
 });
 
 test("real OpenCode GPT-OSS proxy rejects final-only output before rendering it", async () => {
@@ -474,7 +521,7 @@ test("real OpenCode GPT-OSS proxy executes and renders tool calls once", async (
 test("real OpenCode GPT-OSS proxy budgets large webfetch output before post-tool final streaming", async () => {
   test.setTimeout(120_000);
   const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-opencode-runtime-tool-budget-"));
-  const contentServer = await startTextServer(Array.from({ length: 2200 }, (_, index) => `Peanut butter source line ${index.toString().padStart(4, "0")} ${"x".repeat(80)}`).join("\n"));
+  const contentServer = await startTextServer(Array.from({ length: 4200 }, (_, index) => `Peanut butter source line ${index.toString().padStart(4, "0")} ${"x".repeat(80)}`).join("\n"));
   const fakeLlama = await startFakeRawCompletionServer([
     [
       "<|channel|>analysis<|message|>Need web source.",
@@ -484,7 +531,9 @@ test("real OpenCode GPT-OSS proxy budgets large webfetch output before post-tool
     ],
     [
       "<|channel|>analysis<|message|>Tool output enough.",
-      "<|end|><|start|>assistant<|channel|>final<|message|>",
+      "<|return|>"
+    ],
+    [
       { content: "George Washington Carver is often associated with peanut products, but peanut butter predates him.", pauseAfter: "large-webfetch-final" },
       "<|return|>"
     ]
@@ -502,7 +551,7 @@ test("real OpenCode GPT-OSS proxy budgets large webfetch output before post-tool
         modelId: "fake-gpt-oss",
         rawCompletionUrl: `${fakeLlama.url}/completion`
       },
-      settings: { ...baseSettings, nCtx: 4096, maxTokens: 256 },
+      settings: { ...baseSettings, nCtx: 32768, maxTokens: 512 },
       permissionMode: "full_access"
     }, (event) => events.push(event));
 
@@ -510,10 +559,16 @@ test("real OpenCode GPT-OSS proxy budgets large webfetch output before post-tool
     await expect.poll(() => events.some((event) => event.type === "timeline" && event.eventType === "item.started" && event.block.kind === "tool" && event.block.toolName === "webfetch")).toBe(true);
     fakeLlama.release("large-webfetch-call");
     await fakeLlama.waitForPause("large-webfetch-final");
-    await expect.poll(() => fakeLlama.requests.length).toBe(2);
+    await expect.poll(() => fakeLlama.requests.length).toBe(3);
     expect(fakeLlama.requests[1]?.prompt).toContain("# OpenCode Tool Result");
     expect(fakeLlama.requests[1]?.prompt).toContain("OpenCode tool result truncated to fit the local model context window");
     expect(fakeLlama.requests[1]?.nPredict).toBeGreaterThan(0);
+    expect(fakeLlama.requests[1]?.nPredict).toBeLessThanOrEqual(gptOssOpenCodeRequestMaxTokens(fakeLlama.requests[1]?.prompt ?? "", { ...baseSettings, nCtx: 32768, maxTokens: 512 }, true));
+    expect(fakeLlama.requests[2]?.prompt).toContain("<|channel|>final<|message|>");
+    expect(fakeLlama.requests[2]?.prompt).toContain("OpenCode tool result truncated to fit the local model context window");
+    expect(fakeLlama.requests[2]?.prompt).toContain("Tool output enough.");
+    expect(fakeLlama.requests[2]?.nPredict).toBeGreaterThan(0);
+    expect(fakeLlama.requests[2]?.nPredict).toBeLessThanOrEqual(gptOssOpenCodeRequestMaxTokens(fakeLlama.requests[2]?.prompt ?? "", { ...baseSettings, nCtx: 32768, maxTokens: 512 }));
     await expect.poll(() => events.filter((event) => event.type === "assistant.delta").map((event) => event.text).join("")).toContain("peanut butter predates him");
     fakeLlama.release("large-webfetch-final");
     await run;
@@ -560,7 +615,16 @@ test("OpenCode GPT-OSS proxy prompt keeps completion budget when tool results ar
 
   expect(prompt).toContain("# OpenCode Tool Result");
   expect(prompt).toContain("OpenCode tool result truncated to fit the local model context window");
-  expect(gptOssOpenCodeRequestMaxTokens(prompt, { ...baseSettings, nCtx: 4096, maxTokens: 256 })).toBeGreaterThan(0);
+  expect(gptOssOpenCodeRequestMaxTokens(prompt, { ...baseSettings, nCtx: 4096, maxTokens: 256 }, true)).toBeGreaterThan(0);
+});
+
+test("OpenCode GPT-OSS proxy reserves context for forced final continuation", () => {
+  const settings = { ...baseSettings, nCtx: 2048, maxTokens: 512 };
+  const prompt = "P".repeat((settings.nCtx - 128) * 3);
+  const firstPassTokens = gptOssOpenCodeRequestMaxTokens(prompt, settings, true);
+  expect(firstPassTokens).toBeLessThan(64);
+  const continuationPrompt = `${prompt}${"A".repeat(firstPassTokens * 3)}<|end|><|start|>assistant<|channel|>final<|message|>`;
+  expect(gptOssOpenCodeRequestMaxTokens(continuationPrompt, settings)).toBeGreaterThanOrEqual(64);
 });
 
 test("real OpenCode GPT-OSS proxy does not force final continuation after terminal-suppressed tool calls", async () => {
@@ -780,7 +844,8 @@ async function startFakeRawCompletionServer(responses: FakeChunk[][]): Promise<{
         return;
       }
       const body = await readRequestJson(request);
-      requests.push({ prompt: typeof body.prompt === "string" ? body.prompt : "", nPredict: typeof body.n_predict === "number" ? body.n_predict : 0 });
+      const nPredict = typeof body.n_predict === "number" ? body.n_predict : 0;
+      requests.push({ prompt: typeof body.prompt === "string" ? body.prompt : "", nPredict });
       const chunks = responses[Math.min(requestIndex, responses.length - 1)] ?? [];
       requestIndex += 1;
       response.writeHead(200, {
@@ -788,8 +853,16 @@ async function startFakeRawCompletionServer(responses: FakeChunk[][]): Promise<{
         "Cache-Control": "no-cache",
         Connection: "keep-alive"
       });
+      let emittedTokens = 0;
       for (const chunk of chunks) {
-        const content = typeof chunk === "string" ? chunk : chunk.content;
+        const rawContent = typeof chunk === "string" ? chunk : chunk.content;
+        const remainingTokens = nPredict - emittedTokens;
+        if (remainingTokens <= 0) {
+          break;
+        }
+        const maxCharacters = remainingTokens * 3;
+        const content = rawContent.length > maxCharacters ? rawContent.slice(0, maxCharacters) : rawContent;
+        emittedTokens += Math.ceil(content.length / 3);
         response.write(`data: ${JSON.stringify({ content })}\n\n`);
         if (typeof chunk !== "string") {
           const state = pauseState(chunk.pauseAfter);
@@ -818,6 +891,46 @@ async function startFakeRawCompletionServer(responses: FakeChunk[][]): Promise<{
     requests,
     waitForPause: (label: string) => pauseState(label).paused,
     release: (label: string) => pauseState(label).release(),
+    close: () => closeServer(server)
+  };
+}
+
+async function startApprovalReplyServer(): Promise<{ url: string; replies: string[]; close: () => Promise<void> }> {
+  const replies: string[] = [];
+  let requestCount = 0;
+  const server = http.createServer((request, response) => {
+    void (async () => {
+      if (request.method !== "POST" || !request.url?.startsWith("/permission/perm_retry/reply")) {
+        response.writeHead(404, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ error: "not found" }));
+        return;
+      }
+      requestCount += 1;
+      const body = await readRequestJson(request);
+      replies.push(String(body.reply ?? ""));
+      if (requestCount === 1) {
+        response.writeHead(500, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ error: { message: "first approval failure" } }));
+        return;
+      }
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.end(JSON.stringify(true));
+    })().catch((error) => {
+      response.writeHead(500, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }));
+    });
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => resolve());
+  });
+  const address = server.address();
+  if (!address || typeof address === "string") {
+    throw new Error("Approval reply server did not bind a TCP port.");
+  }
+  return {
+    url: `http://127.0.0.1:${address.port}`,
+    replies,
     close: () => closeServer(server)
   };
 }

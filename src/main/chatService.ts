@@ -100,6 +100,17 @@ function mergeStreamingTimelineBlock(
       requestMethod: block.requestMethod ?? prior.requestMethod
     };
   }
+  if (prior.kind === "approval" && block.kind === "approval") {
+    return {
+      ...prior,
+      ...block,
+      title: prior.title || block.title,
+      decision: block.decision ?? prior.decision,
+      details: block.details ?? prior.details,
+      requestMethod: block.requestMethod ?? prior.requestMethod,
+      toolCallId: block.toolCallId ?? prior.toolCallId
+    };
+  }
   const existing = prior as ChatTimelineBlock & { initiallyExpanded?: boolean };
   const next = block as ChatTimelineBlock & { initiallyExpanded?: boolean };
   return {
@@ -2063,15 +2074,18 @@ export class ChatService {
     if (pendingOpenCodeQuestionAnswers) {
       await this.openCodeRuntime.answerUserInput(payload.blockId, pendingOpenCodeQuestionAnswers);
     }
+    const pendingOpenCodeApprovalAction = currentBlock?.kind === "approval"
+      && currentBlock.requestMethod === "opencode"
+      && (payload.action === "approve" || payload.action === "deny")
+      ? payload.action
+      : null;
+    if (pendingOpenCodeApprovalAction) {
+      await this.openCodeRuntime.answerApproval(payload.blockId, pendingOpenCodeApprovalAction);
+    }
     this.store.updateMessageTimelineBlock(payload.messageId, payload.blockId, (block) => {
       if (block.kind === "approval") {
         if (payload.action === "approve" || payload.action === "deny") {
-          if (block.requestMethod === "opencode") {
-            void this.openCodeRuntime.answerApproval(payload.blockId, payload.action).catch((error) => {
-              this.setError(errorMessage(error));
-              this.broadcast();
-            });
-          } else {
+          if (block.requestMethod !== "opencode") {
             this.codexRuntime.answerApproval(payload.blockId, payload.action === "approve" ? "accept" : "decline");
           }
         }
