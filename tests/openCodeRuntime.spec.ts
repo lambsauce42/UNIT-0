@@ -133,6 +133,8 @@ test("real OpenCode GPT-OSS proxy rejects final-only output before rendering it"
 
     const assistantText = events.filter((event) => event.type === "assistant.delta").map((event) => event.text).join("");
     expect(assistantText).toBe("");
+    expect(fakeLlama.requests[0]?.cachePrompt).toBe(true);
+    expect(fakeLlama.requests[0]?.idSlot).toBe(0);
     expect(fakeLlama.requests[0]?.prompt).toContain("<|start|>assistant");
     expect(fakeLlama.requests[0]?.prompt).toContain("< |return|>");
     expect(fakeLlama.requests[0]?.prompt).not.toContain("literal <|return|>");
@@ -190,6 +192,64 @@ test("real OpenCode GPT-OSS proxy streams valid final tokens before upstream com
     expect(events.find((event) => event.type === "final.snapshot" && event.messageId)).toBeTruthy();
     expect(events.some((event) => event.type === "error")).toBe(false);
   } finally {
+    runtime.close();
+    await fakeLlama.close();
+    fs.rmSync(projectDir, { recursive: true, force: true });
+  }
+});
+
+test("OpenCode GPT-OSS prompt rendering treats max tokens as an output cap", () => {
+  const prompt = renderGptOssOpenCodeProxyPrompt({
+    messages: [
+      { role: "system", content: "OpenCode system prompt" },
+      { role: "user", content: "hi" }
+    ],
+    tools: []
+  }, {
+    cwd: "C:\\Project",
+    prompt: "hi",
+    modelLabel: "fake-gpt-oss",
+    nativeGptOss: true,
+    endpoint: { baseUrl: "http://127.0.0.1:1234", modelId: "fake-gpt-oss" },
+    settings: { ...baseSettings, nCtx: 32768, maxTokens: 32768 },
+    permissionMode: "full_access"
+  });
+
+  expect(prompt).toContain("<|start|>assistant");
+  expect(gptOssOpenCodeRequestMaxTokens(prompt, { ...baseSettings, nCtx: 32768, maxTokens: 32768 }, true)).toBeGreaterThan(0);
+});
+
+test("real OpenCode GPT-OSS proxy fails loud when raw completion stalls", async () => {
+  test.setTimeout(90_000);
+  const previousTimeout = process.env.UNIT0_OPENCODE_PROVIDER_IDLE_TIMEOUT_MS;
+  process.env.UNIT0_OPENCODE_PROVIDER_IDLE_TIMEOUT_MS = "50";
+  const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-opencode-runtime-stall-"));
+  const fakeLlama = await startStallingRawCompletionServer();
+  const runtime = new RealOpenCodeRuntime();
+  try {
+    const events = await collectOpenCodeEvents(runtime, {
+      cwd: projectDir,
+      prompt: "Answer exactly ok.",
+      modelLabel: "fake-gpt-oss",
+      nativeGptOss: true,
+      endpoint: {
+        baseUrl: fakeLlama.url,
+        modelId: "fake-gpt-oss",
+        rawCompletionUrl: `${fakeLlama.url}/completion`
+      },
+      settings: baseSettings,
+      permissionMode: "full_access"
+    });
+
+    expect(fakeLlama.requests).toBe(1);
+    expect(events.some((event) => event.type === "error"), JSON.stringify(events)).toBe(true);
+    expect(events.some((event) => event.type === "turn.completed")).toBe(false);
+  } finally {
+    if (previousTimeout === undefined) {
+      delete process.env.UNIT0_OPENCODE_PROVIDER_IDLE_TIMEOUT_MS;
+    } else {
+      process.env.UNIT0_OPENCODE_PROVIDER_IDLE_TIMEOUT_MS = previousTimeout;
+    }
     runtime.close();
     await fakeLlama.close();
     fs.rmSync(projectDir, { recursive: true, force: true });
@@ -738,6 +798,8 @@ test("real OpenCode GPT-OSS proxy streams commentary preambles before tool calls
 
 test("real OpenCode GPT-OSS proxy renders question tool calls as questions", async () => {
   test.setTimeout(120_000);
+  const previousEventTimeout = process.env.UNIT0_OPENCODE_EVENT_IDLE_TIMEOUT_MS;
+  process.env.UNIT0_OPENCODE_EVENT_IDLE_TIMEOUT_MS = "1000";
   const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-opencode-runtime-question-"));
   const fakeLlama = await startFakeRawCompletionServer([
     [
@@ -787,6 +849,8 @@ test("real OpenCode GPT-OSS proxy renders question tool calls as questions", asy
     const firstQuestionId = questionEvent && questionEvent.type === "timeline" && questionEvent.block.kind === "question"
       ? questionEvent.block.questions?.[0]?.id ?? ""
       : "";
+    await new Promise((resolve) => setTimeout(resolve, 1100));
+    expect(events.some((event) => event.type === "error")).toBe(false);
     await runtime.answerUserInput(requestId, { [firstQuestionId]: "TODO" });
     await run;
 
@@ -798,6 +862,11 @@ test("real OpenCode GPT-OSS proxy renders question tool calls as questions", asy
     runtime.close();
     await fakeLlama.close();
     fs.rmSync(projectDir, { recursive: true, force: true });
+    if (previousEventTimeout === undefined) {
+      delete process.env.UNIT0_OPENCODE_EVENT_IDLE_TIMEOUT_MS;
+    } else {
+      process.env.UNIT0_OPENCODE_EVENT_IDLE_TIMEOUT_MS = previousEventTimeout;
+    }
   }
 });
 
@@ -812,12 +881,12 @@ async function collectOpenCodeEvents(runtime: RealOpenCodeRuntime, options: Open
 
 async function startFakeRawCompletionServer(responses: FakeChunk[][]): Promise<{
   url: string;
-  requests: Array<{ prompt: string; nPredict: number }>;
+  requests: Array<{ prompt: string; nPredict: number; cachePrompt: boolean | null; idSlot: number | null }>;
   waitForPause: (label: string) => Promise<void>;
   release: (label: string) => void;
   close: () => Promise<void>;
 }> {
-  const requests: Array<{ prompt: string; nPredict: number }> = [];
+  const requests: Array<{ prompt: string; nPredict: number; cachePrompt: boolean | null; idSlot: number | null }> = [];
   const pauses = new Map<string, { paused: Promise<void>; released: Promise<void>; release: () => void; resolvePaused: () => void }>();
   let requestIndex = 0;
   const pauseState = (label: string) => {
@@ -845,7 +914,12 @@ async function startFakeRawCompletionServer(responses: FakeChunk[][]): Promise<{
       }
       const body = await readRequestJson(request);
       const nPredict = typeof body.n_predict === "number" ? body.n_predict : 0;
-      requests.push({ prompt: typeof body.prompt === "string" ? body.prompt : "", nPredict });
+      requests.push({
+        prompt: typeof body.prompt === "string" ? body.prompt : "",
+        nPredict,
+        cachePrompt: typeof body.cache_prompt === "boolean" ? body.cache_prompt : null,
+        idSlot: typeof body.id_slot === "number" ? body.id_slot : null
+      });
       const chunks = responses[Math.min(requestIndex, responses.length - 1)] ?? [];
       requestIndex += 1;
       response.writeHead(200, {
@@ -891,6 +965,38 @@ async function startFakeRawCompletionServer(responses: FakeChunk[][]): Promise<{
     requests,
     waitForPause: (label: string) => pauseState(label).paused,
     release: (label: string) => pauseState(label).release(),
+    close: () => closeServer(server)
+  };
+}
+
+async function startStallingRawCompletionServer(): Promise<{ url: string; requests: number; close: () => Promise<void> }> {
+  let requests = 0;
+  const server = http.createServer((request, response) => {
+    if (request.method !== "POST" || request.url !== "/completion") {
+      response.writeHead(404, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ error: "not found" }));
+      return;
+    }
+    requests += 1;
+    response.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive"
+    });
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => resolve());
+  });
+  const address = server.address();
+  if (!address || typeof address === "string") {
+    throw new Error("Stalling llama server did not bind a TCP port.");
+  }
+  return {
+    url: `http://127.0.0.1:${address.port}`,
+    get requests() {
+      return requests;
+    },
     close: () => closeServer(server)
   };
 }

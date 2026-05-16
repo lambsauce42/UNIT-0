@@ -15,6 +15,8 @@ const OPENCODE_DEBUG_LOG = process.env.UNIT0_OPENCODE_DEBUG_LOG;
 const OPENCODE_MIN_COMPLETION_TOKENS = 64;
 const OPENCODE_FINAL_CONTINUATION_PREFIX = "<|start|>assistant<|channel|>final<|message|>";
 const OPENCODE_FINAL_CONTINUATION_MARKER = `<|end|>${OPENCODE_FINAL_CONTINUATION_PREFIX}`;
+const DEFAULT_OPENCODE_PROVIDER_IDLE_TIMEOUT_MS = 120_000;
+const DEFAULT_OPENCODE_EVENT_IDLE_TIMEOUT_MS = 120_000;
 
 export type OpenCodeRunOptions = {
   cwd: string;
@@ -251,6 +253,7 @@ export class RealOpenCodeRuntime implements OpenCodeRuntime {
           emptyOk: true
         });
       let sawTurnCompleted = false;
+      let sawTerminalError = false;
       const consumeQueuedEvent = (queued: QueuedOpenCodeEvent): OpenCodeRuntimeEvent | null => {
         if (queued.kind === "stream.closed") {
           if (sawTurnCompleted) {
@@ -264,18 +267,31 @@ export class RealOpenCodeRuntime implements OpenCodeRuntime {
         if (!isSessionScopedEvent(queued.event, sessionId)) {
           return null;
         }
+        if (queued.event.type === "error") {
+          sawTurnCompleted = true;
+          sawTerminalError = true;
+          return queued.event;
+        }
         if (queued.event.type === "turn.completed") {
           sawTurnCompleted = true;
           return null;
         }
         return queued.event;
       };
+      let sawAnyTurnEvent = false;
       while (!sawTurnCompleted) {
-        const next = await eventQueue.shift();
+        const next = await eventQueue.shift(
+          sawAnyTurnEvent ? undefined : openCodeEventIdleTimeoutMs(),
+          "OpenCode did not emit any turn events before the idle timeout."
+        );
         const event = consumeQueuedEvent(next);
         if (event) {
+          sawAnyTurnEvent = true;
           yield event;
         }
+      }
+      if (sawTerminalError) {
+        return;
       }
       let queued: QueuedOpenCodeEvent | null;
       while ((queued = eventQueue.tryShift())) {
@@ -389,12 +405,30 @@ class AsyncEventQueue {
     this.values.push(value);
   }
 
-  shift(): Promise<QueuedOpenCodeEvent> {
+  shift(timeoutMs?: number, timeoutMessage = "Timed out waiting for an OpenCode event."): Promise<QueuedOpenCodeEvent> {
     const value = this.values.shift();
     if (value) {
       return Promise.resolve(value);
     }
-    return new Promise((resolve) => this.resolvers.push(resolve));
+    return new Promise((resolve, reject) => {
+      let timer: NodeJS.Timeout | null = null;
+      const resolver = (next: QueuedOpenCodeEvent) => {
+        if (timer) {
+          clearTimeout(timer);
+        }
+        resolve(next);
+      };
+      this.resolvers.push(resolver);
+      if (timeoutMs && timeoutMs > 0) {
+        timer = setTimeout(() => {
+          const index = this.resolvers.indexOf(resolver);
+          if (index >= 0) {
+            this.resolvers.splice(index, 1);
+          }
+          reject(new Error(timeoutMessage));
+        }, timeoutMs);
+      }
+    });
   }
 
   tryShift(): QueuedOpenCodeEvent | null {
@@ -504,6 +538,8 @@ async function startGptOssOpenCodeProxy(options: OpenCodeRunOptions, eventQueue:
   const upstreamAbortControllers = new Set<AbortController>();
   const server = http.createServer((request, response) => {
     void handleGptOssOpenCodeProxyRequest(request, response, options, toolSink, upstreamAbortControllers).catch((error) => {
+      debugOpenCode("proxy.error", { message: errorMessage(error) });
+      toolSink.queue.push({ kind: "event", event: { type: "error", message: errorMessage(error) } });
       if (!response.headersSent) {
         response.writeHead(500, { "Content-Type": "application/json" });
       }
@@ -547,9 +583,19 @@ async function handleGptOssOpenCodeProxyRequest(
     return;
   }
   const body = await readJsonRequestBody(request);
-  debugOpenCode("proxy.chat.body", body);
+  const debugRequestSummary = OPENCODE_DEBUG_LOG ? openCodeProxyRequestSummary(body) : null;
+  debugOpenCode("proxy.chat.body", debugRequestSummary);
+  debugOpenCode("proxy.tools.completed_emit.start", debugRequestSummary);
   emitCompletedOpenCodeProxyToolEvents(body, toolSink);
+  debugOpenCode("proxy.tools.completed_emit.done", debugRequestSummary);
+  const promptRenderStartedAt = Date.now();
+  debugOpenCode("proxy.prompt.render.start", debugRequestSummary);
   const prompt = renderGptOssOpenCodeProxyPrompt(body, options);
+  debugOpenCode("proxy.prompt.render.done", {
+    elapsedMs: Date.now() - promptRenderStartedAt,
+    promptChars: prompt.length,
+    estimatedPromptTokens: Math.ceil(prompt.length / 3)
+  });
   debugOpenCode("proxy.prompt", { prompt: prompt.slice(0, 2000) });
   const upstreamAbortController = new AbortController();
   upstreamAbortControllers.add(upstreamAbortController);
@@ -558,6 +604,14 @@ async function handleGptOssOpenCodeProxyRequest(
     if (nPredict <= 0) {
       throw new Error("OpenCode GPT-OSS prompt exceeded the local model context window.");
     }
+    debugOpenCode("proxy.raw_completion.request", {
+      promptChars: rawPrompt.length,
+      estimatedPromptTokens: Math.ceil(rawPrompt.length / 3),
+      nPredict,
+      cachePrompt: true,
+      idSlot: options.endpoint.rawCompletionSlotId ?? 0
+    });
+    const providerTimeout = setTimeout(() => upstreamAbortController.abort(), openCodeProviderIdleTimeoutMs());
     const upstream = await fetch(options.endpoint.rawCompletionUrl!, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -568,10 +622,10 @@ async function handleGptOssOpenCodeProxyRequest(
         temperature: options.settings.temperature,
         repeat_penalty: options.settings.repeatPenalty,
         n_predict: nPredict,
-        cache_prompt: false,
-        id_slot: 0
+        cache_prompt: true,
+        id_slot: options.endpoint.rawCompletionSlotId ?? 0
       })
-    });
+    }).finally(() => clearTimeout(providerTimeout));
     if (!upstream.ok || !upstream.body) {
       const errorBody = await upstream.text().catch(() => "");
       throw new Error(errorBody || upstream.statusText);
@@ -607,6 +661,7 @@ async function handleGptOssOpenCodeProxyRequest(
       }
     }
   } catch (error) {
+    toolSink.queue.push({ kind: "event", event: { type: "error", message: errorMessage(error) } });
     if (!response.headersSent) {
       response.writeHead(500, { "Content-Type": "application/json" });
       response.end(JSON.stringify({ error: { message: errorMessage(error) } }));
@@ -1112,12 +1167,42 @@ function openCodeProxyMessageContent(value: unknown): string {
   return "";
 }
 
+function openCodeProxyRequestSummary(body: unknown): Record<string, unknown> {
+  if (!isRecord(body)) {
+    return { type: typeof body };
+  }
+  const messages = Array.isArray(body.messages) ? body.messages : [];
+  const tools = Array.isArray(body.tools) ? body.tools : [];
+  return {
+    model: typeof body.model === "string" ? body.model : undefined,
+    stream: body.stream,
+    maxTokens: body.max_tokens ?? body.maxTokens,
+    messageCount: messages.length,
+    messageRoles: messages.map((message) => isRecord(message) ? String(message.role ?? "") : "").filter(Boolean),
+    messageContentChars: messages.map((message) => isRecord(message) ? openCodeProxyMessageContent(message.content).length : 0),
+    toolCount: tools.length
+  };
+}
+
 function escapeGptOssTranscriptText(text: string): string {
   return text.replace(/<\|/g, "< |");
 }
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function openCodeProviderIdleTimeoutMs(): number {
+  return positiveIntegerEnv("UNIT0_OPENCODE_PROVIDER_IDLE_TIMEOUT_MS", DEFAULT_OPENCODE_PROVIDER_IDLE_TIMEOUT_MS);
+}
+
+function openCodeEventIdleTimeoutMs(): number {
+  return positiveIntegerEnv("UNIT0_OPENCODE_EVENT_IDLE_TIMEOUT_MS", DEFAULT_OPENCODE_EVENT_IDLE_TIMEOUT_MS);
+}
+
+function positiveIntegerEnv(name: string, fallback: number): number {
+  const parsed = Number(process.env[name]);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
 }
 
 export function gptOssOpenCodeRequestMaxTokens(prompt: string, settings: ChatRuntimeSettings, reserveContinuation = false): number {
@@ -1132,11 +1217,8 @@ export function gptOssOpenCodeRequestMaxTokens(prompt: string, settings: ChatRun
 }
 
 function gptOssOpenCodePromptBudgetCharacters(settings: ChatRuntimeSettings): number {
-  const configuredMaxTokens = settings.maxTokens > 0 ? settings.maxTokens : settings.nCtx;
-  const reservedCompletionTokens = Math.min(
-    Math.max(OPENCODE_MIN_COMPLETION_TOKENS, configuredMaxTokens),
-    Math.max(OPENCODE_MIN_COMPLETION_TOKENS, settings.nCtx - 1)
-  );
+  const continuationReserveTokens = OPENCODE_MIN_COMPLETION_TOKENS + Math.ceil(OPENCODE_FINAL_CONTINUATION_MARKER.length / 3);
+  const reservedCompletionTokens = Math.min(OPENCODE_MIN_COMPLETION_TOKENS + continuationReserveTokens, Math.max(1, settings.nCtx - 1));
   const promptTokens = Math.max(1, settings.nCtx - reservedCompletionTokens);
   return promptTokens * 3;
 }
@@ -1146,7 +1228,7 @@ async function readOpenCodeProxyServerSentEvents(body: ReadableStream<Uint8Array
   const decoder = new TextDecoder();
   let buffer = "";
   while (true) {
-    const { value, done } = await reader.read();
+    const { value, done } = await readWithTimeout(reader, openCodeProviderIdleTimeoutMs(), "OpenCode local model provider did not emit completion data before the idle timeout.");
     if (done) {
       buffer += decoder.decode();
       break;
@@ -1164,6 +1246,22 @@ async function readOpenCodeProxyServerSentEvents(body: ReadableStream<Uint8Array
   const trimmed = buffer.trim();
   if (trimmed.startsWith("data:")) {
     onPayload(trimmed.slice(5).trim());
+  }
+}
+
+async function readWithTimeout<T>(reader: ReadableStreamDefaultReader<T>, timeoutMs: number, timeoutMessage: string): Promise<ReadableStreamReadResult<T>> {
+  let timer: NodeJS.Timeout | null = null;
+  try {
+    return await Promise.race([
+      reader.read(),
+      new Promise<ReadableStreamReadResult<T>>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(timeoutMessage)), timeoutMs);
+      })
+    ]);
+  } finally {
+    if (timer) {
+      clearTimeout(timer);
+    }
   }
 }
 
@@ -1295,6 +1393,7 @@ export function splitSseFrames(buffer: string, flush = false): { frames: string[
 }
 
 export function* mapOpenCodeEvent(raw: Record<string, unknown>, onErrorEvent: (message: string, details?: string) => void, partSnapshots?: OpenCodePartSnapshotState): Iterable<OpenCodeRuntimeEvent> {
+  debugOpenCode("opencode.raw_event", raw);
   const type = String(raw.type ?? "");
   const properties = isRecord(raw.properties) ? raw.properties : {};
   if (type === "message.part.delta") {
@@ -2218,5 +2317,25 @@ function debugOpenCode(label: string, data: unknown): void {
   if (!OPENCODE_DEBUG_LOG) {
     return;
   }
-  fs.appendFileSync(OPENCODE_DEBUG_LOG, `${JSON.stringify({ ts: new Date().toISOString(), label, data })}\n`);
+  fs.appendFileSync(OPENCODE_DEBUG_LOG, `${JSON.stringify({ ts: new Date().toISOString(), label, data: boundedDebugValue(data) })}\n`);
+}
+
+function boundedDebugValue(value: unknown, depth = 0): unknown {
+  if (typeof value === "string") {
+    return value.length > 2000 ? `${value.slice(0, 2000)}...[${value.length - 2000} chars truncated]` : value;
+  }
+  if (typeof value !== "object" || value === null) {
+    return value;
+  }
+  if (depth >= 4) {
+    return "[object truncated]";
+  }
+  if (Array.isArray(value)) {
+    return value.slice(0, 20).map((item) => boundedDebugValue(item, depth + 1));
+  }
+  const output: Record<string, unknown> = {};
+  for (const [key, item] of Object.entries(value).slice(0, 40)) {
+    output[key] = boundedDebugValue(item, depth + 1);
+  }
+  return output;
 }

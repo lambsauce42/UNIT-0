@@ -6,7 +6,7 @@ import { EventEmitter } from "node:events";
 import { buildEmbeddingServerCommand } from "../src/main/embeddingRuntime";
 import { buildLlamaServerCommand, GptOssChannelParser, LocalLlamaRuntime, resolveBundledLlamaServerBinary } from "../src/main/localLlamaRuntime";
 
-test("builds a llama-server command for one local slot", () => {
+test("builds a llama-server command for one local chat slot by default", () => {
   const command = buildLlamaServerCommand({
     binaryPath: "C:\\runtime\\llama-server.exe",
     port: 12345,
@@ -47,6 +47,34 @@ test("builds a llama-server command for one local slot", () => {
     "C:\\runtime\\slots",
     "--no-webui"
   ]);
+});
+
+test("builds a llama-server command for multiple explicit slots", () => {
+  const command = buildLlamaServerCommand({
+    binaryPath: "C:\\runtime\\llama-server.exe",
+    port: 12345,
+    modelPath: "C:\\models\\model.gguf",
+    parallelSlots: 2,
+    settings: {
+      nCtx: 8192,
+      nGpuLayers: -1,
+      temperature: 0.7,
+      repeatPenalty: 1.1,
+      maxTokens: 512,
+      reasoningEffort: "medium",
+      permissionMode: "full_access",
+      trimReserveTokens: 2000,
+      trimReservePercent: 15,
+      trimAmountTokens: 4000,
+      trimAmountPercent: 30,
+      systemPrompt: "You are a helpful local assistant."
+    }
+  });
+
+  expect(command.args).toContain("--ctx-size");
+  expect(command.args[command.args.indexOf("--ctx-size") + 1]).toBe("16384");
+  expect(command.args).toContain("-np");
+  expect(command.args[command.args.indexOf("-np") + 1]).toBe("2");
 });
 
 test("enables special token output for native GPT-OSS llama-server sessions", () => {
@@ -194,6 +222,171 @@ test("resolves the bundled llama-server binary from runtime/llama.cpp", () => {
   expect(resolveBundledLlamaServerBinary(dir)).toBe(binaryPath);
 });
 
+test("opens OpenCode endpoint on the local cache slot without increasing parallel slots", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit-0-llama-opencode-endpoint-"));
+  const binaryPath = path.join(dir, "llama-server.exe");
+  const modelPath = path.join(dir, "model.gguf");
+  fs.writeFileSync(binaryPath, "");
+  fs.writeFileSync(modelPath, "");
+  const spawned = Object.assign(new EventEmitter(), {
+    exitCode: null as number | null,
+    kill: () => undefined
+  });
+  let spawnArgs: string[] = [];
+  const fetchImpl = async (input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url.endsWith("/health")) {
+      return Response.json({ status: "ok" });
+    }
+    if (url.endsWith("/v1/models")) {
+      return Response.json({ data: [{ id: "local-model" }] });
+    }
+    return Response.json({});
+  };
+  const runtime = new LocalLlamaRuntime({
+    binaryPath,
+    fetchImpl: fetchImpl as typeof fetch,
+    spawnImpl: ((_command: string, args: readonly string[]) => {
+      spawnArgs = [...args];
+      return spawned;
+    }) as unknown as typeof import("node:child_process").spawn,
+    startupTimeoutMs: 1000
+  });
+
+  const endpoint = await runtime.openAiEndpoint({
+    model: { id: "model", label: "Model", path: modelPath, createdAt: new Date().toISOString() },
+    settings: {
+      nCtx: 4096,
+      nGpuLayers: 0,
+      temperature: 0.7,
+      repeatPenalty: 1.1,
+      maxTokens: 256,
+      reasoningEffort: "medium",
+      permissionMode: "full_access",
+      trimReserveTokens: 2000,
+      trimReservePercent: 15,
+      trimAmountTokens: 4000,
+      trimAmountPercent: 30,
+      systemPrompt: "You are a helpful local assistant."
+    }
+  });
+
+  expect(endpoint.rawCompletionSlotId).toBe(0);
+  expect(spawnArgs[spawnArgs.indexOf("--ctx-size") + 1]).toBe("4096");
+  expect(spawnArgs[spawnArgs.indexOf("-np") + 1]).toBe("1");
+  runtime.close();
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("warms OpenCode endpoint without dirtying the local cache slot", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit-0-llama-opencode-warm-endpoint-"));
+  const binaryPath = path.join(dir, "llama-server.exe");
+  const modelPath = path.join(dir, "model.gguf");
+  fs.writeFileSync(binaryPath, "");
+  fs.writeFileSync(modelPath, "");
+  let spawnCount = 0;
+  const spawned = Object.assign(new EventEmitter(), {
+    exitCode: null as number | null,
+    kill: () => undefined
+  });
+  const fetchImpl = async (input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url.endsWith("/health")) {
+      return Response.json({ status: "ok" });
+    }
+    if (url.endsWith("/v1/models")) {
+      return Response.json({ data: [{ id: "local-model" }] });
+    }
+    return Response.json({});
+  };
+  const runtime = new LocalLlamaRuntime({
+    binaryPath,
+    fetchImpl: fetchImpl as typeof fetch,
+    spawnImpl: (() => {
+      spawnCount += 1;
+      return spawned;
+    }) as unknown as typeof import("node:child_process").spawn,
+    startupTimeoutMs: 1000
+  });
+  const model = { id: "model", label: "Model", path: modelPath, createdAt: new Date().toISOString() };
+  const settings = {
+    nCtx: 4096,
+    nGpuLayers: 0,
+    temperature: 0.7,
+    repeatPenalty: 1.1,
+    maxTokens: 256,
+    reasoningEffort: "medium",
+    permissionMode: "full_access",
+    trimReserveTokens: 2000,
+    trimReservePercent: 15,
+    trimAmountTokens: 4000,
+    trimAmountPercent: 30,
+    systemPrompt: "You are a helpful local assistant."
+  } as const;
+
+  await runtime.openAiEndpoint({ model, settings, reserveForGeneration: false });
+  const endpoint = await runtime.openAiEndpoint({ model, settings });
+
+  expect(endpoint.rawCompletionSlotId).toBe(0);
+  expect(spawnCount).toBe(1);
+  runtime.close();
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("reuses the raw OpenCode slot after successful OpenCode endpoint use", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit-0-llama-opencode-reuse-endpoint-"));
+  const binaryPath = path.join(dir, "llama-server.exe");
+  const modelPath = path.join(dir, "model.gguf");
+  fs.writeFileSync(binaryPath, "");
+  fs.writeFileSync(modelPath, "");
+  let spawnCount = 0;
+  const spawned = Object.assign(new EventEmitter(), {
+    exitCode: null as number | null,
+    kill: () => undefined
+  });
+  const fetchImpl = async (input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url.endsWith("/health")) {
+      return Response.json({ status: "ok" });
+    }
+    if (url.endsWith("/v1/models")) {
+      return Response.json({ data: [{ id: "local-model" }] });
+    }
+    return Response.json({});
+  };
+  const runtime = new LocalLlamaRuntime({
+    binaryPath,
+    fetchImpl: fetchImpl as typeof fetch,
+    spawnImpl: (() => {
+      spawnCount += 1;
+      return spawned;
+    }) as unknown as typeof import("node:child_process").spawn,
+    startupTimeoutMs: 1000
+  });
+  const model = { id: "model", label: "Model", path: modelPath, createdAt: new Date().toISOString() };
+  const settings = {
+    nCtx: 4096,
+    nGpuLayers: 0,
+    temperature: 0.7,
+    repeatPenalty: 1.1,
+    maxTokens: 256,
+    reasoningEffort: "medium",
+    permissionMode: "full_access",
+    trimReserveTokens: 2000,
+    trimReservePercent: 15,
+    trimAmountTokens: 4000,
+    trimAmountPercent: 30,
+    systemPrompt: "You are a helpful local assistant."
+  } as const;
+
+  await runtime.openAiEndpoint({ model, settings });
+  await runtime.openAiEndpoint({ model, settings });
+
+  expect(spawnCount).toBe(1);
+  runtime.close();
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
 test("streams content from llama-server SSE responses", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit-0-llama-stream-"));
   const binaryPath = path.join(dir, "llama-server.exe");
@@ -258,6 +451,237 @@ test("streams content from llama-server SSE responses", async () => {
   const chatRequest = requests.find((request) => request.url.endsWith("/v1/chat/completions"));
   expect(chatRequest?.body).toMatchObject({ cache_prompt: true, id_slot: 0 });
   runtime.close();
+});
+
+test("restores the saved slot after a same-key stream fails", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit-0-llama-dirty-slot-"));
+  const binaryPath = path.join(dir, "llama-server.exe");
+  const modelPath = path.join(dir, "model.gguf");
+  const slotDir = path.join(dir, "slots");
+  fs.writeFileSync(binaryPath, "");
+  fs.writeFileSync(modelPath, "");
+  fs.mkdirSync(slotDir, { recursive: true });
+  const spawned = Object.assign(new EventEmitter(), {
+    exitCode: null as number | null,
+    kill: () => undefined
+  });
+  const slotActions: string[] = [];
+  let completionCount = 0;
+  const fetchImpl = async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url.endsWith("/health")) {
+      return Response.json({ status: "ok" });
+    }
+    if (url.endsWith("/v1/models")) {
+      return Response.json({ data: [{ id: "local-model" }] });
+    }
+    if (url.includes("/slots/0?action=")) {
+      const parsedUrl = new URL(url);
+      const action = parsedUrl.searchParams.get("action") ?? "";
+      const body = init?.body ? JSON.parse(String(init.body)) as { filename?: string } : {};
+      slotActions.push(action);
+      if (action === "save" && body.filename) {
+        fs.writeFileSync(path.join(slotDir, body.filename), "slot");
+      }
+      return Response.json({ ok: true });
+    }
+    completionCount += 1;
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        if (completionCount === 2) {
+          controller.enqueue(new TextEncoder().encode("data: {bad-json}\n\n"));
+          controller.close();
+          return;
+        }
+        controller.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{"content":"ok"}}]}\n\n'));
+        controller.enqueue(new TextEncoder().encode("data: [DONE]\n\n"));
+        controller.close();
+      }
+    });
+    return new Response(stream, { status: 200 });
+  };
+  const runtime = new LocalLlamaRuntime({
+    binaryPath,
+    fetchImpl: fetchImpl as typeof fetch,
+    spawnImpl: (() => spawned) as unknown as typeof import("node:child_process").spawn,
+    startupTimeoutMs: 1000
+  });
+  const model = { id: "model", label: "Model", path: modelPath, createdAt: new Date().toISOString() };
+  const settings = {
+    nCtx: 4096,
+    nGpuLayers: 0,
+    temperature: 0.7,
+    repeatPenalty: 1.1,
+    maxTokens: 256,
+    reasoningEffort: "medium",
+    permissionMode: "full_access",
+    trimReserveTokens: 2000,
+    trimReservePercent: 15,
+    trimAmountTokens: 4000,
+    trimAmountPercent: 30,
+    systemPrompt: "You are a helpful local assistant."
+  } as const;
+  const messages = [{ id: "m1", threadId: "t1", role: "user" as const, content: "Hi", status: "complete" as const, createdAt: "", updatedAt: "" }];
+
+  await runtime.streamChat({ model, settings, messages, cacheKey: "thread-1", onToken: () => undefined });
+  await expect(runtime.streamChat({ model, settings, messages, cacheKey: "thread-1", onToken: () => undefined })).rejects.toThrow();
+  await runtime.streamChat({ model, settings, messages, cacheKey: "thread-1", onToken: () => undefined });
+
+  expect(slotActions).toEqual(["save", "restore", "save"]);
+  runtime.close();
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("restarts the server after a dirty same-key stream without a saved slot", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit-0-llama-dirty-unsaved-slot-"));
+  const binaryPath = path.join(dir, "llama-server.exe");
+  const modelPath = path.join(dir, "model.gguf");
+  fs.writeFileSync(binaryPath, "");
+  fs.writeFileSync(modelPath, "");
+  let spawnCount = 0;
+  let completionCount = 0;
+  const spawnedProcesses: Array<EventEmitter & { exitCode: number | null; kill: () => void }> = [];
+  const fetchImpl = async (input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url.endsWith("/health")) {
+      return Response.json({ status: "ok" });
+    }
+    if (url.endsWith("/v1/models")) {
+      return Response.json({ data: [{ id: "local-model" }] });
+    }
+    if (url.includes("/slots/0?action=")) {
+      return Response.json({ ok: true });
+    }
+    completionCount += 1;
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        if (completionCount === 1) {
+          controller.enqueue(new TextEncoder().encode("data: {bad-json}\n\n"));
+          controller.close();
+          return;
+        }
+        controller.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{"content":"ok"}}]}\n\n'));
+        controller.enqueue(new TextEncoder().encode("data: [DONE]\n\n"));
+        controller.close();
+      }
+    });
+    return new Response(stream, { status: 200 });
+  };
+  const runtime = new LocalLlamaRuntime({
+    binaryPath,
+    fetchImpl: fetchImpl as typeof fetch,
+    spawnImpl: (() => {
+      spawnCount += 1;
+      const spawned = Object.assign(new EventEmitter(), {
+        exitCode: null as number | null,
+        kill: () => {
+          spawned.exitCode = 1;
+        }
+      });
+      spawnedProcesses.push(spawned);
+      return spawned;
+    }) as unknown as typeof import("node:child_process").spawn,
+    startupTimeoutMs: 1000
+  });
+  const model = { id: "model", label: "Model", path: modelPath, createdAt: new Date().toISOString() };
+  const settings = {
+    nCtx: 4096,
+    nGpuLayers: 0,
+    temperature: 0.7,
+    repeatPenalty: 1.1,
+    maxTokens: 256,
+    reasoningEffort: "medium",
+    permissionMode: "full_access",
+    trimReserveTokens: 2000,
+    trimReservePercent: 15,
+    trimAmountTokens: 4000,
+    trimAmountPercent: 30,
+    systemPrompt: "You are a helpful local assistant."
+  } as const;
+  const messages = [{ id: "m1", threadId: "t1", role: "user" as const, content: "Hi", status: "complete" as const, createdAt: "", updatedAt: "" }];
+  let output = "";
+
+  await expect(runtime.streamChat({ model, settings, messages, cacheKey: "thread-1", onToken: () => undefined })).rejects.toThrow();
+  await runtime.streamChat({ model, settings, messages, cacheKey: "thread-1", onToken: (token) => { output += token; } });
+
+  expect(output).toBe("ok");
+  expect(spawnCount).toBe(2);
+  expect(spawnedProcesses[0]?.exitCode).toBe(1);
+  runtime.close();
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("restarts before handing OpenCode a raw endpoint when the active slot is dirty", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit-0-llama-opencode-dirty-endpoint-"));
+  const binaryPath = path.join(dir, "llama-server.exe");
+  const modelPath = path.join(dir, "model.gguf");
+  fs.writeFileSync(binaryPath, "");
+  fs.writeFileSync(modelPath, "");
+  let spawnCount = 0;
+  let completionCount = 0;
+  const spawnedProcesses: Array<EventEmitter & { exitCode: number | null; kill: () => void }> = [];
+  const fetchImpl = async (input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url.endsWith("/health")) {
+      return Response.json({ status: "ok" });
+    }
+    if (url.endsWith("/v1/models")) {
+      return Response.json({ data: [{ id: "local-model" }] });
+    }
+    if (url.includes("/slots/0?action=")) {
+      return Response.json({ ok: true });
+    }
+    completionCount += 1;
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode("data: {bad-json}\n\n"));
+        controller.close();
+      }
+    });
+    return new Response(stream, { status: 200 });
+  };
+  const runtime = new LocalLlamaRuntime({
+    binaryPath,
+    fetchImpl: fetchImpl as typeof fetch,
+    spawnImpl: (() => {
+      spawnCount += 1;
+      const spawned = Object.assign(new EventEmitter(), {
+        exitCode: null as number | null,
+        kill: () => {
+          spawned.exitCode = 1;
+        }
+      });
+      spawnedProcesses.push(spawned);
+      return spawned;
+    }) as unknown as typeof import("node:child_process").spawn,
+    startupTimeoutMs: 1000
+  });
+  const model = { id: "model", label: "Model", path: modelPath, createdAt: new Date().toISOString() };
+  const settings = {
+    nCtx: 4096,
+    nGpuLayers: 0,
+    temperature: 0.7,
+    repeatPenalty: 1.1,
+    maxTokens: 256,
+    reasoningEffort: "medium",
+    permissionMode: "full_access",
+    trimReserveTokens: 2000,
+    trimReservePercent: 15,
+    trimAmountTokens: 4000,
+    trimAmountPercent: 30,
+    systemPrompt: "You are a helpful local assistant."
+  } as const;
+  const messages = [{ id: "m1", threadId: "t1", role: "user" as const, content: "Hi", status: "complete" as const, createdAt: "", updatedAt: "" }];
+
+  await expect(runtime.streamChat({ model, settings, messages, cacheKey: "thread-1", onToken: () => undefined })).rejects.toThrow();
+  const endpoint = await runtime.openAiEndpoint({ model, settings });
+
+  expect(endpoint.rawCompletionSlotId).toBe(0);
+  expect(completionCount).toBe(1);
+  expect(spawnCount).toBe(2);
+  expect(spawnedProcesses[0]?.exitCode).toBe(1);
+  runtime.close();
+  fs.rmSync(dir, { recursive: true, force: true });
 });
 
 test("uses native GPT-OSS prompt channels for document analysis", async () => {

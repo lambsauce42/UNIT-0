@@ -765,13 +765,15 @@ test("chat OpenCode mode completes short local model greeting prompts", async ()
   test.setTimeout(300_000);
   const modelPath = process.env.UNIT0_E2E_OPENCODE_LOCAL_MODEL || "C:\\Users\\Max\\Models\\gpt-oss-20b-GGUF\\gpt-oss-20b-mxfp4.gguf";
   const gpuLayers = Number(process.env.UNIT0_E2E_GGUF_GPU_LAYERS ?? "0");
+  const maxTokens = Number(process.env.UNIT0_E2E_OPENCODE_MAX_TOKENS ?? "128");
+  const systemPrompt = process.env.UNIT0_E2E_OPENCODE_SYSTEM_PROMPT ?? "";
   test.skip(!fs.existsSync(modelPath), `OpenCode local model not found: ${modelPath}`);
   const dataDir = makeDataDir();
   const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), "unit-0-opencode-hi-e2e-project-"));
   const app = await launchApp(dataDir);
   try {
     const page = await firstWindow(app);
-    const result = await page.evaluate(async ({ modelPath: localModelPath, projectDir: localProjectDir, gpuLayers: localGpuLayers }) => {
+    const result = await page.evaluate(async ({ modelPath: localModelPath, projectDir: localProjectDir, gpuLayers: localGpuLayers, maxTokens: localMaxTokens, systemPrompt: localSystemPrompt }) => {
       let state = await window.unitApi.chat.bootstrap();
       await window.unitApi.chat.updateProjectSettings({
         projectId: state.selectedProjectId,
@@ -788,9 +790,9 @@ test("chat OpenCode mode completes short local model greeting prompts", async ()
         runtimeSettings: {
           nCtx: 32768,
           nGpuLayers: localGpuLayers,
-          maxTokens: 128,
+          maxTokens: localMaxTokens,
           temperature: 0,
-          systemPrompt: ""
+          systemPrompt: localSystemPrompt
         }
       });
       const submit = window.unitApi.chat.submit({ text: "hi" });
@@ -817,7 +819,7 @@ test("chat OpenCode mode completes short local model greeting prompts", async ()
       }
       await submit;
       return { finalState: await window.unitApi.chat.bootstrap(), frames };
-    }, { modelPath, projectDir, gpuLayers });
+    }, { modelPath, projectDir, gpuLayers, maxTokens, systemPrompt });
     const assistant = result.finalState.messages.filter((message) => message.role === "assistant").at(-1);
     if (result.finalState.generation.status === "error") {
       throw new Error(JSON.stringify({

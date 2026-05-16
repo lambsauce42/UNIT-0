@@ -418,14 +418,21 @@ export class ChatService {
           model,
           runtimeSettings: thread.runtimeSettings
         });
-        return;
+      } else if (thread.builtinAgenticFramework === "opencode") {
+        await this.runtime.openAiEndpoint({
+          model,
+          settings: openCodeModelSettings(model, thread.runtimeSettings),
+          shouldCancel: () => runId !== this.warmupRunId || this.generationIsRunning(),
+          reserveForGeneration: false
+        });
+      } else {
+        await this.runtime.warmChatSession({
+          model,
+          settings: thread.runtimeSettings,
+          cacheKey: localRuntimeCacheKey(thread, model, thread.builtinAgenticFramework, documentTitle),
+          shouldCancel: () => runId !== this.warmupRunId || this.generationIsRunning()
+        });
       }
-      await this.runtime.warmChatSession({
-        model,
-        settings: thread.runtimeSettings,
-        cacheKey: localRuntimeCacheKey(thread, model, thread.builtinAgenticFramework, documentTitle),
-        shouldCancel: () => runId !== this.warmupRunId || this.generationIsRunning()
-      });
       if (runId !== this.warmupRunId || this.generationIsRunning() || thread.builtinAgenticFramework !== "document_analysis") {
         return;
       }
@@ -865,9 +872,13 @@ export class ChatService {
   }
 
   cancel(): ChatState {
-    if (this.generation.status !== "running") {
+    const activeGeneration = this.generation;
+    if (activeGeneration.status !== "running") {
       return this.state();
     }
+    const state = this.store.loadState();
+    const activeThread = state.threads.find((thread) => thread.id === activeGeneration.threadId);
+    const deferIdleUntilOpenCodeCleanup = activeThread?.providerMode === "builtin" && activeThread.builtinAgenticFramework === "opencode";
     this.cancelRequested = true;
     this.runtime.cancelActiveRequest();
     this.remoteRuntime.cancelActiveRequest();
@@ -879,8 +890,10 @@ export class ChatService {
     if (this.activeLocalRunId) {
       this.cancelledLocalRunIds.add(this.activeLocalRunId);
     }
-    this.store.updateMessageStatus(this.generation.assistantMessageId, "interrupted");
-    this.generation = { status: "idle" };
+    this.store.updateMessageStatus(activeGeneration.assistantMessageId, "interrupted");
+    if (!deferIdleUntilOpenCodeCleanup) {
+      this.generation = { status: "idle" };
+    }
     this.broadcast();
     return this.state();
   }
@@ -1401,6 +1414,7 @@ export class ChatService {
     const reasoningTextById = new Map<string, string>();
     const assistantTextStream: Array<{ id: string; text: string }> = [];
     const reasoningTextStream: Array<{ id: string; text: string }> = [];
+    let resetLocalRuntimeAfterTurn = false;
     try {
       const project = this.store.loadState().projects.find((item) => item.id === options.thread.projectId);
       if (!project?.directory) {
@@ -1415,8 +1429,17 @@ export class ChatService {
       }
       const endpoint = await this.runtime.openAiEndpoint({
         model: options.model,
-        settings: openCodeModelSettings(options.model, options.thread.runtimeSettings)
+        settings: openCodeModelSettings(options.model, options.thread.runtimeSettings),
+        shouldCancel: options.runCancelled
       });
+      if (options.runCancelled()) {
+        resetLocalRuntimeAfterTurn = true;
+        if (options.ownsActiveGeneration()) {
+          this.generation = { status: "idle" };
+          finishedActiveGeneration = true;
+        }
+        return;
+      }
       const nativeGptOss = isNativeGptOssModel(options.model);
       for await (const event of this.openCodeRuntime.runTurn({
         cwd: project.directory,
@@ -1433,6 +1456,9 @@ export class ChatService {
         }
         this.applyOpenCodeEvent(options.assistantMessageId, options.thread.id, event, timelineBlocks, assistantTextById, reasoningTextById, assistantTextStream, reasoningTextStream);
       }
+      if (options.runCancelled()) {
+        resetLocalRuntimeAfterTurn = true;
+      }
       if (!options.runCancelled()) {
         this.assertOpenCodeStreamProducedVisibleOutput(options.assistantMessageId, nativeGptOss);
       }
@@ -1442,6 +1468,7 @@ export class ChatService {
         finishedActiveGeneration = true;
       }
     } catch (error) {
+      resetLocalRuntimeAfterTurn = true;
       const message = errorMessage(error);
       this.store.updateMessageStatus(options.assistantMessageId, options.runCancelled() ? "interrupted" : "error");
       if (!options.runCancelled()) {
@@ -1452,6 +1479,9 @@ export class ChatService {
         finishedActiveGeneration = true;
       }
     } finally {
+      if (resetLocalRuntimeAfterTurn) {
+        this.runtime.close();
+      }
       this.broadcast();
       if (finishedActiveGeneration) {
         void this.drainNextQueuedSubmission();

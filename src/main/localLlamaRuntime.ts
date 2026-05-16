@@ -10,6 +10,7 @@ const GPTOSS_CALL_MARKER = "<|call|>";
 const GPTOSS_RETURN_MARKER = "<|return|>";
 const GPTOSS_CHANNEL_TERMINATORS = [GPTOSS_END_MARKER, GPTOSS_CALL_MARKER, GPTOSS_RETURN_MARKER];
 const DOCUMENT_ANALYSIS_TOOL_RESULT_PREFIX = "Tool result:\n";
+const LOCAL_LLAMA_DEFAULT_PARALLEL_SLOTS = 1;
 const GPTOSS_SYSTEM_PROMPT = [
   "You are ChatGPT, a large language model trained by OpenAI.",
   "Knowledge cutoff: 2024-06",
@@ -112,6 +113,7 @@ export type LocalLlamaOpenAiEndpoint = {
   baseUrl: string;
   modelId: string;
   rawCompletionUrl?: string;
+  rawCompletionSlotId?: number;
 };
 
 type ServerKey = {
@@ -119,6 +121,7 @@ type ServerKey = {
   nCtx: number;
   nGpuLayers: number;
   nativeGptOss: boolean;
+  parallelSlots: number;
 };
 
 type ActiveServer = {
@@ -128,6 +131,7 @@ type ActiveServer = {
   process: ChildProcess;
   slotSavePath: string;
   activeSlotCacheKey: string;
+  activeSlotDirty: boolean;
 };
 
 export class LocalLlamaRuntime {
@@ -175,8 +179,12 @@ export class LocalLlamaRuntime {
       cacheKey?: string;
     }
   ): Promise<void> {
-    const server = await this.ensureServer(options.model, options.settings);
-    await this.restoreSlotIfNeeded(server, options.cacheKey);
+    const server = await this.serverWithRestoredSlot(options.model, options.settings, options.cacheKey);
+    const normalizedCacheKey = normalizeSlotCacheKey(options.cacheKey);
+    if (normalizedCacheKey) {
+      server.activeSlotCacheKey = normalizedCacheKey;
+      server.activeSlotDirty = true;
+    }
     const abortController = new AbortController();
     this.activeAbortController = abortController;
     try {
@@ -300,28 +308,71 @@ export class LocalLlamaRuntime {
       if (options.shouldCancel?.()) {
         return;
       }
-      const server = await this.ensureServer(options.model, options.settings);
+      const server = await this.ensureServer(options.model, options.settings, LOCAL_LLAMA_DEFAULT_PARALLEL_SLOTS);
       if (options.shouldCancel?.()) {
         return;
       }
-      await this.restoreSlotIfNeeded(server, options.cacheKey);
+      const restoreStatus = await this.restoreSlotIfNeeded(server, options.cacheKey);
+      if (restoreStatus === "restart_required") {
+        this.close();
+        if (options.shouldCancel?.()) {
+          return;
+        }
+        const restartedServer = await this.ensureServer(options.model, options.settings, LOCAL_LLAMA_DEFAULT_PARALLEL_SLOTS);
+        const restartedStatus = await this.restoreSlotIfNeeded(restartedServer, options.cacheKey);
+        if (restartedStatus === "restart_required") {
+          throw new LocalLlamaRuntimeError("Bundled llama-server slot restart did not clear dirty KV state.");
+        }
+      }
     });
   }
 
   async openAiEndpoint(options: {
     model: ChatModel;
     settings: ChatRuntimeSettings;
+    shouldCancel?: () => boolean;
+    reserveForGeneration?: boolean;
   }): Promise<LocalLlamaOpenAiEndpoint> {
-    const server = await this.ensureServer(options.model, options.settings);
-    return {
-      baseUrl: server.baseUrl,
-      modelId: server.modelId,
-      rawCompletionUrl: `${server.baseUrl}/completion`
-    };
+    return this.withSlotLock(async () => {
+      if (options.shouldCancel?.()) {
+        throw new LocalLlamaRuntimeError("Bundled llama-server request was cancelled.");
+      }
+      let server = await this.ensureServer(options.model, options.settings, LOCAL_LLAMA_DEFAULT_PARALLEL_SLOTS);
+      if (options.shouldCancel?.()) {
+        throw new LocalLlamaRuntimeError("Bundled llama-server request was cancelled.");
+      }
+      if (server.activeSlotDirty && server.activeSlotCacheKey) {
+        this.close();
+        if (options.shouldCancel?.()) {
+          throw new LocalLlamaRuntimeError("Bundled llama-server request was cancelled.");
+        }
+        server = await this.ensureServer(options.model, options.settings, LOCAL_LLAMA_DEFAULT_PARALLEL_SLOTS);
+        if (options.shouldCancel?.()) {
+          throw new LocalLlamaRuntimeError("Bundled llama-server request was cancelled.");
+        }
+      }
+      if (options.reserveForGeneration !== false) {
+        server.activeSlotCacheKey = "";
+        server.activeSlotDirty = true;
+      }
+      return {
+        baseUrl: server.baseUrl,
+        modelId: server.modelId,
+        rawCompletionUrl: `${server.baseUrl}/completion`,
+        rawCompletionSlotId: 0
+      };
+    });
   }
 
   cancelActiveRequest(): void {
     this.activeAbortController?.abort();
+    if (this.startingProcess && this.startingProcess.exitCode === null) {
+      this.serverGeneration += 1;
+      this.startingProcess.kill();
+      this.startingProcess = null;
+      this.pendingServer = null;
+      this.pendingServerKey = null;
+    }
   }
 
   close(): void {
@@ -339,9 +390,10 @@ export class LocalLlamaRuntime {
     this.pendingServerKey = null;
   }
 
-  private async ensureServer(model: ChatModel, settings: ChatRuntimeSettings): Promise<ActiveServer> {
+  private async ensureServer(model: ChatModel, settings: ChatRuntimeSettings, parallelSlots: number): Promise<ActiveServer> {
     const modelPath = path.resolve(model.path);
     const nativeGptOss = isNativeGptOssModel(model);
+    const normalizedParallelSlots = Math.max(1, Math.floor(parallelSlots));
     if (!fs.existsSync(modelPath) || !fs.statSync(modelPath).isFile()) {
       throw new LocalLlamaRuntimeError(`Model file not found: ${modelPath}`);
     }
@@ -349,7 +401,8 @@ export class LocalLlamaRuntime {
       modelPath,
       nCtx: settings.nCtx,
       nGpuLayers: settings.nGpuLayers,
-      nativeGptOss
+      nativeGptOss,
+      parallelSlots: normalizedParallelSlots
     };
     if (this.activeServer && serverKeyMatches(this.activeServer.key, key) && this.activeServer.process.exitCode === null) {
       return this.activeServer;
@@ -389,6 +442,7 @@ export class LocalLlamaRuntime {
       modelPath: key.modelPath,
       settings,
       nativeGptOss: key.nativeGptOss,
+      parallelSlots: key.parallelSlots,
       slotSavePath
     });
     const process = this.spawnImpl(command.command, command.args, {
@@ -414,7 +468,7 @@ export class LocalLlamaRuntime {
       }
       throw new LocalLlamaRuntimeError("Bundled llama-server startup was superseded.");
     }
-    return { key, baseUrl, modelId, process, slotSavePath, activeSlotCacheKey: "" };
+    return { key, baseUrl, modelId, process, slotSavePath, activeSlotCacheKey: "", activeSlotDirty: false };
   }
 
   private async waitUntilReady(process: ChildProcess, baseUrl: string, binaryPath: string, startGeneration: number): Promise<string> {
@@ -474,20 +528,46 @@ export class LocalLlamaRuntime {
     return slotDir;
   }
 
-  private async restoreSlotIfNeeded(server: ActiveServer, cacheKey?: string): Promise<void> {
+  private async serverWithRestoredSlot(model: ChatModel, settings: ChatRuntimeSettings, cacheKey?: string): Promise<ActiveServer> {
+    let server = await this.ensureServer(model, settings, LOCAL_LLAMA_DEFAULT_PARALLEL_SLOTS);
+    const restoreStatus = await this.restoreSlotIfNeeded(server, cacheKey);
+    if (restoreStatus !== "restart_required") {
+      return server;
+    }
+    this.close();
+    server = await this.ensureServer(model, settings, LOCAL_LLAMA_DEFAULT_PARALLEL_SLOTS);
+    const restartedStatus = await this.restoreSlotIfNeeded(server, cacheKey);
+    if (restartedStatus === "restart_required") {
+      throw new LocalLlamaRuntimeError("Bundled llama-server slot restart did not clear dirty KV state.");
+    }
+    return server;
+  }
+
+  private async restoreSlotIfNeeded(server: ActiveServer, cacheKey?: string): Promise<"ready" | "restart_required"> {
     const normalizedKey = normalizeSlotCacheKey(cacheKey);
-    if (!normalizedKey || server.activeSlotCacheKey === normalizedKey) {
-      return;
+    if (!normalizedKey) {
+      return "ready";
     }
-    if (server.activeSlotCacheKey) {
+    if (server.activeSlotCacheKey === normalizedKey && !server.activeSlotDirty) {
+      return "ready";
+    }
+    if (server.activeSlotCacheKey && !server.activeSlotDirty) {
       await this.saveSlot(server, slotCacheFilename(server, server.activeSlotCacheKey));
-      server.activeSlotCacheKey = "";
     }
+    const wasDirty = server.activeSlotDirty;
+    server.activeSlotCacheKey = "";
+    server.activeSlotDirty = false;
     const filename = slotCacheFilename(server, normalizedKey);
     if (fs.existsSync(path.join(server.slotSavePath, filename))) {
       await this.slotAction(server.baseUrl, "restore", filename);
       server.activeSlotCacheKey = normalizedKey;
+      server.activeSlotDirty = false;
+      return "ready";
     }
+    if (wasDirty) {
+      return "restart_required";
+    }
+    return "ready";
   }
 
   private async saveSlotIfNeeded(server: ActiveServer, cacheKey?: string): Promise<void> {
@@ -497,6 +577,7 @@ export class LocalLlamaRuntime {
     }
     await this.saveSlot(server, slotCacheFilename(server, normalizedKey));
     server.activeSlotCacheKey = normalizedKey;
+    server.activeSlotDirty = false;
   }
 
   private async saveSlot(server: ActiveServer, filename: string): Promise<void> {
@@ -550,8 +631,10 @@ export function buildLlamaServerCommand(options: {
   modelPath: string;
   settings: ChatRuntimeSettings;
   nativeGptOss?: boolean;
+  parallelSlots?: number;
   slotSavePath?: string;
 }): LlamaServerCommand {
+  const parallelSlots = Math.max(1, Math.floor(options.parallelSlots ?? LOCAL_LLAMA_DEFAULT_PARALLEL_SLOTS));
   const args = [
     "--host",
     "127.0.0.1",
@@ -560,11 +643,11 @@ export function buildLlamaServerCommand(options: {
     "--model",
     options.modelPath,
     "--ctx-size",
-    String(options.settings.nCtx),
+    String(options.settings.nCtx * parallelSlots),
     "--n-gpu-layers",
     options.settings.nGpuLayers < 0 ? "auto" : String(options.settings.nGpuLayers),
     "-np",
-    "1",
+    String(parallelSlots),
     "--slots",
     "--slot-save-path",
     options.slotSavePath ?? path.join(path.dirname(options.binaryPath), "slots"),
@@ -643,7 +726,11 @@ async function readServerSentEvents(body: ReadableStream<Uint8Array>, onPayload:
 }
 
 function serverKeyMatches(left: ServerKey, right: ServerKey): boolean {
-  return left.modelPath === right.modelPath && left.nCtx === right.nCtx && left.nGpuLayers === right.nGpuLayers && left.nativeGptOss === right.nativeGptOss;
+  return left.modelPath === right.modelPath
+    && left.nCtx === right.nCtx
+    && left.nGpuLayers === right.nGpuLayers
+    && left.nativeGptOss === right.nativeGptOss
+    && left.parallelSlots === right.parallelSlots;
 }
 
 function normalizeSlotCacheKey(value: string | undefined): string {

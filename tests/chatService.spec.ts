@@ -43,10 +43,15 @@ class TestEmbeddingRuntime implements DocumentEmbeddingRuntime {
 
 class RecordingEmbeddingRuntime extends TestEmbeddingRuntime {
   readonly documentTextBatches: string[][] = [];
+  readonly warmCalls: Array<{ modelPath: string; nCtx: number; nGpuLayers: number }> = [];
 
   override async embedDocuments(options: { modelPath: string; texts: string[]; nCtx: number; nGpuLayers: number; onProgress?: (completed: number, total: number) => void }): Promise<number[][]> {
     this.documentTextBatches.push([...options.texts]);
     return super.embedDocuments(options);
+  }
+
+  override async warm(options: { modelPath: string; nCtx: number; nGpuLayers: number; shouldCancel?: () => boolean }): Promise<void> {
+    this.warmCalls.push({ modelPath: options.modelPath, nCtx: options.nCtx, nGpuLayers: options.nGpuLayers });
   }
 }
 
@@ -149,6 +154,7 @@ class StreamingOpenCodeLlamaRuntime extends LocalLlamaRuntime {
 class ScriptedRemoteRuntime extends RemoteHostRuntime {
   readonly frameworkCalls: string[] = [];
   readonly calls: ChatMessage[][] = [];
+  readonly prewarmCalls: Array<Parameters<RemoteHostRuntime["prewarm"]>[0]> = [];
   private pass = 0;
 
   constructor(private readonly replies: Array<{ content: string; reasoning?: string }>) {
@@ -173,6 +179,10 @@ class ScriptedRemoteRuntime extends RemoteHostRuntime {
       remoteSessionStatus: "warm",
       metrics: { backend: "llama-server" }
     };
+  }
+
+  override async prewarm(options: Parameters<RemoteHostRuntime["prewarm"]>[0]): Promise<void> {
+    this.prewarmCalls.push(options);
   }
 }
 
@@ -224,6 +234,15 @@ class IncompleteOpenCodeRuntime implements OpenCodeRuntime {
 class EndpointOnlyLlamaRuntime extends LocalLlamaRuntime {
   async openAiEndpoint(): Promise<{ baseUrl: string; modelId: string }> {
     return { baseUrl: "http://127.0.0.1:12345", modelId: "llama" };
+  }
+}
+
+class RecordingEndpointOnlyLlamaRuntime extends EndpointOnlyLlamaRuntime {
+  closeCount = 0;
+
+  override close(): void {
+    this.closeCount += 1;
+    super.close();
   }
 }
 
@@ -617,7 +636,8 @@ test("does not mark an incomplete OpenCode runtime stream as complete", async ()
   const modelPath = path.join(dir, "model.gguf");
   fs.writeFileSync(modelPath, "");
   const store = new ChatStore(path.join(dir, "chat.sqlite"));
-  const service = new ChatService(store, new EndpointOnlyLlamaRuntime(), new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined, new TestEmbeddingRuntime(), new IncompleteOpenCodeRuntime());
+  const llamaRuntime = new RecordingEndpointOnlyLlamaRuntime();
+  const service = new ChatService(store, llamaRuntime, new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined, new TestEmbeddingRuntime(), new IncompleteOpenCodeRuntime());
   try {
     let state = store.loadState();
     store.updateProjectSettings(state.selectedProjectId, "OpenCode Incomplete Project", dir);
@@ -635,6 +655,7 @@ test("does not mark an incomplete OpenCode runtime stream as complete", async ()
     const assistant = state.messages.find((message) => message.role === "assistant");
     expect(assistant?.content).toBe("Partial answer.");
     expect(assistant?.status).toBe("error");
+    expect(llamaRuntime.closeCount).toBe(1);
   } finally {
     service.close();
     fs.rmSync(dir, { recursive: true, force: true });
@@ -3208,6 +3229,55 @@ test("requires local models for OpenCode harness settings", async () => {
   }
 });
 
+test("warms document-analysis embeddings even when generation model is remote", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-remote-doc-warm-test-"));
+  const store = new ChatStore(path.join(dir, "chat.sqlite"));
+  const remoteRuntime = new ScriptedRemoteRuntime([]);
+  const embeddingRuntime = new RecordingEmbeddingRuntime();
+  const service = new ChatService(store, new LocalLlamaRuntime(), remoteRuntime, new MockCodexRuntime(), () => undefined, embeddingRuntime);
+  try {
+    const sourcePath = path.join(dir, "notes.txt");
+    const embeddingPath = path.join(dir, "embed.gguf");
+    fs.writeFileSync(sourcePath, "alpha first paragraph");
+    fs.writeFileSync(embeddingPath, "");
+    store.replaceRemoteModels([{
+      id: "remote-model",
+      label: "Remote Model",
+      path: "remote://model",
+      providerId: "remote",
+      reference: "remote-model",
+      promptFormat: "gpt-oss",
+      sourceLabel: "Remote Built-in",
+      hostId: "host",
+      createdAt: new Date().toISOString()
+    }], { hostId: "host", hostIdentity: "Remote Host", protocolVersion: "1" });
+    let state = store.loadState();
+    const index = store.createDocumentIndex(state.selectedProjectId, "Notes", sourcePath, embeddingPath);
+    store.replaceDocumentIndexChunks(index.id, [
+      { chunkId: "c1", sourceTitle: "notes.txt", sourcePath, pageStart: 1, pageEnd: 1, text: "alpha first paragraph", tokenCount: 4, ordinalStart: 0, ordinalEnd: 0, embedding: [1, 0, 0] }
+    ]);
+    store.updateDocumentIndexStatus(index.id, { state: "ready", progress: 1, message: "Ready" });
+    service.selectModel("remote-model");
+    state = store.loadState();
+    service.updateThreadSettings({
+      threadId: state.selectedThreadId,
+      builtinAgenticFramework: "document_analysis",
+      builtinModelId: "remote-model",
+      documentIndexId: index.id,
+      documentAnalysisEmbeddingModelPath: embeddingPath
+    });
+
+    service.warmSelectedLocalRuntime();
+
+    await expect.poll(() => remoteRuntime.prewarmCalls.length).toBeGreaterThanOrEqual(1);
+    await expect.poll(() => embeddingRuntime.warmCalls.length).toBeGreaterThanOrEqual(1);
+    expect(embeddingRuntime.warmCalls[0]).toMatchObject({ modelPath: embeddingPath, nGpuLayers: -1 });
+  } finally {
+    service.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("cancels active OpenCode shell tool execution", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-opencode-cancel-test-"));
   const modelPath = path.join(dir, "model.gguf");
@@ -3271,6 +3341,95 @@ test("cancels active OpenCode shell tool execution", async () => {
   }
 });
 
+test("cancels OpenCode while the local endpoint is still starting", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-opencode-startup-cancel-test-"));
+  const modelPath = path.join(dir, "model.gguf");
+  fs.writeFileSync(modelPath, "");
+  const store = new ChatStore(path.join(dir, "chat.sqlite"));
+  let endpointStarted: (() => void) | null = null;
+  const endpointStartedGate = new Promise<void>((resolve) => {
+    endpointStarted = resolve;
+  });
+  class BlockingEndpointRuntime extends LocalLlamaRuntime {
+    private rejectEndpoint: ((error: Error) => void) | null = null;
+    cancelled = false;
+
+    override async openAiEndpoint(): Promise<{ baseUrl: string; modelId: string }> {
+      endpointStarted?.();
+      return new Promise((_, reject) => {
+        this.rejectEndpoint = reject;
+      });
+    }
+
+    override cancelActiveRequest(): void {
+      this.cancelled = true;
+      this.rejectEndpoint?.(new Error("startup cancelled"));
+    }
+  }
+  const llamaRuntime = new BlockingEndpointRuntime();
+  const service = new ChatService(store, llamaRuntime, new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined, new TestEmbeddingRuntime(), new ScriptedOpenCodeRuntime([[{ type: "assistant.delta", id: "unused", status: "updated", text: "unused" }]]));
+  try {
+    let state = store.loadState();
+    store.updateProjectSettings(state.selectedProjectId, "OpenCode Startup Cancel Project", dir);
+    store.addLocalModel(modelPath);
+    state = store.loadState();
+    store.updateThreadSettings(state.selectedThreadId, {
+      builtinAgenticFramework: "opencode",
+      builtinModelId: state.selectedModelId
+    });
+
+    await service.submit({ text: "start" });
+    await endpointStartedGate;
+    service.cancel();
+    await expect.poll(() => service.state().generation.status).toBe("idle");
+
+    state = store.loadState();
+    const assistant = state.messages.find((message) => message.role === "assistant");
+    expect(llamaRuntime.cancelled).toBe(true);
+    expect(assistant?.status).toBe("interrupted");
+  } finally {
+    service.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("cancels OpenCode after the local endpoint is ready but before the turn starts", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-opencode-endpoint-ready-cancel-test-"));
+  const modelPath = path.join(dir, "model.gguf");
+  fs.writeFileSync(modelPath, "");
+  const store = new ChatStore(path.join(dir, "chat.sqlite"));
+  let service: ChatService;
+  class CancellingEndpointRuntime extends EndpointOnlyLlamaRuntime {
+    override async openAiEndpoint(): Promise<{ baseUrl: string; modelId: string }> {
+      service.cancel();
+      return super.openAiEndpoint();
+    }
+  }
+  const openCodeRuntime = new ScriptedOpenCodeRuntime([[{ type: "assistant.delta", id: "unexpected", status: "updated", text: "unexpected" }]]);
+  service = new ChatService(store, new CancellingEndpointRuntime(), new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined, new TestEmbeddingRuntime(), openCodeRuntime);
+  try {
+    let state = store.loadState();
+    store.updateProjectSettings(state.selectedProjectId, "OpenCode Endpoint Ready Cancel Project", dir);
+    store.addLocalModel(modelPath);
+    state = store.loadState();
+    store.updateThreadSettings(state.selectedThreadId, {
+      builtinAgenticFramework: "opencode",
+      builtinModelId: state.selectedModelId
+    });
+
+    await service.submit({ text: "start" });
+    await expect.poll(() => service.state().generation.status).toBe("idle");
+
+    state = store.loadState();
+    const assistant = state.messages.find((message) => message.role === "assistant");
+    expect(assistant?.status).toBe("interrupted");
+    expect(openCodeRuntime.calls).toHaveLength(0);
+  } finally {
+    service.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("cancelled OpenCode run does not clear a newer generation", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-opencode-race-test-"));
   const modelPath = path.join(dir, "model.gguf");
@@ -3312,7 +3471,30 @@ test("cancelled OpenCode run does not clear a newer generation", async () => {
       releaseFirstRun?.();
     }
   }
-  const service = new ChatService(store, new EndpointOnlyLlamaRuntime(), new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined, new TestEmbeddingRuntime(), new RacingOpenCodeRuntime());
+  class GuardedEndpointRuntime extends EndpointOnlyLlamaRuntime {
+    closeCount = 0;
+    closeAfterSecondEndpointStarted = false;
+    private endpointCount = 0;
+    private secondEndpointStarted = false;
+
+    override async openAiEndpoint(): Promise<{ baseUrl: string; modelId: string }> {
+      this.endpointCount += 1;
+      if (this.endpointCount === 2) {
+        this.secondEndpointStarted = true;
+      }
+      return super.openAiEndpoint();
+    }
+
+    override close(): void {
+      this.closeCount += 1;
+      if (this.secondEndpointStarted) {
+        this.closeAfterSecondEndpointStarted = true;
+      }
+      super.close();
+    }
+  }
+  const llamaRuntime = new GuardedEndpointRuntime();
+  const service = new ChatService(store, llamaRuntime, new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined, new TestEmbeddingRuntime(), new RacingOpenCodeRuntime());
   try {
     let state = store.loadState();
     store.updateProjectSettings(state.selectedProjectId, "OpenCode Race Project", dir);
@@ -3326,11 +3508,14 @@ test("cancelled OpenCode run does not clear a newer generation", async () => {
     await service.submit({ text: "start long command" });
     await expect.poll(() => service.state().messages.find((message) => message.role === "assistant")?.timelineBlocks?.some((block) => block.kind === "tool" && block.status === "started") ?? false).toBe(true);
     service.cancel();
+    expect(service.state().generation.status).toBe("running");
     await service.submit({ text: "new request" });
     await secondReplyStartedGate;
     await expect.poll(() => service.state().messages.find((message) => message.role === "assistant")?.status).toBe("interrupted");
 
     expect(service.state().generation.status).toBe("running");
+    expect(llamaRuntime.closeCount).toBe(1);
+    expect(llamaRuntime.closeAfterSecondEndpointStarted).toBe(false);
 
     releaseSecondReply?.();
     await expect.poll(() => service.state().generation.status).toBe("idle");
