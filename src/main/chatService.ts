@@ -2,6 +2,7 @@ import type {
   ChatAttachment,
   ChatBuiltinAgenticFramework,
   ChatCodexAccountState,
+  ChatContextUsage,
   ChatCodexModel,
   ChatGenerationState,
   ChatGitState,
@@ -360,6 +361,8 @@ export class ChatService {
   private nextOpenCodeRunId = 0;
   private cancelledOpenCodeRunIds = new Set<number>();
   private warmupRunId = 0;
+  private contextUsageByThreadId = new Map<string, ChatContextUsage>();
+  private contextUsageEpochByThreadId = new Map<string, number>();
 
   constructor(
     private readonly store: ChatStore,
@@ -374,13 +377,98 @@ export class ChatService {
   }
 
   state(): ChatState {
+    const storedState = this.store.loadState();
     return {
-      ...this.store.loadState(),
+      ...storedState,
       codexModels: this.codexModels,
       codexAccount: this.codexAccount,
       queuedSubmissions: this.queuedSubmissions,
-      generation: this.generation
+      generation: this.generation,
+      contextUsage: this.selectedContextUsage(storedState)
     };
+  }
+
+  private selectedContextUsage(state: Omit<ChatState, "generation" | "contextUsage">): ChatContextUsage | null {
+    const selectedThread = state.threads.find((thread) => thread.id === state.selectedThreadId);
+    if (!selectedThread) {
+      return null;
+    }
+    const usage = this.contextUsageByThreadId.get(selectedThread.id);
+    if (
+      !usage
+      || usage.contextTokens !== selectedThread.runtimeSettings.nCtx
+      || usage.framework !== selectedThread.builtinAgenticFramework
+      || usage.promptSignature !== this.contextUsagePromptSignatureForThread(state, selectedThread)
+      || usage.promptEpoch !== this.contextUsageEpochForThread(selectedThread.id)
+    ) {
+      return null;
+    }
+    return usage;
+  }
+
+  private contextUsagePromptSignatureForThread(
+    state: Omit<ChatState, "generation" | "contextUsage">,
+    thread: ChatState["threads"][number]
+  ): string {
+    const project = state.projects.find((item) => item.id === thread.projectId);
+    const model = state.models.find((item) => item.id === (thread.builtinModelId || state.selectedModelId));
+    return JSON.stringify({
+      threadId: thread.id,
+      projectId: thread.projectId,
+      projectDirectory: project?.directory ?? "",
+      framework: thread.builtinAgenticFramework,
+      providerMode: thread.providerMode,
+      builtinModelId: thread.builtinModelId,
+      modelId: model?.id ?? "",
+      modelPath: model?.path ?? "",
+      permissionMode: thread.permissionMode,
+      runtimeSettings: thread.runtimeSettings,
+      activeContextStartMessageIndex: thread.activeContextStartMessageIndex,
+      messages: state.messages
+        .filter((message) => message.threadId === thread.id)
+        .slice(thread.activeContextStartMessageIndex)
+        .map((message) => ({
+          id: message.id,
+          role: message.role,
+          status: message.status,
+          content: message.content,
+          reasoning: message.reasoning ?? "",
+          attachments: message.attachments ?? [],
+          timelineBlocks: message.timelineBlocks ?? []
+        }))
+    });
+  }
+
+  private currentContextUsagePromptSignature(threadId: string): string | null {
+    const state = this.store.loadState();
+    const thread = state.threads.find((item) => item.id === threadId);
+    return thread ? this.contextUsagePromptSignatureForThread(state, thread) : null;
+  }
+
+  private invalidateContextUsage(threadId: string | undefined): void {
+    if (threadId) {
+      this.contextUsageByThreadId.delete(threadId);
+      this.contextUsageEpochByThreadId.set(threadId, this.contextUsageEpochForThread(threadId) + 1);
+    }
+  }
+
+  private contextUsageEpochForThread(threadId: string): number {
+    return this.contextUsageEpochByThreadId.get(threadId) ?? 0;
+  }
+
+  private invalidateSelectedContextUsage(): void {
+    this.invalidateContextUsage(this.store.loadState().selectedThreadId);
+  }
+
+  private invalidateProjectContextUsage(projectId: string | undefined): void {
+    if (!projectId) {
+      return;
+    }
+    for (const thread of this.store.loadState().threads) {
+      if (thread.projectId === projectId) {
+        this.invalidateContextUsage(thread.id);
+      }
+    }
   }
 
   warmSelectedLocalRuntime(): void {
@@ -526,6 +614,7 @@ export class ChatService {
 
   updateProjectSettings(projectId: string, title: string, directory: string): ChatState {
     this.store.updateProjectSettings(projectId, title, directory);
+    this.invalidateProjectContextUsage(projectId);
     this.clearError();
     this.broadcast();
     this.warmSelectedLocalRuntime();
@@ -542,6 +631,7 @@ export class ChatService {
 
   moveThread(threadId: string, projectId: string, targetThreadId?: string, position?: "before" | "after"): ChatState {
     this.store.moveThread(threadId, projectId, targetThreadId, position);
+    this.invalidateContextUsage(threadId);
     this.clearError();
     this.broadcast();
     return this.state();
@@ -555,6 +645,7 @@ export class ChatService {
   }
 
   deleteProject(projectId: string): ChatState {
+    this.invalidateProjectContextUsage(projectId);
     this.store.deleteProject(projectId);
     this.clearError();
     this.broadcast();
@@ -562,6 +653,7 @@ export class ChatService {
   }
 
   deleteThread(threadId: string): ChatState {
+    this.invalidateContextUsage(threadId);
     this.store.deleteThread(threadId);
     this.clearError();
     this.broadcast();
@@ -577,6 +669,7 @@ export class ChatService {
   }
 
   selectModel(modelId: string): ChatState {
+    this.invalidateSelectedContextUsage();
     this.store.selectModel(modelId);
     this.clearError();
     this.broadcast();
@@ -585,6 +678,7 @@ export class ChatService {
   }
 
   updateRuntimeSettings(settings: Partial<ChatState["runtimeSettings"]>): ChatState {
+    this.invalidateSelectedContextUsage();
     this.store.updateRuntimeSettings(settings);
     this.clearError();
     this.broadcast();
@@ -616,6 +710,7 @@ export class ChatService {
       this.broadcast();
       return this.state();
     }
+    this.invalidateContextUsage(payload.threadId);
     this.store.updateThreadSettings(payload.threadId, {
       providerMode: payload.providerMode,
       selectedSettingsPresetId: payload.selectedSettingsPresetId,
@@ -655,6 +750,7 @@ export class ChatService {
       this.broadcast();
       return this.state();
     }
+    this.invalidateContextUsage(payload.threadId);
     this.store.applySettingsPreset(payload.threadId, payload.presetId);
     this.clearError();
     this.broadcast();
@@ -784,6 +880,7 @@ export class ChatService {
     if (selectedThread.providerMode === "codex") {
       return false;
     }
+    this.invalidateContextUsage(selectedThread.id);
     if (text === "/reset") {
       const messageCount = this.store.messageCount(selectedThread.id);
       if (messageCount <= selectedThread.activeContextStartMessageIndex) {
@@ -861,6 +958,7 @@ export class ChatService {
       this.setError(localToCodexBlockReason());
       return this.state();
     }
+    this.invalidateContextUsage(threadId);
     if (text && this.store.messageCount(threadId) === 0) {
       this.store.renameThread(threadId, text);
     }
@@ -1439,6 +1537,8 @@ export class ChatService {
       if (lastUserMessage.attachments.length > 0) {
         throw new Error("OpenCode threads do not support Unit-0 attachments yet.");
       }
+      const contextUsagePromptSignature = this.currentContextUsagePromptSignature(options.thread.id);
+      const contextUsagePromptEpoch = this.contextUsageEpochForThread(options.thread.id);
       const endpoint = await this.runtime.openAiEndpoint({
         model: options.model,
         settings: openCodeModelSettings(options.model, options.thread.runtimeSettings),
@@ -1466,7 +1566,7 @@ export class ChatService {
         if (options.runCancelled()) {
           break;
         }
-        this.applyOpenCodeEvent(options.assistantMessageId, options.thread.id, event, timelineBlocks, assistantTextById, reasoningTextById, assistantTextStream, reasoningTextStream);
+        this.applyOpenCodeEvent(options.assistantMessageId, options.thread.id, contextUsagePromptSignature, contextUsagePromptEpoch, event, timelineBlocks, assistantTextById, reasoningTextById, assistantTextStream, reasoningTextStream);
       }
       if (options.runCancelled()) {
         resetLocalRuntimeAfterTurn = true;
@@ -1526,6 +1626,8 @@ export class ChatService {
   private applyOpenCodeEvent(
     assistantMessageId: string,
     threadId: string,
+    contextUsagePromptSignature: string | null,
+    contextUsagePromptEpoch: number,
     event: OpenCodeRuntimeEvent,
     timelineBlocks: ChatTimelineBlock[],
     assistantTextById: Map<string, string>,
@@ -1535,6 +1637,32 @@ export class ChatService {
   ): void {
     if (event.type === "session.started") {
       this.store.updateThreadSettings(threadId, { openCodeSessionId: event.sessionId });
+      this.broadcast();
+      return;
+    }
+    if (event.type === "context.updated") {
+      if (
+        !contextUsagePromptSignature
+        || this.currentContextUsagePromptSignature(threadId) !== contextUsagePromptSignature
+        || this.contextUsageEpochForThread(threadId) !== contextUsagePromptEpoch
+      ) {
+        return;
+      }
+      this.contextUsageByThreadId.set(threadId, {
+        threadId,
+        framework: event.framework,
+        source: "actual_prompt",
+        promptSignature: contextUsagePromptSignature,
+        promptEpoch: contextUsagePromptEpoch,
+        promptTokens: event.promptTokens,
+        contextTokens: event.contextTokens,
+        remainingTokens: event.remainingTokens,
+        maxOutputTokens: event.maxOutputTokens,
+        precise: event.precise,
+        includesSystemPrompt: event.includesSystemPrompt,
+        includesToolDefinitions: event.includesToolDefinitions,
+        updatedAt: new Date().toISOString()
+      });
       this.broadcast();
       return;
     }
@@ -1956,6 +2084,7 @@ export class ChatService {
     }
     const documentIndex = this.store.createDocumentIndex(payload.projectId, payload.title, payload.sourcePath, embeddingModelPath);
     if (selectedThread) {
+      this.invalidateContextUsage(selectedThread.id);
       this.store.selectDocumentIndex(selectedThread.id, documentIndex.id);
     }
     this.clearError();
@@ -2000,6 +2129,7 @@ export class ChatService {
       return this.state();
     }
     const updated = this.store.updateDocumentIndex(payload.documentIndexId, payload.title, payload.sourcePath, embeddingModelPath);
+    this.invalidateContextUsage(selectedThread.id);
     this.store.selectDocumentIndex(selectedThread.id, updated.id);
     this.clearError();
     this.broadcast();
@@ -2019,6 +2149,7 @@ export class ChatService {
   }
 
   selectDocumentIndex(payload: ChatSelectDocumentIndexPayload): ChatState {
+    this.invalidateContextUsage(payload.threadId);
     this.store.selectDocumentIndex(payload.threadId, payload.documentIndexId);
     this.clearError();
     this.broadcast();

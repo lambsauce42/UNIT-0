@@ -221,7 +221,10 @@ test("mock Codex runtime exposes account, rate limits, and models without shelli
   const snapshot = await runtime.readAccount(true);
   expect(snapshot.account.status).toBe("ready");
   if (snapshot.account.status === "ready") {
-    expect(snapshot.account.rateLimits?.primary?.usedPercent).toBe(12);
+    expect(snapshot.account.rateLimits?.primary?.usedPercent).toBe(34);
+    expect(snapshot.account.rateLimits?.primary?.windowDurationMins).toBe(299);
+    expect(snapshot.account.rateLimits?.secondary?.usedPercent).toBe(12);
+    expect(snapshot.account.rateLimits?.secondary?.windowDurationMins).toBe(10079);
   }
   expect(snapshot.models.some((model) => model.isDefault)).toBe(true);
 });
@@ -237,17 +240,17 @@ test("parses the Codex CLI rate-limit bucket from app-server responses", () => {
     rateLimitsByLimitId: {
       codex: {
         limitId: "codex",
-        primary: { usedPercent: 9, windowDurationMins: 300, resetsAt: 1778424330 },
-        secondary: { usedPercent: 1, windowDurationMins: 10080, resetsAt: 1779011130 },
+        primary: { usedPercent: 9, windowDurationMins: 299, resetsAt: 1778424330 },
+        secondary: { usedPercent: 1, windowDurationMins: 10079, resetsAt: 1779011130 },
         rateLimitReachedType: null
       }
     }
   });
 
   expect(rateLimits?.primary?.usedPercent).toBe(9);
-  expect(rateLimits?.primary?.windowDurationMins).toBe(300);
+  expect(rateLimits?.primary?.windowDurationMins).toBe(299);
   expect(rateLimits?.secondary?.usedPercent).toBe(1);
-  expect(rateLimits?.secondary?.windowDurationMins).toBe(10080);
+  expect(rateLimits?.secondary?.windowDurationMins).toBe(10079);
 });
 
 test("builds legacy Codex collaboration mode payload without shelling out", () => {

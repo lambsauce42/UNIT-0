@@ -5,7 +5,7 @@ import http, { type Server } from "node:http";
 import { createRequire } from "node:module";
 import net from "node:net";
 import path from "node:path";
-import type { ChatPermissionMode, ChatRuntimeSettings, ChatTimelineBlock } from "../shared/types.js";
+import type { ChatBuiltinAgenticFramework, ChatPermissionMode, ChatRuntimeSettings, ChatTimelineBlock } from "../shared/types.js";
 import { GptOssChannelParser, renderGptOssOpenCodeSystemPrompt, type GptOssChannelParserResult, type LocalLlamaOpenAiEndpoint } from "./localLlamaRuntime.js";
 
 const requireFromOpenCodeRuntime = createRequire(__filename);
@@ -39,6 +39,18 @@ type OpenCodeConfigOptions = Omit<OpenCodeRunOptions, "endpoint"> & {
 
 export type OpenCodeRuntimeEvent =
   | { type: "session.started"; sessionId: string }
+  | {
+      type: "context.updated";
+      framework: ChatBuiltinAgenticFramework;
+      promptTokens: number;
+      contextTokens: number;
+      remainingTokens: number;
+      maxOutputTokens: number;
+      precise: boolean;
+      includesSystemPrompt: boolean;
+      includesToolDefinitions: boolean;
+      sessionId?: string;
+    }
   | { type: "assistant.delta"; id: string; status: string; text: string; replace?: boolean; sessionId?: string }
   | { type: "reasoning.delta"; id: string; status: string; text: string; replace?: boolean; sessionId?: string }
   | { type: "timeline"; eventType: "item.started" | "item.updated" | "item.completed"; block: ChatTimelineBlock; sessionId?: string }
@@ -387,19 +399,22 @@ export class RealOpenCodeRuntime implements OpenCodeRuntime {
         if (queued.kind === "error") {
           throw queued.error;
         }
-        if (!isSessionScopedEvent(queued.event, sessionId)) {
+        const event = queued.event.type === "context.updated" && !queued.event.sessionId
+          ? { ...queued.event, sessionId }
+          : queued.event;
+        if (!isSessionScopedEvent(event, sessionId)) {
           return null;
         }
-        if (queued.event.type === "error") {
+        if (event.type === "error") {
           sawTurnCompleted = true;
           sawTerminalError = true;
-          return queued.event;
+          return event;
         }
-        if (queued.event.type === "turn.completed") {
+        if (event.type === "turn.completed") {
           sawTurnCompleted = true;
           return null;
         }
-        return queued.event;
+        return event;
       };
       let sawAnyTurnEvent = false;
       while (!sawTurnCompleted) {
@@ -780,28 +795,55 @@ async function handleGptOssOpenCodeProxyRequest(
   debugOpenCode("proxy.tools.completed_emit.start", debugRequestSummary);
   emitCompletedOpenCodeProxyToolEvents(body, toolSink);
   debugOpenCode("proxy.tools.completed_emit.done", debugRequestSummary);
+  const includesToolDefinitions = openCodeProxyBodyIncludesToolDefinitions(body);
   const promptRenderStartedAt = Date.now();
   debugOpenCode("proxy.prompt.render.start", debugRequestSummary);
   const prompt = renderGptOssOpenCodeProxyPrompt(body, options);
   debugOpenCode("proxy.prompt.render.done", {
     elapsedMs: Date.now() - promptRenderStartedAt,
-    promptChars: prompt.length,
-    estimatedPromptTokens: Math.ceil(prompt.length / 3)
+    promptChars: prompt.length
   });
   debugOpenCode("proxy.prompt", { prompt: prompt.slice(0, 2000) });
   const upstreamAbortController = new AbortController();
   upstreamAbortControllers.add(upstreamAbortController);
   response.once("close", () => upstreamAbortController.abort());
-  const requestRawCompletion = async (rawPrompt: string, nPredict: number): Promise<ReadableStream<Uint8Array>> => {
+  let continuationReserveTokens: Promise<number> | null = null;
+  const exactContinuationReserveTokens = () => {
+    continuationReserveTokens ??= countGptOssOpenCodePromptTokens(options, OPENCODE_FINAL_CONTINUATION_MARKER, upstreamAbortController.signal)
+      .then((markerTokens) => OPENCODE_MIN_COMPLETION_TOKENS + markerTokens);
+    return continuationReserveTokens;
+  };
+  const requestRawCompletion = async (rawPrompt: string, reserveContinuation = false, maxTokenCap?: number): Promise<ReadableStream<Uint8Array>> => {
+    const promptTokens = await countGptOssOpenCodePromptTokens(options, rawPrompt, upstreamAbortController.signal);
+    const nPredict = gptOssOpenCodeRequestMaxTokensForPromptTokens(
+      promptTokens,
+      options.settings,
+      reserveContinuation ? await exactContinuationReserveTokens() : 0,
+      maxTokenCap
+    );
     if (nPredict <= 0) {
-      throw new Error("OpenCode GPT-OSS prompt exceeded the local model context window.");
+      throw new Error(`OpenCode GPT-OSS prompt exceeded the local model context window (${promptTokens}/${options.settings.nCtx} prompt tokens).`);
     }
     debugOpenCode("proxy.raw_completion.request", {
       promptChars: rawPrompt.length,
-      estimatedPromptTokens: Math.ceil(rawPrompt.length / 3),
+      promptTokens,
       nPredict,
       cachePrompt: true,
       idSlot: options.endpoint.rawCompletionSlotId ?? 0
+    });
+    toolSink.queue.push({
+      kind: "event",
+      event: {
+        type: "context.updated",
+        framework: "opencode",
+        promptTokens,
+        contextTokens: options.settings.nCtx,
+        remainingTokens: Math.max(0, options.settings.nCtx - promptTokens),
+        maxOutputTokens: nPredict,
+        precise: true,
+        includesSystemPrompt: true,
+        includesToolDefinitions
+      }
     });
     const upstreamStartedAt = Date.now();
     const providerTimeout = setTimeout(() => upstreamAbortController.abort(), openCodeProviderIdleTimeoutMs());
@@ -827,7 +869,7 @@ async function handleGptOssOpenCodeProxyRequest(
     return upstream.body;
   };
   try {
-    const upstreamBody = await requestRawCompletion(prompt, gptOssOpenCodeRequestMaxTokens(prompt, options.settings, true));
+    const upstreamBody = await requestRawCompletion(prompt, true);
     const shouldStream = !(isRecord(body) && body.stream === false);
     if (shouldStream) {
       response.writeHead(200, {
@@ -840,7 +882,7 @@ async function handleGptOssOpenCodeProxyRequest(
       await streamGptOssOpenCodeProxyResponse(upstreamBody, response, openCodeProxyToolRecipientNames(body), toolSink, shouldStream, async (generatedText) => {
         const continuationPrompt = gptOssOpenCodeFinalContinuationPrompt(prompt, generatedText);
         debugOpenCode("proxy.final_continuation.prompt", { prompt: continuationPrompt.slice(-2000) });
-        return requestRawCompletion(continuationPrompt, gptOssOpenCodeFinalContinuationMaxTokens(continuationPrompt, options.settings));
+        return requestRawCompletion(continuationPrompt, false, Math.min(options.settings.maxTokens, 512));
       });
     } catch (error) {
       toolSink.queue.push({ kind: "event", event: { type: "error", message: errorMessage(error) } });
@@ -875,6 +917,54 @@ async function readJsonRequestBody(request: http.IncomingMessage): Promise<unkno
   }
   const text = Buffer.concat(chunks).toString("utf8");
   return text ? JSON.parse(text) : {};
+}
+
+async function countGptOssOpenCodePromptTokens(options: OpenCodeRunOptions, prompt: string, signal: AbortSignal): Promise<number> {
+  const tokenizeUrl = options.endpoint.tokenizeUrl;
+  if (!tokenizeUrl) {
+    throw new Error("OpenCode GPT-OSS precise token budgeting requires a llama-server tokenize endpoint.");
+  }
+  const startedAt = Date.now();
+  const timeoutController = new AbortController();
+  const abortTimeout = setTimeout(() => timeoutController.abort(), openCodeProviderIdleTimeoutMs());
+  const abortOnParentSignal = () => timeoutController.abort();
+  if (signal.aborted) {
+    timeoutController.abort();
+  }
+  signal.addEventListener("abort", abortOnParentSignal, { once: true });
+  try {
+    const response = await fetch(tokenizeUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      signal: timeoutController.signal,
+      body: JSON.stringify({
+        content: prompt,
+        add_special: false,
+        parse_special: true,
+        with_pieces: false
+      })
+    }).catch((error) => {
+      if (timeoutController.signal.aborted && !signal.aborted) {
+        throw new Error("OpenCode GPT-OSS tokenizer did not respond before the idle timeout.");
+      }
+      throw error;
+    });
+    debugOpenCode("proxy.tokenize.response_headers", { elapsedMs: Date.now() - startedAt });
+    if (!response.ok) {
+      const errorBody = await response.text().catch(() => "");
+      throw new Error(`OpenCode GPT-OSS tokenizer failed (${response.status}): ${errorBody || response.statusText}`);
+    }
+    const body = await response.json().catch((error) => {
+      throw new Error(`OpenCode GPT-OSS tokenizer returned invalid JSON: ${errorMessage(error)}`);
+    });
+    if (!isRecord(body) || !Array.isArray(body.tokens)) {
+      throw new Error("OpenCode GPT-OSS tokenizer response did not include a tokens array.");
+    }
+    return body.tokens.length;
+  } finally {
+    clearTimeout(abortTimeout);
+    signal.removeEventListener("abort", abortOnParentSignal);
+  }
 }
 
 async function streamGptOssOpenCodeProxyResponse(
@@ -981,10 +1071,6 @@ function gptOssOpenCodeFinalContinuationPrompt(prompt: string, generatedText: st
   const withoutTerminal = generatedText.replace(/(?:<\|return\|>|<\|call\|>)\s*$/u, "");
   const ended = withoutTerminal.endsWith("<|end|>") ? withoutTerminal : `${withoutTerminal}<|end|>`;
   return `${prompt}${ended}${OPENCODE_FINAL_CONTINUATION_PREFIX}`;
-}
-
-function gptOssOpenCodeFinalContinuationMaxTokens(prompt: string, settings: ChatRuntimeSettings): number {
-  return Math.min(gptOssOpenCodeRequestMaxTokens(prompt, settings), Math.min(settings.maxTokens, 512));
 }
 
 function writeOpenCodeProxyCommentaryDelta(
@@ -1303,6 +1389,10 @@ function openCodeProxyToolRecipientNames(body: unknown): string[] {
   return openCodeProxyToolDefinitions(body).map((tool) => tool.name);
 }
 
+export function openCodeProxyBodyIncludesToolDefinitions(body: unknown): boolean {
+  return openCodeProxyToolDefinitions(body).length > 0;
+}
+
 function openCodeProxyToolDefinitions(body: unknown): Array<{ name: string; description?: string; parameters?: unknown }> {
   if (!isRecord(body) || !Array.isArray(body.tools)) {
     return [];
@@ -1405,15 +1495,18 @@ function positiveIntegerEnv(name: string, fallback: number): number {
   return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
 }
 
-export function gptOssOpenCodeRequestMaxTokens(prompt: string, settings: ChatRuntimeSettings, reserveContinuation = false): number {
-  const estimatedPromptTokens = Math.ceil(prompt.length / 3);
-  const remainingContextTokens = Math.max(0, settings.nCtx - estimatedPromptTokens);
+export function gptOssOpenCodeRequestMaxTokensForPromptTokens(
+  promptTokens: number,
+  settings: ChatRuntimeSettings,
+  continuationReserveTokens = 0,
+  maxTokenCap?: number
+): number {
+  const normalizedPromptTokens = Math.max(0, Math.floor(promptTokens));
+  const remainingContextTokens = Math.max(0, settings.nCtx - normalizedPromptTokens);
   const configuredMaxTokens = settings.maxTokens > 0 ? settings.maxTokens : remainingContextTokens;
-  const continuationReserveTokens = OPENCODE_MIN_COMPLETION_TOKENS + Math.ceil(OPENCODE_FINAL_CONTINUATION_MARKER.length / 3);
-  const continuationReserve = reserveContinuation
-    ? Math.min(continuationReserveTokens, Math.max(0, remainingContextTokens - 1))
-    : 0;
-  return Math.min(configuredMaxTokens, Math.max(0, remainingContextTokens - continuationReserve));
+  const effectiveMaxTokenCap = maxTokenCap === undefined || maxTokenCap <= 0 ? configuredMaxTokens : maxTokenCap;
+  const continuationReserve = Math.min(Math.max(0, Math.floor(continuationReserveTokens)), Math.max(0, remainingContextTokens - 1));
+  return Math.min(configuredMaxTokens, effectiveMaxTokenCap, Math.max(0, remainingContextTokens - continuationReserve));
 }
 
 function gptOssOpenCodePromptBudgetCharacters(settings: ChatRuntimeSettings): number {

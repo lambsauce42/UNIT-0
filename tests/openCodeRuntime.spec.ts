@@ -3,7 +3,7 @@ import fs from "node:fs";
 import http, { type Server } from "node:http";
 import os from "node:os";
 import path from "node:path";
-import { gptOssOpenCodeRequestMaxTokens, openCodeConfig, RealOpenCodeRuntime, renderGptOssOpenCodeProxyPrompt, shouldTrackOpenCodePendingApproval, type OpenCodeRuntimeEvent, type OpenCodeRunOptions } from "../src/main/openCodeRuntime";
+import { gptOssOpenCodeRequestMaxTokensForPromptTokens, openCodeConfig, openCodeProxyBodyIncludesToolDefinitions, RealOpenCodeRuntime, renderGptOssOpenCodeProxyPrompt, shouldTrackOpenCodePendingApproval, type OpenCodeRuntimeEvent, type OpenCodeRunOptions } from "../src/main/openCodeRuntime";
 import type { ChatRuntimeSettings } from "../src/shared/types";
 
 const baseSettings: ChatRuntimeSettings = {
@@ -22,6 +22,12 @@ const baseSettings: ChatRuntimeSettings = {
 };
 
 type FakeChunk = string | { content: string; pauseAfter: string };
+const fakeFinalContinuationMarker = "<|end|><|start|>assistant<|channel|>final<|message|>";
+const fakeContinuationReserveTokens = 64 + fakePromptTokens(fakeFinalContinuationMarker);
+
+function fakePromptTokens(prompt: string): number {
+  return Math.ceil(prompt.length / 3);
+}
 
 test("OpenCode config maps Unit-0 full access to OpenCode web permissions", () => {
   const fullAccess = openCodeConfig({
@@ -53,6 +59,22 @@ test("OpenCode config maps Unit-0 full access to OpenCode web permissions", () =
     webfetch: "ask",
     websearch: "ask"
   });
+});
+
+test("OpenCode context usage reports tool definitions only when the actual proxy body includes tools", () => {
+  expect(openCodeProxyBodyIncludesToolDefinitions({ messages: [{ role: "user", content: "hi" }] })).toBe(false);
+  expect(openCodeProxyBodyIncludesToolDefinitions({
+    tools: [
+      {
+        type: "function",
+        function: {
+          name: "read_fixture",
+          description: "Read a harmless fixture",
+          parameters: { type: "object", properties: {} }
+        }
+      }
+    ]
+  })).toBe(true);
 });
 
 test("real OpenCode approval reply remains retryable after a failed POST", async () => {
@@ -119,7 +141,8 @@ test("real OpenCode GPT-OSS proxy rejects final-only output before rendering it"
       endpoint: {
         baseUrl: fakeLlama.url,
         modelId: "fake-gpt-oss",
-        rawCompletionUrl: `${fakeLlama.url}/completion`
+        rawCompletionUrl: `${fakeLlama.url}/completion`,
+        tokenizeUrl: `${fakeLlama.url}/tokenize`
       },
       settings: baseSettings,
       permissionMode: "full_access"
@@ -142,6 +165,136 @@ test("real OpenCode GPT-OSS proxy rejects final-only output before rendering it"
     runtime.close();
     await fakeLlama.close();
     fs.rmSync(projectDir, { recursive: true, force: true });
+  }
+});
+
+test("real OpenCode GPT-OSS proxy budgets completions with the llama tokenizer count", async () => {
+  test.setTimeout(90_000);
+  const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-opencode-runtime-tokenize-"));
+  const settings = { ...baseSettings, nCtx: 32768, maxTokens: 128 };
+  const fakeLlama = await startFakeRawCompletionServer([
+    ["<|channel|>analysis<|message|>Need concise answer.<|end|><|start|>assistant<|channel|>final<|message|>ok<|return|>"],
+    ["<|channel|>final<|message|>ok<|return|>"]
+  ], {
+    tokenize: (content) => Array.from({
+      length: content === fakeFinalContinuationMarker ? fakePromptTokens(fakeFinalContinuationMarker) : 32650
+    }, (_, index) => index)
+  });
+  const runtime = new RealOpenCodeRuntime();
+  try {
+    const events = await collectOpenCodeEvents(runtime, {
+      cwd: projectDir,
+      prompt: "Answer ok.",
+      modelLabel: "fake-gpt-oss",
+      nativeGptOss: true,
+      endpoint: {
+        baseUrl: fakeLlama.url,
+        modelId: "fake-gpt-oss",
+        rawCompletionUrl: `${fakeLlama.url}/completion`,
+        tokenizeUrl: `${fakeLlama.url}/tokenize`
+      },
+      settings,
+      permissionMode: "full_access"
+    });
+
+    const errors = events.filter((event) => event.type === "error").map((event) => event.message);
+    const contextEvent = events.find((event) => event.type === "context.updated");
+    expect(errors).toEqual([]);
+    expect(contextEvent).toMatchObject({
+      type: "context.updated",
+      framework: "opencode",
+      promptTokens: 32650,
+      contextTokens: settings.nCtx,
+      remainingTokens: settings.nCtx - 32650,
+      precise: true,
+      includesSystemPrompt: true,
+      includesToolDefinitions: true
+    });
+    expect(fakeLlama.tokenizeRequests).toHaveLength(2);
+    expect(fakeLlama.requests[0]?.nPredict).toBe(gptOssOpenCodeRequestMaxTokensForPromptTokens(32650, settings, fakeContinuationReserveTokens));
+    expect(fakeLlama.requests[0]?.nPredict).toBeLessThan(128);
+  } finally {
+    runtime.close();
+    await fakeLlama.close();
+    fs.rmSync(projectDir, { recursive: true, force: true });
+  }
+});
+
+test("real OpenCode GPT-OSS proxy fails loud when tokenizer stalls", async () => {
+  test.setTimeout(90_000);
+  const previousProviderTimeout = process.env.UNIT0_OPENCODE_PROVIDER_IDLE_TIMEOUT_MS;
+  process.env.UNIT0_OPENCODE_PROVIDER_IDLE_TIMEOUT_MS = "250";
+  const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-opencode-runtime-tokenize-stall-"));
+  const fakeLlama = await startStallingTokenizerServer();
+  const runtime = new RealOpenCodeRuntime();
+  try {
+    const events = await collectOpenCodeEvents(runtime, {
+      cwd: projectDir,
+      prompt: "Answer ok.",
+      modelLabel: "fake-gpt-oss",
+      nativeGptOss: true,
+      endpoint: {
+        baseUrl: fakeLlama.url,
+        modelId: "fake-gpt-oss",
+        rawCompletionUrl: `${fakeLlama.url}/completion`,
+        tokenizeUrl: `${fakeLlama.url}/tokenize`
+      },
+      settings: baseSettings,
+      permissionMode: "full_access"
+    });
+
+    expect(events.some((event) => event.type === "error" && event.message.includes("tokenizer did not respond before the idle timeout"))).toBe(true);
+    expect(fakeLlama.completionRequests).toBe(0);
+  } finally {
+    runtime.close();
+    await fakeLlama.close();
+    fs.rmSync(projectDir, { recursive: true, force: true });
+    if (previousProviderTimeout === undefined) {
+      delete process.env.UNIT0_OPENCODE_PROVIDER_IDLE_TIMEOUT_MS;
+    } else {
+      process.env.UNIT0_OPENCODE_PROVIDER_IDLE_TIMEOUT_MS = previousProviderTimeout;
+    }
+  }
+});
+
+test("real OpenCode GPT-OSS proxy aborts stalled tokenizer immediately when closed", async () => {
+  test.setTimeout(90_000);
+  const previousProviderTimeout = process.env.UNIT0_OPENCODE_PROVIDER_IDLE_TIMEOUT_MS;
+  process.env.UNIT0_OPENCODE_PROVIDER_IDLE_TIMEOUT_MS = "5000";
+  const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-opencode-runtime-tokenize-close-"));
+  const fakeLlama = await startStallingTokenizerServer();
+  const runtime = new RealOpenCodeRuntime();
+  try {
+    const startedAt = Date.now();
+    const run = collectOpenCodeEvents(runtime, {
+      cwd: projectDir,
+      prompt: "Answer ok.",
+      modelLabel: "fake-gpt-oss",
+      nativeGptOss: true,
+      endpoint: {
+        baseUrl: fakeLlama.url,
+        modelId: "fake-gpt-oss",
+        rawCompletionUrl: `${fakeLlama.url}/completion`,
+        tokenizeUrl: `${fakeLlama.url}/tokenize`
+      },
+      settings: baseSettings,
+      permissionMode: "full_access"
+    });
+
+    await expect.poll(() => fakeLlama.tokenizeRequests).toBe(1);
+    runtime.close();
+    await expect(run).rejects.toThrow("OpenCode event stream closed before turn completion.");
+    expect(Date.now() - startedAt).toBeLessThan(2500);
+    expect(fakeLlama.completionRequests).toBe(0);
+  } finally {
+    runtime.close();
+    await fakeLlama.close();
+    fs.rmSync(projectDir, { recursive: true, force: true });
+    if (previousProviderTimeout === undefined) {
+      delete process.env.UNIT0_OPENCODE_PROVIDER_IDLE_TIMEOUT_MS;
+    } else {
+      process.env.UNIT0_OPENCODE_PROVIDER_IDLE_TIMEOUT_MS = previousProviderTimeout;
+    }
   }
 });
 
@@ -170,7 +323,8 @@ test("real OpenCode GPT-OSS proxy streams valid final tokens before upstream com
       endpoint: {
         baseUrl: fakeLlama.url,
         modelId: "fake-gpt-oss",
-        rawCompletionUrl: `${fakeLlama.url}/completion`
+        rawCompletionUrl: `${fakeLlama.url}/completion`,
+        tokenizeUrl: `${fakeLlama.url}/tokenize`
       },
       settings: baseSettings,
       permissionMode: "full_access"
@@ -225,7 +379,8 @@ test("real OpenCode runtime reuses compatible server across follow-up turns", as
       endpoint: {
         baseUrl: fakeLlama.url,
         modelId: "fake-gpt-oss",
-        rawCompletionUrl: `${fakeLlama.url}/completion`
+        rawCompletionUrl: `${fakeLlama.url}/completion`,
+        tokenizeUrl: `${fakeLlama.url}/tokenize`
       },
       settings: baseSettings,
       permissionMode: "full_access"
@@ -244,7 +399,8 @@ test("real OpenCode runtime reuses compatible server across follow-up turns", as
       endpoint: {
         baseUrl: fakeLlama.url,
         modelId: "fake-gpt-oss",
-        rawCompletionUrl: `${fakeLlama.url}/completion`
+        rawCompletionUrl: `${fakeLlama.url}/completion`,
+        tokenizeUrl: `${fakeLlama.url}/tokenize`
       },
       settings: baseSettings,
       permissionMode: "full_access"
@@ -288,7 +444,8 @@ test("real OpenCode runtime serializes overlapping turns on the reused proxy", a
     endpoint: {
       baseUrl: fakeLlama.url,
       modelId: "fake-gpt-oss",
-      rawCompletionUrl: `${fakeLlama.url}/completion`
+      rawCompletionUrl: `${fakeLlama.url}/completion`,
+      tokenizeUrl: `${fakeLlama.url}/tokenize`
     },
     settings: baseSettings,
     permissionMode: "full_access"
@@ -332,7 +489,7 @@ test("OpenCode GPT-OSS prompt rendering treats max tokens as an output cap", () 
   });
 
   expect(prompt).toContain("<|start|>assistant");
-  expect(gptOssOpenCodeRequestMaxTokens(prompt, { ...baseSettings, nCtx: 32768, maxTokens: 32768 }, true)).toBeGreaterThan(0);
+  expect(gptOssOpenCodeRequestMaxTokensForPromptTokens(fakePromptTokens(prompt), { ...baseSettings, nCtx: 32768, maxTokens: 32768 }, fakeContinuationReserveTokens)).toBeGreaterThan(0);
 });
 
 test("real OpenCode GPT-OSS proxy fails loud when raw completion stalls", async () => {
@@ -351,7 +508,8 @@ test("real OpenCode GPT-OSS proxy fails loud when raw completion stalls", async 
       endpoint: {
         baseUrl: fakeLlama.url,
         modelId: "fake-gpt-oss",
-        rawCompletionUrl: `${fakeLlama.url}/completion`
+        rawCompletionUrl: `${fakeLlama.url}/completion`,
+        tokenizeUrl: `${fakeLlama.url}/tokenize`
       },
       settings: baseSettings,
       permissionMode: "full_access"
@@ -397,7 +555,8 @@ test("real OpenCode GPT-OSS proxy continues analysis-only turns into final chann
       endpoint: {
         baseUrl: fakeLlama.url,
         modelId: "fake-gpt-oss",
-        rawCompletionUrl: `${fakeLlama.url}/completion`
+        rawCompletionUrl: `${fakeLlama.url}/completion`,
+        tokenizeUrl: `${fakeLlama.url}/tokenize`
       },
       settings: baseSettings,
       permissionMode: "full_access"
@@ -445,7 +604,8 @@ test("real OpenCode GPT-OSS proxy continues analysis-only turns when llama suppr
       endpoint: {
         baseUrl: fakeLlama.url,
         modelId: "fake-gpt-oss",
-        rawCompletionUrl: `${fakeLlama.url}/completion`
+        rawCompletionUrl: `${fakeLlama.url}/completion`,
+        tokenizeUrl: `${fakeLlama.url}/tokenize`
       },
       settings: baseSettings,
       permissionMode: "full_access"
@@ -495,7 +655,8 @@ test("real OpenCode GPT-OSS proxy repeats final continuation when the model keep
       endpoint: {
         baseUrl: fakeLlama.url,
         modelId: "fake-gpt-oss",
-        rawCompletionUrl: `${fakeLlama.url}/completion`
+        rawCompletionUrl: `${fakeLlama.url}/completion`,
+        tokenizeUrl: `${fakeLlama.url}/tokenize`
       },
       settings: baseSettings,
       permissionMode: "full_access"
@@ -540,7 +701,8 @@ test("real OpenCode GPT-OSS proxy does not invent final content after repeated a
       endpoint: {
         baseUrl: fakeLlama.url,
         modelId: "fake-gpt-oss",
-        rawCompletionUrl: `${fakeLlama.url}/completion`
+        rawCompletionUrl: `${fakeLlama.url}/completion`,
+        tokenizeUrl: `${fakeLlama.url}/tokenize`
       },
       settings: baseSettings,
       permissionMode: "full_access"
@@ -585,7 +747,8 @@ test("real OpenCode GPT-OSS proxy streams commentary prose as visible content", 
       endpoint: {
         baseUrl: fakeLlama.url,
         modelId: "fake-gpt-oss",
-        rawCompletionUrl: `${fakeLlama.url}/completion`
+        rawCompletionUrl: `${fakeLlama.url}/completion`,
+        tokenizeUrl: `${fakeLlama.url}/tokenize`
       },
       settings: baseSettings,
       permissionMode: "full_access"
@@ -640,7 +803,8 @@ test("real OpenCode GPT-OSS proxy executes and renders tool calls once", async (
       endpoint: {
         baseUrl: fakeLlama.url,
         modelId: "fake-gpt-oss",
-        rawCompletionUrl: `${fakeLlama.url}/completion`
+        rawCompletionUrl: `${fakeLlama.url}/completion`,
+        tokenizeUrl: `${fakeLlama.url}/tokenize`
       },
       settings: baseSettings,
       permissionMode: "full_access"
@@ -725,7 +889,8 @@ test("real OpenCode GPT-OSS proxy budgets large webfetch output before post-tool
       endpoint: {
         baseUrl: fakeLlama.url,
         modelId: "fake-gpt-oss",
-        rawCompletionUrl: `${fakeLlama.url}/completion`
+        rawCompletionUrl: `${fakeLlama.url}/completion`,
+        tokenizeUrl: `${fakeLlama.url}/tokenize`
       },
       settings: { ...baseSettings, nCtx: 32768, maxTokens: 512 },
       permissionMode: "full_access"
@@ -739,12 +904,12 @@ test("real OpenCode GPT-OSS proxy budgets large webfetch output before post-tool
     expect(fakeLlama.requests[1]?.prompt).toContain("# OpenCode Tool Result");
     expect(fakeLlama.requests[1]?.prompt).toContain("OpenCode tool result truncated to fit the local model context window");
     expect(fakeLlama.requests[1]?.nPredict).toBeGreaterThan(0);
-    expect(fakeLlama.requests[1]?.nPredict).toBeLessThanOrEqual(gptOssOpenCodeRequestMaxTokens(fakeLlama.requests[1]?.prompt ?? "", { ...baseSettings, nCtx: 32768, maxTokens: 512 }, true));
+    expect(fakeLlama.requests[1]?.nPredict).toBeLessThanOrEqual(gptOssOpenCodeRequestMaxTokensForPromptTokens(fakePromptTokens(fakeLlama.requests[1]?.prompt ?? ""), { ...baseSettings, nCtx: 32768, maxTokens: 512 }, fakeContinuationReserveTokens));
     expect(fakeLlama.requests[2]?.prompt).toContain("<|channel|>final<|message|>");
     expect(fakeLlama.requests[2]?.prompt).toContain("OpenCode tool result truncated to fit the local model context window");
     expect(fakeLlama.requests[2]?.prompt).toContain("Tool output enough.");
     expect(fakeLlama.requests[2]?.nPredict).toBeGreaterThan(0);
-    expect(fakeLlama.requests[2]?.nPredict).toBeLessThanOrEqual(gptOssOpenCodeRequestMaxTokens(fakeLlama.requests[2]?.prompt ?? "", { ...baseSettings, nCtx: 32768, maxTokens: 512 }));
+    expect(fakeLlama.requests[2]?.nPredict).toBeLessThanOrEqual(gptOssOpenCodeRequestMaxTokensForPromptTokens(fakePromptTokens(fakeLlama.requests[2]?.prompt ?? ""), { ...baseSettings, nCtx: 32768, maxTokens: 512 }));
     await expect.poll(() => events.filter((event) => event.type === "assistant.delta").map((event) => event.text).join("")).toContain("peanut butter predates him");
     fakeLlama.release("large-webfetch-final");
     await run;
@@ -791,16 +956,16 @@ test("OpenCode GPT-OSS proxy prompt keeps completion budget when tool results ar
 
   expect(prompt).toContain("# OpenCode Tool Result");
   expect(prompt).toContain("OpenCode tool result truncated to fit the local model context window");
-  expect(gptOssOpenCodeRequestMaxTokens(prompt, { ...baseSettings, nCtx: 4096, maxTokens: 256 }, true)).toBeGreaterThan(0);
+  expect(gptOssOpenCodeRequestMaxTokensForPromptTokens(fakePromptTokens(prompt), { ...baseSettings, nCtx: 4096, maxTokens: 256 }, fakeContinuationReserveTokens)).toBeGreaterThan(0);
 });
 
 test("OpenCode GPT-OSS proxy reserves context for forced final continuation", () => {
   const settings = { ...baseSettings, nCtx: 2048, maxTokens: 512 };
   const prompt = "P".repeat((settings.nCtx - 128) * 3);
-  const firstPassTokens = gptOssOpenCodeRequestMaxTokens(prompt, settings, true);
+  const firstPassTokens = gptOssOpenCodeRequestMaxTokensForPromptTokens(fakePromptTokens(prompt), settings, fakeContinuationReserveTokens);
   expect(firstPassTokens).toBeLessThan(64);
   const continuationPrompt = `${prompt}${"A".repeat(firstPassTokens * 3)}<|end|><|start|>assistant<|channel|>final<|message|>`;
-  expect(gptOssOpenCodeRequestMaxTokens(continuationPrompt, settings)).toBeGreaterThanOrEqual(64);
+  expect(gptOssOpenCodeRequestMaxTokensForPromptTokens(fakePromptTokens(continuationPrompt), settings)).toBeGreaterThanOrEqual(64);
 });
 
 test("real OpenCode GPT-OSS proxy does not force final continuation after terminal-suppressed tool calls", async () => {
@@ -832,7 +997,8 @@ test("real OpenCode GPT-OSS proxy does not force final continuation after termin
       endpoint: {
         baseUrl: fakeLlama.url,
         modelId: "fake-gpt-oss",
-        rawCompletionUrl: `${fakeLlama.url}/completion`
+        rawCompletionUrl: `${fakeLlama.url}/completion`,
+        tokenizeUrl: `${fakeLlama.url}/tokenize`
       },
       settings: baseSettings,
       permissionMode: "full_access"
@@ -886,7 +1052,8 @@ test("real OpenCode GPT-OSS proxy streams commentary preambles before tool calls
       endpoint: {
         baseUrl: fakeLlama.url,
         modelId: "fake-gpt-oss",
-        rawCompletionUrl: `${fakeLlama.url}/completion`
+        rawCompletionUrl: `${fakeLlama.url}/completion`,
+        tokenizeUrl: `${fakeLlama.url}/tokenize`
       },
       settings: baseSettings,
       permissionMode: "full_access"
@@ -942,7 +1109,8 @@ test("real OpenCode GPT-OSS proxy renders question tool calls as questions", asy
       endpoint: {
         baseUrl: fakeLlama.url,
         modelId: "fake-gpt-oss",
-        rawCompletionUrl: `${fakeLlama.url}/completion`
+        rawCompletionUrl: `${fakeLlama.url}/completion`,
+        tokenizeUrl: `${fakeLlama.url}/tokenize`
       },
       settings: baseSettings,
       permissionMode: "full_access"
@@ -995,14 +1163,17 @@ async function collectOpenCodeEvents(runtime: RealOpenCodeRuntime, options: Open
   return events;
 }
 
-async function startFakeRawCompletionServer(responses: FakeChunk[][]): Promise<{
+async function startFakeRawCompletionServer(responses: FakeChunk[][], options: { tokenize?: (content: string) => unknown[] } = {}): Promise<{
   url: string;
   requests: Array<{ prompt: string; nPredict: number; cachePrompt: boolean | null; idSlot: number | null }>;
+  tokenizeRequests: string[];
   waitForPause: (label: string) => Promise<void>;
   release: (label: string) => void;
   close: () => Promise<void>;
 }> {
   const requests: Array<{ prompt: string; nPredict: number; cachePrompt: boolean | null; idSlot: number | null }> = [];
+  const tokenizeRequests: string[] = [];
+  const tokenize = options.tokenize ?? ((content: string) => Array.from({ length: Math.ceil(content.length / 3) }, (_, index) => index));
   const pauses = new Map<string, { paused: Promise<void>; released: Promise<void>; release: () => void; resolvePaused: () => void }>();
   let requestIndex = 0;
   const pauseState = (label: string) => {
@@ -1023,6 +1194,14 @@ async function startFakeRawCompletionServer(responses: FakeChunk[][]): Promise<{
   };
   const server = http.createServer((request, response) => {
     void (async () => {
+      if (request.method === "POST" && request.url === "/tokenize") {
+        const body = await readRequestJson(request);
+        const content = typeof body.content === "string" ? body.content : "";
+        tokenizeRequests.push(content);
+        response.writeHead(200, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ tokens: tokenize(content) }));
+        return;
+      }
       if (request.method !== "POST" || request.url !== "/completion") {
         response.writeHead(404, { "Content-Type": "application/json" });
         response.end(JSON.stringify({ error: "not found" }));
@@ -1079,6 +1258,7 @@ async function startFakeRawCompletionServer(responses: FakeChunk[][]): Promise<{
   return {
     url: `http://127.0.0.1:${address.port}`,
     requests,
+    tokenizeRequests,
     waitForPause: (label: string) => pauseState(label).paused,
     release: (label: string) => pauseState(label).release(),
     close: () => closeServer(server)
@@ -1088,6 +1268,14 @@ async function startFakeRawCompletionServer(responses: FakeChunk[][]): Promise<{
 async function startStallingRawCompletionServer(): Promise<{ url: string; requests: number; close: () => Promise<void> }> {
   let requests = 0;
   const server = http.createServer((request, response) => {
+    if (request.method === "POST" && request.url === "/tokenize") {
+      void readRequestJson(request).then((body) => {
+        const content = typeof body.content === "string" ? body.content : "";
+        response.writeHead(200, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ tokens: Array.from({ length: Math.ceil(content.length / 3) }, (_, index) => index) }));
+      });
+      return;
+    }
     if (request.method !== "POST" || request.url !== "/completion") {
       response.writeHead(404, { "Content-Type": "application/json" });
       response.end(JSON.stringify({ error: "not found" }));
@@ -1112,6 +1300,43 @@ async function startStallingRawCompletionServer(): Promise<{ url: string; reques
     url: `http://127.0.0.1:${address.port}`,
     get requests() {
       return requests;
+    },
+    close: () => closeServer(server)
+  };
+}
+
+async function startStallingTokenizerServer(): Promise<{ url: string; completionRequests: number; tokenizeRequests: number; close: () => Promise<void> }> {
+  let completionRequests = 0;
+  let tokenizeRequests = 0;
+  const server = http.createServer((request, response) => {
+    if (request.method === "POST" && request.url === "/tokenize") {
+      tokenizeRequests += 1;
+      return;
+    }
+    if (request.method === "POST" && request.url === "/completion") {
+      completionRequests += 1;
+      response.writeHead(500, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ error: "completion should not be reached before tokenization" }));
+      return;
+    }
+    response.writeHead(404, { "Content-Type": "application/json" });
+    response.end(JSON.stringify({ error: "not found" }));
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => resolve());
+  });
+  const address = server.address();
+  if (!address || typeof address === "string") {
+    throw new Error("Stalling tokenizer server did not bind a TCP port.");
+  }
+  return {
+    url: `http://127.0.0.1:${address.port}`,
+    get completionRequests() {
+      return completionRequests;
+    },
+    get tokenizeRequests() {
+      return tokenizeRequests;
     },
     close: () => closeServer(server)
   };

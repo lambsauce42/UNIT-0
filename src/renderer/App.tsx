@@ -5736,7 +5736,7 @@ function ChatSurface() {
   const rightUsageIndicators = usageItems.filter((item) => item.preference.placement === "right").map((item) => renderUsageIndicator(item.id)).filter(Boolean);
   const composerUsageIndicators = usageItems.filter((item) => item.preference.placement === "bottom").map((item) => renderUsageIndicator(item.id)).filter(Boolean);
   const footerRightUsageIndicators = usageItems.filter((item) => item.preference.placement === "footer_right").map((item) => renderUsageIndicator(item.id)).filter(Boolean);
-  const contextPercent = contextUsagePercent(chatState, (activeRuntimeSettings ?? chatState.runtimeSettings).nCtx);
+  const contextUsage = contextUsageView(chatState, (activeRuntimeSettings ?? chatState.runtimeSettings).nCtx);
 
   return (
     <div
@@ -6306,7 +6306,7 @@ function ChatSurface() {
             <div className="chat-footer-right-cluster">
               {footerRightUsageIndicators}
               <span className="chat-context-tile-label">Context:</span>
-              <ChatContextTileBar usedPercent={contextPercent} nCtx={(activeRuntimeSettings ?? chatState.runtimeSettings).nCtx} />
+              <ChatContextTileBar usage={contextUsage} />
             </div>
           </div>
         </div>
@@ -6371,10 +6371,16 @@ function ChatSidebarLimitBar({ label, percent, title }: { label: string; percent
   );
 }
 
-function ChatContextTileBar({ usedPercent, nCtx }: { usedPercent: number; nCtx: number }) {
+type ChatContextUsageView = {
+  usedPercent: number;
+  nCtx: number;
+  title: string;
+};
+
+function ChatContextTileBar({ usage }: { usage: ChatContextUsageView }) {
   const stripCount = 20;
-  const leftPercent = Math.max(0, 100 - usedPercent);
-  const label = `${leftPercent}% context left (${usedPercent}% used of ${formatContextLabel(nCtx)})`;
+  const usedPercent = usage.usedPercent;
+  const label = usage.title;
   return (
     <div className="chat-context-tile-bar" title={label} aria-label={label}>
       {Array.from({ length: stripCount }, (_, index) => {
@@ -8911,11 +8917,37 @@ function formatContextLabel(tokens: number) {
   return String(tokens);
 }
 
-function contextUsagePercent(state: ChatState, nCtx: number) {
+function contextUsageView(state: ChatState, nCtx: number): ChatContextUsageView {
+  const exactUsage = state.contextUsage;
+  if (exactUsage?.precise && exactUsage.contextTokens === nCtx && exactUsage.threadId === state.selectedThreadId) {
+    const usedPercent = Math.max(0, Math.min(100, Math.round((exactUsage.promptTokens / Math.max(1, exactUsage.contextTokens)) * 1000) / 10));
+    const inclusions = [
+      exactUsage.includesSystemPrompt ? "system prompts" : "",
+      exactUsage.includesToolDefinitions ? "tool definitions" : ""
+    ].filter(Boolean).join(" and ");
+    return {
+      usedPercent,
+      nCtx: exactUsage.contextTokens,
+      title: `Exact: ${formatContextLabel(exactUsage.promptTokens)}/${formatContextLabel(exactUsage.contextTokens)} used, ${formatContextLabel(exactUsage.remainingTokens)} left${inclusions ? ` incl. ${inclusions}` : ""}`
+    };
+  }
+  const selectedThread = state.threads.find((thread) => thread.id === state.selectedThreadId);
+  if (selectedThread?.providerMode === "builtin" && selectedThread.builtinAgenticFramework === "opencode") {
+    return {
+      usedPercent: 0,
+      nCtx,
+      title: `Exact OpenCode context unavailable for ${formatContextLabel(nCtx)} window`
+    };
+  }
   const selectedMessages = state.messages.filter((message) => message.threadId === state.selectedThreadId);
   const usedCharacters = selectedMessages.reduce((total, message) => total + message.content.length + (message.reasoning?.length ?? 0), 0);
   const approximateTokens = Math.ceil(usedCharacters / 4);
-  return Math.max(0, Math.min(100, Math.round((approximateTokens / Math.max(1, nCtx)) * 1000) / 10));
+  const usedPercent = Math.max(0, Math.min(100, Math.round((approximateTokens / Math.max(1, nCtx)) * 1000) / 10));
+  return {
+    usedPercent,
+    nCtx,
+    title: `Estimate: ${formatContextLabel(approximateTokens)}/${formatContextLabel(nCtx)} visible tokens used`
+  };
 }
 
 type CodexLimitWindowView = {
@@ -8925,16 +8957,35 @@ type CodexLimitWindowView = {
   usedPercent: number | null;
 };
 
+const CODEX_FIVE_HOUR_LIMIT_MINS = 300;
+const CODEX_WEEKLY_LIMIT_MINS = 10080;
+const CODEX_LIMIT_DURATION_TOLERANCE_MINS = 2;
+
 function codexLimitWindows(state: ChatState): CodexLimitWindowView[] {
-  const windows = state.codexAccount.status === "ready" && state.codexAccount.rateLimits
-    ? [state.codexAccount.rateLimits.primary, state.codexAccount.rateLimits.secondary].filter((window): window is NonNullable<typeof window> => Boolean(window))
-    : [];
-  const weekly = windows.find((window) => window.windowDurationMins === 10080);
-  const fiveHour = windows.find((window) => window.windowDurationMins === 300);
+  if (state.codexAccount.status !== "ready") {
+    return [
+      rateLimitWindowView("weekly", "Weekly", undefined),
+      rateLimitWindowView("five_hour", "5h", undefined)
+    ];
+  }
+  const limits = state.codexAccount.rateLimits;
+  if (!limits?.primary || !limits.secondary) {
+    throw new Error("Codex rate-limit payload is missing the primary or secondary codex bucket window.");
+  }
+  const fiveHour = limits.primary;
+  const weekly = limits.secondary;
+  assertCodexLimitWindowDuration("5h", fiveHour, CODEX_FIVE_HOUR_LIMIT_MINS);
+  assertCodexLimitWindowDuration("Weekly", weekly, CODEX_WEEKLY_LIMIT_MINS);
   return [
     rateLimitWindowView("weekly", "Weekly", weekly),
     rateLimitWindowView("five_hour", "5h", fiveHour)
   ];
+}
+
+function assertCodexLimitWindowDuration(label: string, window: ChatCodexRateLimitWindow, expectedMins: number) {
+  if (Math.abs(window.windowDurationMins - expectedMins) > CODEX_LIMIT_DURATION_TOLERANCE_MINS) {
+    throw new Error(`Codex ${label} rate-limit window duration ${window.windowDurationMins}m does not match expected ${expectedMins}m.`);
+  }
 }
 
 function rateLimitWindowView(id: CodexLimitWindowView["id"], label: CodexLimitWindowView["label"], window: ChatCodexRateLimitWindow | undefined): CodexLimitWindowView {

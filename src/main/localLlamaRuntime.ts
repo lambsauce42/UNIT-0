@@ -114,6 +114,7 @@ export type LocalLlamaOpenAiEndpoint = {
   modelId: string;
   rawCompletionUrl?: string;
   rawCompletionSlotId?: number;
+  tokenizeUrl?: string;
 };
 
 type ServerKey = {
@@ -359,7 +360,8 @@ export class LocalLlamaRuntime {
         baseUrl: server.baseUrl,
         modelId: server.modelId,
         rawCompletionUrl: `${server.baseUrl}/completion`,
-        rawCompletionSlotId: 0
+        rawCompletionSlotId: 0,
+        tokenizeUrl: `${server.baseUrl}/tokenize`
       };
     });
   }

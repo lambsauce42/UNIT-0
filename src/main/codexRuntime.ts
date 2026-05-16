@@ -168,8 +168,8 @@ export class MockCodexRuntime implements CodexRuntime {
         planType: "pro",
         requiresOpenaiAuth: true,
         rateLimits: {
-          primary: { usedPercent: 12, windowDurationMins: 10080, resetsAt: 1767225600 },
-          secondary: { usedPercent: 34, windowDurationMins: 300, resetsAt: 1767240000 },
+          primary: { usedPercent: 34, windowDurationMins: 299, resetsAt: 1767240000 },
+          secondary: { usedPercent: 12, windowDurationMins: 10079, resetsAt: 1767225600 },
           rateLimitReachedType: null
         }
       },

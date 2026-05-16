@@ -1,6 +1,6 @@
 import { expect, test } from "@playwright/test";
 import fs from "node:fs";
-import { gptOssOpenCodeRequestMaxTokens, renderGptOssOpenCodeProxyPrompt } from "../src/main/openCodeRuntime";
+import { gptOssOpenCodeRequestMaxTokensForPromptTokens, renderGptOssOpenCodeProxyPrompt } from "../src/main/openCodeRuntime";
 import type { ChatRuntimeSettings } from "../src/shared/types";
 import { estimatedTokens, memorySnapshot, nowMs, writePerfRecord } from "./perfHarness";
 
@@ -57,7 +57,7 @@ test("@perf OpenCode native GPT-OSS proxy records cache policy and prompt budget
   const simulatedDecodeMs = 40;
   const simulatedTtftMs = simulatedPrefillMs + 8;
   const simulatedTotalMs = simulatedPrefillMs + simulatedDecodeMs;
-  const nPredict = gptOssOpenCodeRequestMaxTokens(prompt, perfSettings, true);
+  const nPredict = gptOssOpenCodeRequestMaxTokensForPromptTokens(estimatedTokens(prompt), perfSettings, 80);
 
   expect(cachePromptMatch).toBeTruthy();
   expect(slotMatch?.[1]).toBe("0");

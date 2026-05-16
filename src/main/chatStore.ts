@@ -280,7 +280,7 @@ export class ChatStore {
     this.migrateProjectActionButtonsToAppSettings();
   }
 
-  loadState(): Omit<ChatState, "generation"> {
+  loadState(): Omit<ChatState, "generation" | "contextUsage"> {
     this.seedIfEmpty();
     const projects = (this.db
       .prepare(

@@ -122,6 +122,22 @@ export interface ChatContextMarker {
   timestamp: string;
 }
 
+export interface ChatContextUsage {
+  threadId: string;
+  framework: ChatBuiltinAgenticFramework;
+  source: "actual_prompt" | "estimate";
+  promptSignature: string;
+  promptEpoch: number;
+  promptTokens: number;
+  contextTokens: number;
+  remainingTokens: number;
+  maxOutputTokens: number;
+  precise: boolean;
+  includesSystemPrompt: boolean;
+  includesToolDefinitions: boolean;
+  updatedAt: string;
+}
+
 export interface ChatDocumentIndex {
   id: string;
   projectId: string;
@@ -267,6 +283,7 @@ export interface ChatState {
   appSettings: ChatAppSettings;
   queuedSubmissions: ChatQueuedSubmission[];
   generation: ChatGenerationState;
+  contextUsage: ChatContextUsage | null;
 }
 
 export interface ChatQueuedSubmission {

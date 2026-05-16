@@ -9,7 +9,7 @@ import type { DocumentEmbeddingRuntime } from "../src/main/embeddingRuntime";
 import { LocalLlamaRuntime } from "../src/main/localLlamaRuntime";
 import { mapOpenCodeEvent, normalizeOpenCodeHarmonyEvent, parseOpenCodeHarmonySnapshot, splitSseFrames, type OpenCodeRunOptions, type OpenCodeRuntime, type OpenCodeRuntimeEvent, type OpenCodeWarmOptions } from "../src/main/openCodeRuntime";
 import { RemoteHostRuntime } from "../src/main/remoteHostRuntime";
-import type { ChatBuiltinAgenticFramework, ChatMessage, ChatModel, ChatRuntimeSettings } from "../src/shared/types";
+import type { ChatBuiltinAgenticFramework, ChatMessage, ChatModel, ChatRuntimeSettings, ChatState } from "../src/shared/types";
 
 function makeService() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-service-test-"));
@@ -464,8 +464,8 @@ test("Codex account refresh recovers without surfacing a chat generation error",
     const recovered = await service.refreshCodexAccount();
     expect(recovered.codexAccount.status).toBe("ready");
     if (recovered.codexAccount.status === "ready") {
-      expect(recovered.codexAccount.rateLimits?.primary?.usedPercent).toBe(12);
-      expect(recovered.codexAccount.rateLimits?.secondary?.usedPercent).toBe(34);
+      expect(recovered.codexAccount.rateLimits?.primary?.usedPercent).toBe(34);
+      expect(recovered.codexAccount.rateLimits?.secondary?.usedPercent).toBe(12);
     }
     expect(recovered.generation.status).toBe("idle");
   } finally {
@@ -779,6 +779,157 @@ test("collapses stale OpenCode timeline segments when a full part snapshot repla
     expect(assistant?.timelineBlocks?.[0]).toMatchObject({ kind: "assistant_message", text: "Replacement." });
     expect(JSON.stringify(assistant?.timelineBlocks)).not.toContain("Second.");
   } finally {
+    service.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("surfaces exact OpenCode context usage from the actual model prompt", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-opencode-context-usage-test-"));
+  const modelPath = path.join(dir, "model.gguf");
+  fs.writeFileSync(modelPath, "");
+  const store = new ChatStore(path.join(dir, "chat.sqlite"));
+  const contextUpdated = (promptTokens: number): OpenCodeRuntimeEvent => ({
+    type: "context.updated",
+    framework: "opencode",
+    promptTokens,
+    contextTokens: 32768,
+    remainingTokens: 32768 - promptTokens,
+    maxOutputTokens: 512,
+    precise: true,
+    includesSystemPrompt: true,
+    includesToolDefinitions: true
+  });
+  const openCodeRuntime = new ScriptedOpenCodeRuntime([
+    [contextUpdated(1234), { type: "assistant.delta", id: "assistant-1", status: "updated", text: "Done." }],
+    [contextUpdated(2345), { type: "assistant.delta", id: "assistant-2", status: "updated", text: "Done again." }],
+    [contextUpdated(3456), { type: "assistant.delta", id: "assistant-3", status: "updated", text: "Done after move." }]
+  ]);
+  const contextUsageSnapshots: Array<ChatState["contextUsage"]> = [];
+  let service: ChatService | undefined;
+  service = new ChatService(store, new EndpointOnlyLlamaRuntime(), new RemoteHostRuntime(), new MockCodexRuntime(), () => {
+    if (service) {
+      contextUsageSnapshots.push(service.state().contextUsage);
+    }
+  }, new TestEmbeddingRuntime(), openCodeRuntime);
+  try {
+    let state = store.loadState();
+    const threadId = state.selectedThreadId;
+    const projectId = state.selectedProjectId;
+    store.updateProjectSettings(projectId, "OpenCode Context Usage Project", dir);
+    store.addLocalModel(modelPath);
+    state = store.loadState();
+    store.updateThreadSettings(threadId, {
+      builtinAgenticFramework: "opencode",
+      builtinModelId: state.selectedModelId
+    });
+
+    await service.submit({ text: "measure context" });
+    await expect.poll(() => service.state().generation.status).toBe("idle");
+
+    expect(contextUsageSnapshots).toContainEqual(expect.objectContaining({
+      framework: "opencode",
+      source: "actual_prompt",
+      promptTokens: 1234,
+      contextTokens: 32768,
+      remainingTokens: 31534,
+      maxOutputTokens: 512,
+      precise: true,
+      includesSystemPrompt: true,
+      includesToolDefinitions: true
+    }));
+    expect(service.state().contextUsage).toBeNull();
+
+    const changedProjectDir = path.join(dir, "changed-project-dir");
+    fs.mkdirSync(changedProjectDir);
+    service.updateProjectSettings(projectId, "OpenCode Context Usage Project", changedProjectDir);
+    expect(service.state().contextUsage).toBeNull();
+
+    await service.submit({ text: "measure context again" });
+    await expect.poll(() => service.state().generation.status).toBe("idle");
+    expect(contextUsageSnapshots).toContainEqual(expect.objectContaining({ promptTokens: 2345 }));
+
+    service.createProject();
+    const targetProjectId = service.state().selectedProjectId;
+    const targetProjectDir = path.join(dir, "target-project-dir");
+    fs.mkdirSync(targetProjectDir);
+    service.updateProjectSettings(targetProjectId, "Target Project", targetProjectDir);
+    service.selectThread(threadId);
+    expect(service.state().contextUsage).toBeNull();
+    service.moveThread(threadId, targetProjectId);
+    service.selectThread(threadId);
+    expect(service.state().contextUsage).toBeNull();
+
+    await service.submit({ text: "measure context after move" });
+    await expect.poll(() => service.state().generation.status).toBe("idle");
+    expect(contextUsageSnapshots).toContainEqual(expect.objectContaining({ promptTokens: 3456 }));
+
+    service.updateThreadSettings({ threadId, runtimeSettings: { systemPrompt: "Changed system prompt" } });
+    expect(service.state().contextUsage).toBeNull();
+  } finally {
+    service.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("ignores late OpenCode context usage after prompt-shaping state changes", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-opencode-late-context-usage-test-"));
+  const modelPath = path.join(dir, "model.gguf");
+  fs.writeFileSync(modelPath, "");
+  const store = new ChatStore(path.join(dir, "chat.sqlite"));
+  let releaseContextEvent: () => void = () => undefined;
+  const contextEventGate = new Promise<void>((resolve) => {
+    releaseContextEvent = resolve;
+  });
+  let runStarted: () => void = () => undefined;
+  const runStartedGate = new Promise<void>((resolve) => {
+    runStarted = resolve;
+  });
+  class LateContextOpenCodeRuntime extends ScriptedOpenCodeRuntime {
+    override async *runTurn(options: OpenCodeRunOptions): AsyncIterable<OpenCodeRuntimeEvent> {
+      this.calls.push({ ...options });
+      yield { type: "session.started", sessionId: "opencode-session-late-context" };
+      runStarted();
+      await contextEventGate;
+      yield {
+        type: "context.updated",
+        framework: "opencode",
+        promptTokens: 999,
+        contextTokens: 32768,
+        remainingTokens: 31769,
+        maxOutputTokens: 512,
+        precise: true,
+        includesSystemPrompt: true,
+        includesToolDefinitions: true
+      };
+      yield { type: "assistant.delta", id: "assistant-1", status: "updated", text: "Done." };
+      yield { type: "turn.completed" };
+    }
+  }
+  const service = new ChatService(store, new EndpointOnlyLlamaRuntime(), new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined, new TestEmbeddingRuntime(), new LateContextOpenCodeRuntime());
+  try {
+    let state = store.loadState();
+    const projectId = state.selectedProjectId;
+    store.updateProjectSettings(projectId, "OpenCode Late Context Usage Project", dir);
+    store.addLocalModel(modelPath);
+    state = store.loadState();
+    store.updateThreadSettings(state.selectedThreadId, {
+      builtinAgenticFramework: "opencode",
+      builtinModelId: state.selectedModelId
+    });
+
+    await service.submit({ text: "measure context after state change" });
+    await runStartedGate;
+    const changedProjectDir = path.join(dir, "changed-while-running");
+    fs.mkdirSync(changedProjectDir);
+    service.updateProjectSettings(projectId, "OpenCode Late Context Usage Project", changedProjectDir);
+    service.updateProjectSettings(projectId, "OpenCode Late Context Usage Project", dir);
+    releaseContextEvent();
+    await expect.poll(() => service.state().generation.status).toBe("idle");
+
+    expect(service.state().contextUsage).toBeNull();
+  } finally {
+    releaseContextEvent();
     service.close();
     fs.rmSync(dir, { recursive: true, force: true });
   }
