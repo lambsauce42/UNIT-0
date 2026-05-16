@@ -419,12 +419,24 @@ export class ChatService {
           runtimeSettings: thread.runtimeSettings
         });
       } else if (thread.builtinAgenticFramework === "opencode") {
-        await this.runtime.openAiEndpoint({
+        const endpoint = await this.runtime.openAiEndpoint({
           model,
           settings: openCodeModelSettings(model, thread.runtimeSettings),
           shouldCancel: () => runId !== this.warmupRunId || this.generationIsRunning(),
           reserveForGeneration: false
         });
+        const project = state.projects.find((item) => item.id === thread.projectId);
+        if (project?.directory && runId === this.warmupRunId && !this.generationIsRunning()) {
+          await this.openCodeRuntime.warm?.({
+            cwd: project.directory,
+            modelLabel: model.label,
+            nativeGptOss: isNativeGptOssModel(model),
+            endpoint,
+            settings: openCodeModelSettings(model, thread.runtimeSettings),
+            permissionMode: thread.permissionMode,
+            shouldCancel: () => runId !== this.warmupRunId || this.generationIsRunning()
+          });
+        }
       } else {
         await this.runtime.warmChatSession({
           model,

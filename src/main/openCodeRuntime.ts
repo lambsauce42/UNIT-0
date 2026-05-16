@@ -29,6 +29,10 @@ export type OpenCodeRunOptions = {
   permissionMode: ChatPermissionMode;
 };
 
+export type OpenCodeWarmOptions = Omit<OpenCodeRunOptions, "prompt" | "sessionId"> & {
+  shouldCancel?: () => boolean;
+};
+
 type OpenCodeConfigOptions = Omit<OpenCodeRunOptions, "endpoint"> & {
   endpoint: { baseUrl: string; modelId: string };
 };
@@ -53,7 +57,15 @@ type OpenCodeProviderEndpoint = {
   baseUrl: string;
   modelId: string;
   markerSecret?: string;
+  beginTurn?(options: OpenCodeRunOptions, eventQueue: AsyncEventQueue): void;
+  endTurn?(): void;
   close(): void;
+};
+
+type CachedOpenCodeServer = {
+  key: string;
+  server: OpenCodeServer;
+  providerEndpoint: OpenCodeProviderEndpoint;
 };
 
 type QueuedOpenCodeEvent =
@@ -82,6 +94,12 @@ type OpenCodeProxyToolEventSink = {
   completed: OpenCodeProxyToolCallRecord[];
   sawReasoning: boolean;
   markerSecret: string;
+};
+
+type OpenCodeProxyTurnState = {
+  options: OpenCodeRunOptions;
+  toolSink: OpenCodeProxyToolEventSink;
+  upstreamAbortControllers: Set<AbortController>;
 };
 
 type OpenCodePart = {
@@ -148,6 +166,7 @@ const openCodeReasoningSeen = new WeakMap<Map<string, OpenCodeHarmonyState>, { v
 
 export interface OpenCodeRuntime {
   runTurn(options: OpenCodeRunOptions): AsyncIterable<OpenCodeRuntimeEvent>;
+  warm?(options: OpenCodeWarmOptions): Promise<void>;
   answerApproval(permissionId: string, decision: "approve" | "deny"): Promise<void>;
   answerUserInput(requestId: string, answers: Record<string, string>): Promise<void>;
   cancelActiveRequest(): void;
@@ -160,10 +179,106 @@ export class RealOpenCodeRuntime implements OpenCodeRuntime {
   private activeServerUrl = "";
   private activeCwd = "";
   private activeServer: OpenCodeServer | null = null;
+  private activeWarmAbortController: AbortController | null = null;
+  private cachedServer: CachedOpenCodeServer | null = null;
+  private turnLock: Promise<void> = Promise.resolve();
+  private closed = false;
   private readonly pendingPermissions = new Map<string, PendingPermission>();
   private readonly pendingQuestions = new Map<string, PendingQuestion>();
 
+  private async acquireTurnLock(): Promise<() => void> {
+    const previous = this.turnLock;
+    let releaseNext!: () => void;
+    this.turnLock = new Promise<void>((resolve) => {
+      releaseNext = resolve;
+    });
+    await previous;
+    let released = false;
+    return () => {
+      if (released) {
+        return;
+      }
+      released = true;
+      releaseNext();
+    };
+  }
+
+  private async openCodeServer(options: OpenCodeRunOptions, eventQueue: AsyncEventQueue, signal: AbortSignal): Promise<CachedOpenCodeServer> {
+    if (this.closed) {
+      throw new Error("OpenCode runtime is closed.");
+    }
+    const key = openCodeServerCacheKey(options);
+    if (this.cachedServer?.key === key && this.cachedServer.server.process.exitCode === null) {
+      debugOpenCode("opencode.server.reuse", { key });
+      this.cachedServer.providerEndpoint.beginTurn?.(options, eventQueue);
+      return this.cachedServer;
+    }
+    this.closeCachedServer();
+    let providerEndpoint: OpenCodeProviderEndpoint | null = null;
+    try {
+      providerEndpoint = await openCodeProviderEndpoint(options, eventQueue);
+      providerEndpoint.beginTurn?.(options, eventQueue);
+      const startedAt = Date.now();
+      debugOpenCode("opencode.server.start", { key });
+      const server = await startOpenCodeServer({
+        config: openCodeConfig({
+          ...options,
+          endpoint: providerEndpoint
+        }),
+        signal
+      });
+      if (signal.aborted || this.closed) {
+        stopOpenCodeServer(server);
+        throw new Error("OpenCode runtime is closed.");
+      }
+      debugOpenCode("opencode.server.ready", { elapsedMs: Date.now() - startedAt, key });
+      this.cachedServer = { key, server, providerEndpoint };
+      return this.cachedServer;
+    } catch (error) {
+      providerEndpoint?.close();
+      throw error;
+    }
+  }
+
+  private closeCachedServer(): void {
+    if (!this.cachedServer) {
+      return;
+    }
+    const { server, providerEndpoint } = this.cachedServer;
+    stopOpenCodeServer(server);
+    providerEndpoint.close();
+    if (this.activeServer === server) {
+      this.activeServer = null;
+    }
+    this.cachedServer = null;
+  }
+
+  async warm(options: OpenCodeWarmOptions): Promise<void> {
+    const releaseTurn = await this.acquireTurnLock();
+    const abortController = new AbortController();
+    const eventQueue = new AsyncEventQueue();
+    try {
+      if (this.closed || options.shouldCancel?.()) {
+        return;
+      }
+      this.activeWarmAbortController = abortController;
+      await this.openCodeServer({ ...options, prompt: "" }, eventQueue, abortController.signal);
+      if (options.shouldCancel?.()) {
+        this.closeCachedServer();
+        return;
+      }
+      this.cachedServer?.providerEndpoint.endTurn?.();
+    } finally {
+      abortController.abort();
+      if (this.activeWarmAbortController === abortController) {
+        this.activeWarmAbortController = null;
+      }
+      releaseTurn();
+    }
+  }
+
   async *runTurn(options: OpenCodeRunOptions): AsyncIterable<OpenCodeRuntimeEvent> {
+    const releaseTurn = await this.acquireTurnLock();
     const abortController = new AbortController();
     this.activeAbortController = abortController;
     let server: OpenCodeServer | null = null;
@@ -172,27 +287,30 @@ export class RealOpenCodeRuntime implements OpenCodeRuntime {
     let sessionId = options.sessionId?.trim() ?? "";
     let latestAssistantMessageId = "";
     let providerEndpoint: OpenCodeProviderEndpoint | null = null;
+    let completedNormally = false;
     const harmonyStates = new Map<string, OpenCodeHarmonyState>();
     const normalizeGptOss = options.nativeGptOss;
     const onAbort = () => eventQueue.push({ kind: "stream.closed" });
     try {
-      server = await startOpenCodeServer({
-        config: openCodeConfig({
-          ...options,
-          endpoint: providerEndpoint = await openCodeProviderEndpoint(options, eventQueue)
-        }),
-        signal: abortController.signal
-      });
+      if (this.closed) {
+        throw new Error("OpenCode runtime is closed.");
+      }
+      const cached = await this.openCodeServer(options, eventQueue, abortController.signal);
+      server = cached.server;
+      providerEndpoint = cached.providerEndpoint;
       this.activeServer = server;
       this.activeServerUrl = server.url;
       this.activeCwd = options.cwd;
       if (!sessionId) {
+        const sessionStartedAt = Date.now();
+        debugOpenCode("opencode.session.create.start", {});
         const session = await openCodeJson<{ id?: string }>(server.url, "/session", {
           method: "POST",
           cwd: options.cwd,
           body: { title: options.prompt.slice(0, 80) || "OpenCode session" },
           signal: abortController.signal
         });
+        debugOpenCode("opencode.session.create.done", { elapsedMs: Date.now() - sessionStartedAt });
         sessionId = String(session.id ?? "");
         if (!sessionId) {
           throw new Error("OpenCode did not return a session id.");
@@ -238,8 +356,12 @@ export class RealOpenCodeRuntime implements OpenCodeRuntime {
           eventQueue.push({ kind: "stream.closed" });
         }
       });
+      const eventConnectedStartedAt = Date.now();
       await eventReader.connected;
+      debugOpenCode("opencode.event.connected", { elapsedMs: Date.now() - eventConnectedStartedAt });
       yield { type: "session.started", sessionId };
+      const promptAsyncStartedAt = Date.now();
+      debugOpenCode("opencode.prompt_async.start", {});
       await openCodeJson<void>(server.url, `/session/${encodeURIComponent(sessionId)}/prompt_async`, {
         method: "POST",
         cwd: options.cwd,
@@ -252,6 +374,7 @@ export class RealOpenCodeRuntime implements OpenCodeRuntime {
         signal: abortController.signal,
           emptyOk: true
         });
+      debugOpenCode("opencode.prompt_async.done", { elapsedMs: Date.now() - promptAsyncStartedAt });
       let sawTurnCompleted = false;
       let sawTerminalError = false;
       const consumeQueuedEvent = (queued: QueuedOpenCodeEvent): OpenCodeRuntimeEvent | null => {
@@ -310,6 +433,7 @@ export class RealOpenCodeRuntime implements OpenCodeRuntime {
       if (snapshot?.parts) {
         yield finalSnapshotEvent(snapshot.parts, normalizeGptOss, latestAssistantMessageId);
       }
+      completedNormally = true;
       yield { type: "turn.completed" };
       abortController.abort();
       await eventStream.catch(() => undefined);
@@ -323,13 +447,25 @@ export class RealOpenCodeRuntime implements OpenCodeRuntime {
         this.activeCwd = "";
       }
       if (server) {
-        stopOpenCodeServer(server);
+        if (!completedNormally || this.cachedServer?.server !== server) {
+          stopOpenCodeServer(server);
+          if (this.cachedServer?.server === server) {
+            this.cachedServer = null;
+          }
+        }
       }
-      providerEndpoint?.close();
+      providerEndpoint?.endTurn?.();
+      if (!completedNormally || this.cachedServer?.providerEndpoint !== providerEndpoint) {
+        providerEndpoint?.close();
+        if (this.cachedServer?.providerEndpoint === providerEndpoint) {
+          this.cachedServer = null;
+        }
+      }
       if (server && this.activeServer === server) {
         this.activeServer = null;
       }
       abortController.signal.removeEventListener("abort", onAbort);
+      releaseTurn();
     }
   }
 
@@ -378,7 +514,11 @@ export class RealOpenCodeRuntime implements OpenCodeRuntime {
   }
 
   close(): void {
+    this.closed = true;
     this.cancelActiveRequest();
+    this.activeWarmAbortController?.abort();
+    this.activeWarmAbortController = null;
+    this.closeCachedServer();
     if (this.activeServer) {
       stopOpenCodeServer(this.activeServer);
       this.activeServer = null;
@@ -468,6 +608,29 @@ export function openCodeConfig(options: OpenCodeConfigOptions): OpenCodeConfig {
   };
 }
 
+function openCodeServerCacheKey(options: OpenCodeRunOptions): string {
+  return JSON.stringify({
+    cwd: path.resolve(options.cwd),
+    modelLabel: options.modelLabel,
+    nativeGptOss: options.nativeGptOss,
+    permissionMode: options.permissionMode,
+    endpoint: {
+      baseUrl: options.endpoint.baseUrl,
+      modelId: options.endpoint.modelId,
+      rawCompletionUrl: options.endpoint.rawCompletionUrl ?? "",
+      rawCompletionSlotId: options.endpoint.rawCompletionSlotId ?? 0
+    },
+    settings: {
+      nCtx: options.settings.nCtx,
+      maxTokens: options.settings.maxTokens,
+      temperature: options.settings.temperature,
+      repeatPenalty: options.settings.repeatPenalty,
+      reasoningEffort: options.settings.reasoningEffort,
+      systemPrompt: options.settings.systemPrompt
+    }
+  });
+}
+
 function openCodeSystemPrompt(options: OpenCodeRunOptions): string | undefined {
   const userSystemPrompt = options.settings.systemPrompt.trim();
   if (!options.nativeGptOss) {
@@ -534,12 +697,41 @@ async function openCodeProviderEndpoint(options: OpenCodeRunOptions, eventQueue:
 
 async function startGptOssOpenCodeProxy(options: OpenCodeRunOptions, eventQueue: AsyncEventQueue): Promise<OpenCodeProviderEndpoint> {
   const port = await reserveLocalPort();
-  const toolSink: OpenCodeProxyToolEventSink = { cwd: options.cwd, queue: eventQueue, pending: new Map(), completed: [], sawReasoning: false, markerSecret: randomUUID() };
-  const upstreamAbortControllers = new Set<AbortController>();
+  const markerSecret = randomUUID();
+  let turnState: OpenCodeProxyTurnState | null = null;
+  const beginTurn = (turnOptions: OpenCodeRunOptions, turnEventQueue: AsyncEventQueue) => {
+    turnState = {
+      options: turnOptions,
+      toolSink: { cwd: turnOptions.cwd, queue: turnEventQueue, pending: new Map(), completed: [], sawReasoning: false, markerSecret },
+      upstreamAbortControllers: new Set()
+    };
+  };
+  const endTurn = () => {
+    if (!turnState) {
+      return;
+    }
+    for (const controller of turnState.upstreamAbortControllers) {
+      controller.abort();
+    }
+    turnState = null;
+  };
+  beginTurn(options, eventQueue);
   const server = http.createServer((request, response) => {
-    void handleGptOssOpenCodeProxyRequest(request, response, options, toolSink, upstreamAbortControllers).catch((error) => {
+    const url = new URL(request.url ?? "/", "http://127.0.0.1");
+    if (request.method === "GET" && url.pathname === "/v1/models") {
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ data: [{ id: OPENCODE_MODEL_ID, object: "model" }] }));
+      return;
+    }
+    const activeTurn = turnState;
+    if (!activeTurn) {
+      response.writeHead(503, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ error: { message: "OpenCode provider proxy received a request outside an active turn." } }));
+      return;
+    }
+    void handleGptOssOpenCodeProxyRequest(request, response, activeTurn.options, activeTurn.toolSink, activeTurn.upstreamAbortControllers).catch((error) => {
       debugOpenCode("proxy.error", { message: errorMessage(error) });
-      toolSink.queue.push({ kind: "event", event: { type: "error", message: errorMessage(error) } });
+      activeTurn.toolSink.queue.push({ kind: "event", event: { type: "error", message: errorMessage(error) } });
       if (!response.headersSent) {
         response.writeHead(500, { "Content-Type": "application/json" });
       }
@@ -553,11 +745,11 @@ async function startGptOssOpenCodeProxy(options: OpenCodeRunOptions, eventQueue:
   return {
     baseUrl: `http://127.0.0.1:${port}`,
     modelId: OPENCODE_MODEL_ID,
-    markerSecret: toolSink.markerSecret,
+    markerSecret,
+    beginTurn,
+    endTurn,
     close: () => {
-      for (const controller of upstreamAbortControllers) {
-        controller.abort();
-      }
+      endTurn();
       server.close();
     }
   };
@@ -611,6 +803,7 @@ async function handleGptOssOpenCodeProxyRequest(
       cachePrompt: true,
       idSlot: options.endpoint.rawCompletionSlotId ?? 0
     });
+    const upstreamStartedAt = Date.now();
     const providerTimeout = setTimeout(() => upstreamAbortController.abort(), openCodeProviderIdleTimeoutMs());
     const upstream = await fetch(options.endpoint.rawCompletionUrl!, {
       method: "POST",
@@ -626,6 +819,7 @@ async function handleGptOssOpenCodeProxyRequest(
         id_slot: options.endpoint.rawCompletionSlotId ?? 0
       })
     }).finally(() => clearTimeout(providerTimeout));
+    debugOpenCode("proxy.raw_completion.response_headers", { elapsedMs: Date.now() - upstreamStartedAt });
     if (!upstream.ok || !upstream.body) {
       const errorBody = await upstream.text().catch(() => "");
       throw new Error(errorBody || upstream.statusText);
@@ -742,7 +936,13 @@ async function streamGptOssOpenCodeProxyResponse(
     }
   };
   const consumeBody = async (streamBody: ReadableStream<Uint8Array>) => {
+    const consumeStartedAt = Date.now();
+    let sawFirstPayload = false;
     await readOpenCodeProxyServerSentEvents(streamBody, (payload) => {
+      if (!sawFirstPayload && payload !== "[DONE]") {
+        sawFirstPayload = true;
+        debugOpenCode("proxy.upstream.first_payload", { elapsedMs: Date.now() - consumeStartedAt });
+      }
       debugOpenCode("proxy.upstream", payload.slice(0, 1000));
       if (payload === "[DONE]") {
         return;

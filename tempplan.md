@@ -42,9 +42,9 @@ Analyze and improve local built-in chat, Document Analysis, and Open Code with f
 - Why it matters: repeated process startup and event-stream setup add fixed overhead independent of model generation.
 - Harnesses affected: Open Code.
 - Expected impact: moderate total latency improvement on multi-turn Open Code sessions.
-- Proposed fix: not first implementation pass. Consider reusing an OpenCode server keyed by cwd/config and restarting on config changes. This needs careful lifecycle and stale-session handling.
-- Risk: high. OpenCode server lifecycle, permissions, and session state need strict cleanup.
-- Test coverage: future test with two turns in one session should assert one server startup and preserved event behavior.
+- Proposed fix: reuse an OpenCode server and native GPT-OSS provider proxy for compatible turns keyed by cwd, endpoint, raw slot, permission mode, model/settings, native mode, and system prompt. Reset proxy tool/event state per turn, allow only `/v1/models` while idle, close the proxy if OpenCode startup fails, and serialize warm/turn entry to prevent overlapping turns from clobbering the single active proxy state.
+- Risk: medium. OpenCode server lifecycle, permissions, and session state need strict cleanup.
+- Test coverage: real OpenCode runtime tests assert compatible follow-up turns reuse the same cached server, overlapping turns serialize before the second provider request reaches the fake llama server, and question/tool streaming behavior remains intact.
 
 ### 5. Open Code GPT-OSS prompt budget treats `maxTokens == nCtx` as no prompt space
 
@@ -115,6 +115,25 @@ Analyze and improve local built-in chat, Document Analysis, and Open Code with f
 - Proposed fix: do not return immediately after remote prewarm; continue to document-analysis embedding warmup when applicable.
 - Risk: low.
 - Test coverage: ChatService warmup test asserting both remote prewarm and embedding warm are called.
+
+### 12. Open Code warmup starts llama but not OpenCode/proxy
+
+- Evidence: real UI timing after earlier cache fixes showed warmed first turns still paid about 0.8 seconds before raw `/completion` was invoked, even though llama was already running. Debug spans showed this came from OpenCode/proxy startup and session setup.
+- Why it matters: selecting an OpenCode thread should not leave the first visible turn paying app/harness startup overhead.
+- Harnesses affected: Open Code.
+- Expected impact: first-turn app overhead after warmup drops from hundreds of milliseconds to low tens of milliseconds before llama prefill.
+- Proposed fix: add `OpenCodeRuntime.warm()` and call it from `ChatService.warmSelectedLocalRuntimeNow` after the local endpoint is prepared. Warmup starts/reuses the compatible OpenCode server/provider proxy but does not create a session, send a prompt, execute tools, or dirty conversation state.
+- Risk: medium. Warmup must not leave an active turn state, must respect cancellation, and must not intercept generation requests outside an active turn.
+- Test coverage: ChatService test asserts selected local OpenCode threads call `openCodeRuntime.warm`; real UI timing with the actual textarea and OpenCode Test preset verifies server startup happens before submit and the first submit reuses the warmed server.
+
+## Real UI Timing After OpenCode Reuse/Warmup
+
+Measured with a visible Electron app, real textarea submission, `OpenCode Test` preset, `gpt-oss-20b-mxfp4.gguf`, `nCtx=32768`, `maxTokens=128`, and `UNIT0_OPENCODE_DEBUG_LOG`.
+
+- Before persistent OpenCode reuse, warmed follow-up submit-to-first-visible text was about `995 ms`; raw `/completion` to first upstream payload was about `101 ms`, proving most remaining follow-up latency was before llama.
+- After persistent OpenCode reuse and OpenCode warmup, first warmed submit reused the OpenCode server. Submit-to-first-visible text was `2564 ms`; debug spans showed raw `/completion` prefill took `2205 ms`, so the remaining first-turn delay is model prefill of a roughly `50k` character OpenCode prompt.
+- After the first turn seeded llama prefix cache, follow-up submit-to-first-visible text was `169 ms` and total completion was `253 ms`. Raw `/completion` response headers took `77 ms`; OpenCode event connect was `2 ms`, `prompt_async` was `8 ms`, and prompt rendering was `1 ms`.
+- Streaming remained incremental: the real UI recorded empty assistant frames while running, then reasoning appeared before final content on both turns.
 
 ## Baseline and Regression Test Design
 

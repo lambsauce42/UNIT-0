@@ -198,6 +198,122 @@ test("real OpenCode GPT-OSS proxy streams valid final tokens before upstream com
   }
 });
 
+test("real OpenCode runtime reuses compatible server across follow-up turns", async () => {
+  test.setTimeout(120_000);
+  const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-opencode-runtime-reuse-"));
+  const fakeLlama = await startFakeRawCompletionServer([
+    [
+      "<|channel|>analysis<|message|>First.",
+      "<|end|><|start|>assistant<|channel|>final<|message|>",
+      "ok one",
+      "<|return|>"
+    ],
+    [
+      "<|channel|>analysis<|message|>Second.",
+      "<|end|><|start|>assistant<|channel|>final<|message|>",
+      "ok two",
+      "<|return|>"
+    ]
+  ]);
+  const runtime = new RealOpenCodeRuntime();
+  try {
+    const firstEvents = await collectOpenCodeEvents(runtime, {
+      cwd: projectDir,
+      prompt: "first",
+      modelLabel: "fake-gpt-oss",
+      nativeGptOss: true,
+      endpoint: {
+        baseUrl: fakeLlama.url,
+        modelId: "fake-gpt-oss",
+        rawCompletionUrl: `${fakeLlama.url}/completion`
+      },
+      settings: baseSettings,
+      permissionMode: "full_access"
+    });
+    const firstServer = (runtime as unknown as { cachedServer?: { server: unknown } }).cachedServer?.server;
+    const sessionId = firstEvents.find((event) => event.type === "session.started")?.sessionId ?? "";
+    expect(sessionId).toBeTruthy();
+    expect(firstServer).toBeTruthy();
+
+    const secondEvents = await collectOpenCodeEvents(runtime, {
+      cwd: projectDir,
+      prompt: "second",
+      sessionId,
+      modelLabel: "fake-gpt-oss",
+      nativeGptOss: true,
+      endpoint: {
+        baseUrl: fakeLlama.url,
+        modelId: "fake-gpt-oss",
+        rawCompletionUrl: `${fakeLlama.url}/completion`
+      },
+      settings: baseSettings,
+      permissionMode: "full_access"
+    });
+
+    expect((runtime as unknown as { cachedServer?: { server: unknown } }).cachedServer?.server).toBe(firstServer);
+    expect(secondEvents.filter((event) => event.type === "assistant.delta").map((event) => event.text).join("")).toContain("ok two");
+    expect(fakeLlama.requests).toHaveLength(2);
+    expect(fakeLlama.requests.every((request) => request.cachePrompt === true && request.idSlot === 0)).toBe(true);
+  } finally {
+    runtime.close();
+    await fakeLlama.close();
+    fs.rmSync(projectDir, { recursive: true, force: true });
+  }
+});
+
+test("real OpenCode runtime serializes overlapping turns on the reused proxy", async () => {
+  test.setTimeout(120_000);
+  const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-opencode-runtime-serialize-"));
+  const fakeLlama = await startFakeRawCompletionServer([
+    [
+      "<|channel|>analysis<|message|>",
+      { content: "First", pauseAfter: "first-turn-paused" },
+      ".<|end|><|start|>assistant<|channel|>final<|message|>",
+      "ok one",
+      "<|return|>"
+    ],
+    [
+      "<|channel|>analysis<|message|>Second.",
+      "<|end|><|start|>assistant<|channel|>final<|message|>",
+      "ok two",
+      "<|return|>"
+    ]
+  ]);
+  const runtime = new RealOpenCodeRuntime();
+  const options = (prompt: string): OpenCodeRunOptions => ({
+    cwd: projectDir,
+    prompt,
+    modelLabel: "fake-gpt-oss",
+    nativeGptOss: true,
+    endpoint: {
+      baseUrl: fakeLlama.url,
+      modelId: "fake-gpt-oss",
+      rawCompletionUrl: `${fakeLlama.url}/completion`
+    },
+    settings: baseSettings,
+    permissionMode: "full_access"
+  });
+  try {
+    const firstRun = collectOpenCodeEvents(runtime, options("first"));
+    await fakeLlama.waitForPause("first-turn-paused");
+    const secondRun = collectOpenCodeEvents(runtime, options("second"));
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    expect(fakeLlama.requests).toHaveLength(1);
+
+    fakeLlama.release("first-turn-paused");
+    await firstRun;
+    const secondEvents = await secondRun;
+
+    expect(fakeLlama.requests).toHaveLength(2);
+    expect(secondEvents.filter((event) => event.type === "assistant.delta").map((event) => event.text).join("")).toContain("ok two");
+  } finally {
+    fakeLlama.release("first-turn-paused");
+    runtime.close();
+    await fakeLlama.close();
+    fs.rmSync(projectDir, { recursive: true, force: true });
+  }
+});
+
 test("OpenCode GPT-OSS prompt rendering treats max tokens as an output cap", () => {
   const prompt = renderGptOssOpenCodeProxyPrompt({
     messages: [

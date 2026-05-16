@@ -7,7 +7,7 @@ import { ChatStore } from "../src/main/chatStore";
 import { MockCodexRuntime, type CodexRunOptions, type CodexThreadEvent } from "../src/main/codexRuntime";
 import type { DocumentEmbeddingRuntime } from "../src/main/embeddingRuntime";
 import { LocalLlamaRuntime } from "../src/main/localLlamaRuntime";
-import { mapOpenCodeEvent, normalizeOpenCodeHarmonyEvent, parseOpenCodeHarmonySnapshot, splitSseFrames, type OpenCodeRunOptions, type OpenCodeRuntime, type OpenCodeRuntimeEvent } from "../src/main/openCodeRuntime";
+import { mapOpenCodeEvent, normalizeOpenCodeHarmonyEvent, parseOpenCodeHarmonySnapshot, splitSseFrames, type OpenCodeRunOptions, type OpenCodeRuntime, type OpenCodeRuntimeEvent, type OpenCodeWarmOptions } from "../src/main/openCodeRuntime";
 import { RemoteHostRuntime } from "../src/main/remoteHostRuntime";
 import type { ChatBuiltinAgenticFramework, ChatMessage, ChatModel, ChatRuntimeSettings } from "../src/shared/types";
 
@@ -188,6 +188,7 @@ class ScriptedRemoteRuntime extends RemoteHostRuntime {
 
 class ScriptedOpenCodeRuntime implements OpenCodeRuntime {
   readonly calls: OpenCodeRunOptions[] = [];
+  readonly warmCalls: OpenCodeWarmOptions[] = [];
   readonly approvals: Array<{ permissionId: string; decision: "approve" | "deny" }> = [];
   readonly userInputs: Array<{ requestId: string; answers: Record<string, string> }> = [];
 
@@ -200,6 +201,10 @@ class ScriptedOpenCodeRuntime implements OpenCodeRuntime {
       yield event;
     }
     yield { type: "turn.completed" };
+  }
+
+  async warm(options: OpenCodeWarmOptions): Promise<void> {
+    this.warmCalls.push({ ...options });
   }
 
   async answerApproval(permissionId: string, decision: "approve" | "deny"): Promise<void> {
@@ -3272,6 +3277,38 @@ test("warms document-analysis embeddings even when generation model is remote", 
     await expect.poll(() => remoteRuntime.prewarmCalls.length).toBeGreaterThanOrEqual(1);
     await expect.poll(() => embeddingRuntime.warmCalls.length).toBeGreaterThanOrEqual(1);
     expect(embeddingRuntime.warmCalls[0]).toMatchObject({ modelPath: embeddingPath, nGpuLayers: -1 });
+  } finally {
+    service.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("warms OpenCode runtime server for selected local OpenCode threads", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-opencode-warm-test-"));
+  const modelPath = path.join(dir, "model.gguf");
+  fs.writeFileSync(modelPath, "");
+  const store = new ChatStore(path.join(dir, "chat.sqlite"));
+  const openCodeRuntime = new ScriptedOpenCodeRuntime();
+  const service = new ChatService(store, new EndpointOnlyLlamaRuntime(), new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined, new TestEmbeddingRuntime(), openCodeRuntime);
+  try {
+    let state = store.loadState();
+    store.updateProjectSettings(state.selectedProjectId, "OpenCode Warm Project", dir);
+    store.addLocalModel(modelPath);
+    state = store.loadState();
+    store.updateThreadSettings(state.selectedThreadId, {
+      builtinAgenticFramework: "opencode",
+      builtinModelId: state.selectedModelId
+    });
+
+    service.warmSelectedLocalRuntime();
+
+    await expect.poll(() => openCodeRuntime.warmCalls.length).toBeGreaterThanOrEqual(1);
+    expect(openCodeRuntime.warmCalls[0]).toMatchObject({
+      cwd: dir,
+      modelLabel: "model",
+      nativeGptOss: false,
+      permissionMode: "full_access"
+    });
   } finally {
     service.close();
     fs.rmSync(dir, { recursive: true, force: true });
