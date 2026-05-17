@@ -803,7 +803,8 @@ test("surfaces exact OpenCode context usage from the actual model prompt", async
   const openCodeRuntime = new ScriptedOpenCodeRuntime([
     [contextUpdated(1234), { type: "assistant.delta", id: "assistant-1", status: "updated", text: "Done." }],
     [contextUpdated(2345), { type: "assistant.delta", id: "assistant-2", status: "updated", text: "Done again." }],
-    [contextUpdated(3456), { type: "assistant.delta", id: "assistant-3", status: "updated", text: "Done after move." }]
+    [contextUpdated(3456), { type: "assistant.delta", id: "assistant-3", status: "updated", text: "Done again after stale display." }],
+    [contextUpdated(4567), { type: "assistant.delta", id: "assistant-4", status: "updated", text: "Done after move." }]
   ]);
   const contextUsageSnapshots: Array<ChatState["contextUsage"]> = [];
   let service: ChatService | undefined;
@@ -838,7 +839,7 @@ test("surfaces exact OpenCode context usage from the actual model prompt", async
       includesSystemPrompt: true,
       includesToolDefinitions: true
     }));
-    expect(service.state().contextUsage).toBeNull();
+    expect(service.state().contextUsage).toMatchObject({ promptTokens: 1234 });
 
     const changedProjectDir = path.join(dir, "changed-project-dir");
     fs.mkdirSync(changedProjectDir);
@@ -848,6 +849,11 @@ test("surfaces exact OpenCode context usage from the actual model prompt", async
     await service.submit({ text: "measure context again" });
     await expect.poll(() => service.state().generation.status).toBe("idle");
     expect(contextUsageSnapshots).toContainEqual(expect.objectContaining({ promptTokens: 2345 }));
+    expect(service.state().contextUsage).toMatchObject({ promptTokens: 2345 });
+    const stateBeforeSecondContextUpdate = await service.submit({ text: "measure context again before update" });
+    expect(stateBeforeSecondContextUpdate.contextUsage).toMatchObject({ promptTokens: 2345 });
+    await expect.poll(() => service.state().generation.status).toBe("idle");
+    expect(service.state().contextUsage).toMatchObject({ promptTokens: 3456 });
 
     service.createProject();
     const targetProjectId = service.state().selectedProjectId;
@@ -855,14 +861,15 @@ test("surfaces exact OpenCode context usage from the actual model prompt", async
     fs.mkdirSync(targetProjectDir);
     service.updateProjectSettings(targetProjectId, "Target Project", targetProjectDir);
     service.selectThread(threadId);
-    expect(service.state().contextUsage).toBeNull();
+    expect(service.state().contextUsage).toMatchObject({ promptTokens: 3456 });
     service.moveThread(threadId, targetProjectId);
     service.selectThread(threadId);
     expect(service.state().contextUsage).toBeNull();
 
     await service.submit({ text: "measure context after move" });
     await expect.poll(() => service.state().generation.status).toBe("idle");
-    expect(contextUsageSnapshots).toContainEqual(expect.objectContaining({ promptTokens: 3456 }));
+    expect(contextUsageSnapshots).toContainEqual(expect.objectContaining({ promptTokens: 4567 }));
+    expect(service.state().contextUsage).toMatchObject({ promptTokens: 4567 });
 
     service.updateThreadSettings({ threadId, runtimeSettings: { systemPrompt: "Changed system prompt" } });
     expect(service.state().contextUsage).toBeNull();

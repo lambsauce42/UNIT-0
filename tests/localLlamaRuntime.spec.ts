@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { EventEmitter } from "node:events";
 import { buildEmbeddingServerCommand } from "../src/main/embeddingRuntime";
-import { buildLlamaServerCommand, GptOssChannelParser, LocalLlamaRuntime, resolveBundledLlamaServerBinary } from "../src/main/localLlamaRuntime";
+import { buildLlamaServerCommand, configureLocalLlamaDebugLogPath, GptOssChannelParser, LocalLlamaRuntime, resolveBundledLlamaServerBinary } from "../src/main/localLlamaRuntime";
 
 test("builds a llama-server command for one local chat slot by default", () => {
   const command = buildLlamaServerCommand({
@@ -182,7 +182,9 @@ test("rejects malformed GPT-OSS constrained JSON instead of exposing it as text"
   expect(() => finalParser.push("<|channel|>commentary to=final <|constrain|>json<|message|>{not-json}<|return|>")).toThrow("malformed constrained final JSON");
 
   const toolParser = new GptOssChannelParser({ defaultChannel: "analysis", toolRecipients: ["glob"] });
-  expect(() => toolParser.push("<|channel|>commentary to=glob code<|message|>{not-json}<|call|>")).toThrow("malformed tool-call JSON");
+  const parsedTool = toolParser.push("<|channel|>commentary to=glob code<|message|>{not-json}<|call|>");
+  expect(parsedTool.toolCallContent).toContain("__unit0_tool_call_error");
+  expect(parsedTool.toolCallContent).toContain("malformed tool-call JSON");
 
   const unknownRecipientParser = new GptOssChannelParser({ defaultChannel: "analysis", toolRecipients: ["glob"] });
   expect(() => unknownRecipientParser.push('<|channel|>commentary to=shell code<|message|>{"command":"dir"}<|call|>')).toThrow("unsupported commentary recipient");
@@ -242,6 +244,7 @@ test("opens OpenCode endpoint on the local cache slot without increasing paralle
     kill: () => undefined
   });
   let spawnArgs: string[] = [];
+  let spawnOptions: { env?: NodeJS.ProcessEnv } | undefined;
   const fetchImpl = async (input: RequestInfo | URL) => {
     const url = String(input);
     if (url.endsWith("/health")) {
@@ -255,8 +258,9 @@ test("opens OpenCode endpoint on the local cache slot without increasing paralle
   const runtime = new LocalLlamaRuntime({
     binaryPath,
     fetchImpl: fetchImpl as typeof fetch,
-    spawnImpl: ((_command: string, args: readonly string[]) => {
+    spawnImpl: ((_command: string, args: readonly string[], options?: { env?: NodeJS.ProcessEnv }) => {
       spawnArgs = [...args];
+      spawnOptions = options;
       return spawned;
     }) as unknown as typeof import("node:child_process").spawn,
     startupTimeoutMs: 1000
@@ -283,6 +287,7 @@ test("opens OpenCode endpoint on the local cache slot without increasing paralle
   expect(endpoint.rawCompletionSlotId).toBe(0);
   expect(spawnArgs[spawnArgs.indexOf("--ctx-size") + 1]).toBe("4096");
   expect(spawnArgs[spawnArgs.indexOf("-np") + 1]).toBe("1");
+  expect(spawnOptions?.env?.GGML_CUDA_DISABLE_GRAPHS).toBe("1");
   runtime.close();
   fs.rmSync(dir, { recursive: true, force: true });
 });
@@ -340,6 +345,74 @@ test("warms OpenCode endpoint without dirtying the local cache slot", async () =
   expect(spawnCount).toBe(1);
   runtime.close();
   fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("logs llama process output and OpenCode endpoint slot state", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit-0-llama-debug-log-"));
+  const binaryPath = path.join(dir, "llama-server.exe");
+  const modelPath = path.join(dir, "model.gguf");
+  const logPath = path.join(dir, "local-llama-debug.log");
+  fs.writeFileSync(binaryPath, "");
+  fs.writeFileSync(modelPath, "");
+  configureLocalLlamaDebugLogPath(logPath);
+  const stdout = new EventEmitter();
+  const stderr = new EventEmitter();
+  const spawned = Object.assign(new EventEmitter(), {
+    exitCode: null as number | null,
+    stdout,
+    stderr,
+    pid: 12345,
+    kill: () => undefined
+  });
+  const fetchImpl = async (input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url.endsWith("/health")) {
+      return Response.json({ status: "ok" });
+    }
+    if (url.endsWith("/v1/models")) {
+      return Response.json({ data: [{ id: "local-model" }] });
+    }
+    return Response.json({});
+  };
+  const runtime = new LocalLlamaRuntime({
+    binaryPath,
+    fetchImpl: fetchImpl as typeof fetch,
+    spawnImpl: (() => spawned) as unknown as typeof import("node:child_process").spawn,
+    startupTimeoutMs: 1000
+  });
+  const model = { id: "model", label: "Model", path: modelPath, createdAt: new Date().toISOString() };
+  const settings = {
+    nCtx: 4096,
+    nGpuLayers: 0,
+    temperature: 0.7,
+    repeatPenalty: 1.1,
+    maxTokens: 256,
+    reasoningEffort: "medium",
+    permissionMode: "full_access",
+    trimReserveTokens: 2000,
+    trimReservePercent: 15,
+    trimAmountTokens: 4000,
+    trimAmountPercent: 30,
+    systemPrompt: "You are a helpful local assistant."
+  } as const;
+
+  try {
+    await runtime.openAiEndpoint({ model, settings });
+    stdout.emit("data", "slot update\n");
+    stderr.emit("data", "server warning\n");
+    spawned.emit("exit", 99, null);
+
+    const lines = fs.readFileSync(logPath, "utf8").trim().split(/\r?\n/u).map((line) => JSON.parse(line) as { label: string; data: Record<string, unknown> });
+    expect(lines.some((line) => line.label === "llama.process.spawn" && line.data.pid === 12345)).toBe(true);
+    expect(lines.some((line) => line.label === "llama.endpoint.open.done" && line.data.activeSlotDirty === true)).toBe(true);
+    expect(lines.some((line) => line.label === "llama.process.output" && line.data.stream === "stdout" && line.data.line === "slot update")).toBe(true);
+    expect(lines.some((line) => line.label === "llama.process.output" && line.data.stream === "stderr" && line.data.line === "server warning")).toBe(true);
+    expect(lines.some((line) => line.label === "llama.process.exit" && line.data.code === 99)).toBe(true);
+  } finally {
+    runtime.close();
+    configureLocalLlamaDebugLogPath("");
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("reuses the raw OpenCode slot after successful OpenCode endpoint use", async () => {

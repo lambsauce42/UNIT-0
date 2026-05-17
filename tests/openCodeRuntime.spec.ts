@@ -278,7 +278,7 @@ test("real OpenCode GPT-OSS proxy rejects final-only output before rendering it"
 test("real OpenCode GPT-OSS proxy budgets completions with the llama tokenizer count", async () => {
   test.setTimeout(90_000);
   const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-opencode-runtime-tokenize-"));
-  const settings = { ...baseSettings, nCtx: 32768, maxTokens: 128 };
+  const settings = { ...baseSettings, nCtx: 32768, maxTokens: 128, trimReserveTokens: 0, trimReservePercent: 0 };
   const fakeLlama = await startFakeRawCompletionServer([
     ["<|channel|>analysis<|message|>Need concise answer.<|end|><|start|>assistant<|channel|>final<|message|>ok<|return|>"],
     ["<|channel|>final<|message|>ok<|return|>"]
@@ -1008,6 +1008,57 @@ test("real OpenCode GPT-OSS proxy executes and renders tool calls once", async (
   }
 });
 
+test("real OpenCode GPT-OSS proxy returns malformed tool calls as failed tool results", async () => {
+  test.setTimeout(120_000);
+  const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-opencode-runtime-bad-tool-"));
+  const fakeLlama = await startFakeRawCompletionServer([
+    [
+      "<|channel|>analysis<|message|>Need a tool but malformed.",
+      "<|end|><|start|>assistant<|channel|>commentary to=glob code<|message|>",
+      "{\"pattern\":",
+      "<|call|>"
+    ],
+    [
+      "<|channel|>analysis<|message|>Tool call failed; answer directly.",
+      "<|end|><|start|>assistant<|channel|>final<|message|>",
+      "Available tools include glob, grep, read, write, edit, bash, question, webfetch, skill, and todowrite.",
+      "<|return|>"
+    ]
+  ]);
+  const runtime = new RealOpenCodeRuntime();
+  try {
+    const events: OpenCodeRuntimeEvent[] = [];
+    await collectOpenCodeEvents(runtime, {
+      cwd: projectDir,
+      prompt: "list all your tools",
+      modelLabel: "fake-gpt-oss",
+      nativeGptOss: true,
+      endpoint: {
+        baseUrl: fakeLlama.url,
+        modelId: "fake-gpt-oss",
+        rawCompletionUrl: `${fakeLlama.url}/completion`,
+        tokenizeUrl: `${fakeLlama.url}/tokenize`
+      },
+      settings: baseSettings,
+      permissionMode: "full_access"
+    }, (event) => events.push(event));
+
+    expect(fakeLlama.requests).toHaveLength(2);
+    expect(fakeLlama.requests[1].prompt).toContain("blocked malformed model tool-call JSON");
+    expect(fakeLlama.requests[1].prompt).toContain("OpenCode Tool Result");
+    expect(events.some((event) => event.type === "error")).toBe(false);
+    const toolEvents = events.filter((event) => event.type === "timeline" && event.block.kind === "tool");
+    expect(toolEvents.some((event) => event.eventType === "item.started" && event.block.command?.includes("malformed tool-call JSON"))).toBe(true);
+    expect(toolEvents.some((event) => event.eventType === "item.completed")).toBe(true);
+    const assistantText = events.filter((event) => event.type === "assistant.delta").map((event) => event.text).join("");
+    expect(assistantText).toContain("Available tools include");
+  } finally {
+    runtime.close();
+    await fakeLlama.close();
+    fs.rmSync(projectDir, { recursive: true, force: true });
+  }
+});
+
 test("real OpenCode GPT-OSS proxy budgets large webfetch output before post-tool final streaming", async () => {
   test.setTimeout(120_000);
   const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-opencode-runtime-tool-budget-"));
@@ -1109,13 +1160,57 @@ test("OpenCode GPT-OSS proxy prompt keeps completion budget when tool results ar
   expect(gptOssOpenCodeRequestMaxTokensForPromptTokens(fakePromptTokens(prompt), { ...baseSettings, nCtx: 4096, maxTokens: 256 }, fakeContinuationReserveTokens)).toBeGreaterThan(0);
 });
 
+test("OpenCode GPT-OSS proxy drops tool results after a later final answer", () => {
+  const prompt = renderGptOssOpenCodeProxyPrompt({
+    messages: [
+      { role: "user", content: "inspect the file" },
+      {
+        role: "assistant",
+        content: "[[UNIT0_ANALYSIS]]Need file.[[UNIT0_FINAL]]",
+        tool_calls: [{
+          id: "call_read",
+          type: "function",
+          function: { name: "read", arguments: "{\"filePath\":\"alpha.txt\"}" }
+        }]
+      },
+      { role: "tool", tool_call_id: "call_read", content: "TOOL_RESULT_SHOULD_NOT_SURVIVE ".repeat(2000) },
+      { role: "assistant", content: "[[UNIT0_ANALYSIS]]Read it.[[UNIT0_FINAL]]alpha.txt contains alpha." },
+      { role: "user", content: "thanks" }
+    ],
+    tools: [{ type: "function", function: { name: "read", parameters: { type: "object" } } }]
+  }, {
+    cwd: "C:\\Project",
+    prompt: "thanks",
+    modelLabel: "fake-gpt-oss",
+    nativeGptOss: true,
+    endpoint: { baseUrl: "http://127.0.0.1:1234", modelId: "fake-gpt-oss" },
+    settings: { ...baseSettings, nCtx: 32768, maxTokens: 512 },
+    permissionMode: "full_access"
+  });
+
+  expect(prompt).not.toContain("# OpenCode Tool Result");
+  expect(prompt).not.toContain("TOOL_RESULT_SHOULD_NOT_SURVIVE");
+  expect(prompt).toContain("alpha.txt contains alpha.");
+  expect(prompt).toContain("<|start|>user<|message|>thanks<|end|>");
+});
+
 test("OpenCode GPT-OSS proxy reserves context for forced final continuation", () => {
-  const settings = { ...baseSettings, nCtx: 2048, maxTokens: 512 };
+  const settings = { ...baseSettings, nCtx: 2048, maxTokens: 512, trimReserveTokens: 0, trimReservePercent: 0 };
   const prompt = "P".repeat((settings.nCtx - 128) * 3);
   const firstPassTokens = gptOssOpenCodeRequestMaxTokensForPromptTokens(fakePromptTokens(prompt), settings, fakeContinuationReserveTokens);
   expect(firstPassTokens).toBeLessThan(64);
   const continuationPrompt = `${prompt}${"A".repeat(firstPassTokens * 3)}<|end|><|start|>assistant<|channel|>final<|message|>`;
   expect(gptOssOpenCodeRequestMaxTokensForPromptTokens(fakePromptTokens(continuationPrompt), settings)).toBeGreaterThanOrEqual(64);
+});
+
+test("OpenCode GPT-OSS proxy keeps configured context reserve for large retained transcripts", () => {
+  const settings = { ...baseSettings, nCtx: 32768, maxTokens: 32768, trimReserveTokens: 2000, trimReservePercent: 15 };
+  const promptTokens = 22307;
+  const reservedContextTokens = Math.floor(settings.nCtx * settings.trimReservePercent / 100);
+  const nPredict = gptOssOpenCodeRequestMaxTokensForPromptTokens(promptTokens, settings, fakeContinuationReserveTokens);
+
+  expect(nPredict).toBeLessThanOrEqual(settings.nCtx - promptTokens - reservedContextTokens - fakeContinuationReserveTokens);
+  expect(nPredict).toBeGreaterThan(0);
 });
 
 test("real OpenCode GPT-OSS proxy does not force final continuation after terminal-suppressed tool calls", async () => {

@@ -1233,8 +1233,30 @@ function writeOpenCodeProxyContentOrToolDelta(
   toolRecipients: string[],
   allowToolCall: boolean
 ): { toolCall: boolean } {
-  const toolCall = allowToolCall ? parseOpenCodeToolCallContent(content, toolRecipients) : null;
-  if (toolCall) {
+  const toolCall = allowToolCall ? parseOpenCodeToolCallContent(content, toolRecipients) : { kind: "none" as const };
+  if (toolCall.kind === "invalid") {
+    if (markerState.sentFinal) {
+      throw new Error("OpenCode GPT-OSS emitted an invalid tool call after final output.");
+    }
+    const callId = `call_${randomUUID().replace(/-/g, "")}`;
+    const record = openCodeProxyFailedToolCallRecord(callId, toolCall, toolSink);
+    toolSink.pending.set(callId, record);
+    toolSink.completed.push(record);
+    writeDelta({ content: openCodeToolStartMarker(record) });
+    writeDelta({
+      tool_calls: [{
+        index: 0,
+        id: callId,
+        type: "function",
+        function: {
+          name: record.name,
+          arguments: record.argumentsText
+        }
+      }]
+    });
+    return { toolCall: true };
+  }
+  if (toolCall.kind === "valid") {
     if (markerState.sentFinal) {
       throw new Error("OpenCode GPT-OSS emitted a tool call after final output.");
     }
@@ -1268,6 +1290,25 @@ function writeOpenCodeProxyContentOrToolDelta(
   markerState.sentFinal = true;
   writeDelta({ content: `${prefix}${content}` });
   return { toolCall: false };
+}
+
+function openCodeProxyFailedToolCallRecord(
+  id: string,
+  invalidCall: OpenCodeParsedInvalidToolCall,
+  toolSink: OpenCodeProxyToolEventSink
+): OpenCodeProxyToolCallRecord {
+  const output = `Tool call failed before execution: ${invalidCall.message}\n\nEmit exactly one native GPT-OSS tool call in the required JSON shape, or answer in final if no tool is needed.`;
+  return {
+    id,
+    name: "bash",
+    argumentsText: JSON.stringify({
+      command: `# Unit-0 blocked malformed model tool-call JSON: ${invalidCall.message}`,
+      description: "Reports malformed model tool call"
+    }),
+    cwd: toolSink.cwd,
+    secret: toolSink.markerSecret,
+    output
+  };
 }
 
 function openCodeProxyNonStreamResponse(chunks: Record<string, unknown>[]): Record<string, unknown> {
@@ -1311,23 +1352,51 @@ function writeOpenCodeProxyDelta(response: http.ServerResponse, delta: Record<st
   response.write(`data: ${JSON.stringify(payload)}\n\n`);
 }
 
-function parseOpenCodeToolCallContent(content: string, toolRecipients: string[]): { name: string; arguments: string } | null {
+type OpenCodeParsedToolCall =
+  | { kind: "none" }
+  | { kind: "valid"; name: string; arguments: string }
+  | OpenCodeParsedInvalidToolCall;
+
+type OpenCodeParsedInvalidToolCall = {
+  kind: "invalid";
+  message: string;
+};
+
+function parseOpenCodeToolCallContent(content: string, toolRecipients: string[]): OpenCodeParsedToolCall {
   const match = /^\s*<tool_call>\s*([\s\S]*?)\s*<\/tool_call>\s*$/u.exec(content);
   if (!match) {
-    return null;
+    return { kind: "none" };
   }
-  const decoded = JSON.parse(match[1]) as unknown;
-  if (!isRecord(decoded) || typeof decoded.tool !== "string" || !toolRecipients.includes(decoded.tool)) {
-    throw new Error("OpenCode GPT-OSS emitted an invalid tool call.");
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(match[1]) as unknown;
+  } catch (error) {
+    return { kind: "invalid", message: `malformed tool-call JSON (${errorMessage(error)})` };
+  }
+  if (!isRecord(decoded)) {
+    return { kind: "invalid", message: "tool call must be a JSON object" };
+  }
+  if (typeof decoded.__unit0_tool_call_error === "string") {
+    return { kind: "invalid", message: decoded.__unit0_tool_call_error };
+  }
+  if (typeof decoded.tool !== "string") {
+    return { kind: "invalid", message: "tool call JSON must include a string `tool` field" };
+  }
+  if (!toolRecipients.includes(decoded.tool)) {
+    return { kind: "invalid", message: `unknown tool recipient \`${decoded.tool}\`; available tools: ${toolRecipients.join(", ")}` };
   }
   const args = { ...decoded };
   const tool = decoded.tool;
   delete args.tool;
-  return { name: tool, arguments: JSON.stringify(args) };
+  return { kind: "valid", name: tool, arguments: JSON.stringify(args) };
 }
 
 function emitStartedOpenCodeProxyToolEvent(toolSink: OpenCodeProxyToolEventSink, toolCall: OpenCodeProxyToolCallRecord): void {
   toolSink.queue.push({ kind: "event", event: openCodeProxyToolStartedRuntimeEvent({ ...toolCall, cwd: toolCall.cwd ?? toolSink.cwd }) });
+}
+
+function emitCompletedOpenCodeProxyToolEvent(toolSink: OpenCodeProxyToolEventSink, toolCall: OpenCodeProxyToolCallRecord): void {
+  toolSink.queue.push({ kind: "event", event: openCodeProxyToolCompletedRuntimeEvent({ ...toolCall, cwd: toolCall.cwd ?? toolSink.cwd }) });
 }
 
 function openCodeProxyToolStartedRuntimeEvent(toolCall: OpenCodeProxyToolCallRecord, sessionId?: string): OpenCodeRuntimeEvent {
@@ -1399,6 +1468,10 @@ function decodeOpenCodeToolStartMarker(encoded: string): OpenCodeProxyToolCallRe
 }
 
 function emitCompletedOpenCodeProxyToolEvents(body: unknown, toolSink: OpenCodeProxyToolEventSink): void {
+  for (const toolCall of toolSink.completed.splice(0)) {
+    emitStartedOpenCodeProxyToolEvent(toolSink, toolCall);
+    emitCompletedOpenCodeProxyToolEvent(toolSink, toolCall);
+  }
   if (!isRecord(body) || !Array.isArray(body.messages)) {
     return;
   }
@@ -1419,13 +1492,14 @@ function emitCompletedOpenCodeProxyToolEvents(body: unknown, toolSink: OpenCodeP
 
 export function renderGptOssOpenCodeProxyPrompt(body: unknown, options: OpenCodeRunOptions): string {
   const messages = isRecord(body) && Array.isArray(body.messages) ? body.messages : [];
+  const answeredToolResultIndexes = answeredOpenCodeToolResultMessageIndexes(messages);
   const parts: OpenCodeProxyPromptPart[] = [
     `<|start|>system<|message|>${renderGptOssOpenCodeSystemPrompt(options.settings)}<|end|>`,
     `<|start|>developer<|message|># Environment\nWorking directory: ${escapeGptOssTranscriptText(options.cwd)}\nPlatform: win32<|end|>`,
     options.settings.systemPrompt.trim() ? `<|start|>developer<|message|>${escapeGptOssTranscriptText(options.settings.systemPrompt.trim())}<|end|>` : "",
     renderOpenCodeProxyToolInstructions(body)
   ].filter(Boolean);
-  for (const message of messages) {
+  for (const [index, message] of messages.entries()) {
     if (!isRecord(message)) {
       continue;
     }
@@ -1436,10 +1510,13 @@ export function renderGptOssOpenCodeProxyPrompt(body: unknown, options: OpenCode
         continue;
       }
     }
+    const isToolResultMessage = role === "tool" || isOpenCodeHostToolResultContent(content);
     if (role === "assistant") {
       parts.push(...renderOpenCodeProxyAssistantTranscript(message, content));
-    } else if (role === "tool" || isOpenCodeHostToolResultContent(content)) {
-      parts.push({ kind: "toolResult", content: sanitizeOpenCodeProxyToolResultContent(content) });
+    } else if (isToolResultMessage) {
+      if (!answeredToolResultIndexes.has(index)) {
+        parts.push({ kind: "toolResult", content: sanitizeOpenCodeProxyToolResultContent(content) });
+      }
     } else if (role === "system") {
       continue;
     } else {
@@ -1448,6 +1525,38 @@ export function renderGptOssOpenCodeProxyPrompt(body: unknown, options: OpenCode
   }
   parts.push("<|start|>assistant");
   return renderOpenCodeProxyPromptParts(parts, options.settings);
+}
+
+function answeredOpenCodeToolResultMessageIndexes(messages: unknown[]): Set<number> {
+  const answered = new Set<number>();
+  const finalAssistantIndexes = messages
+    .map((message, index) => isRecord(message) && String(message.role ?? "") === "assistant" && openCodeProxyAssistantHasFinalContent(openCodeProxyMessageContent(message.content)) ? index : -1)
+    .filter((index) => index >= 0);
+  if (finalAssistantIndexes.length === 0) {
+    return answered;
+  }
+  for (const [index, message] of messages.entries()) {
+    if (!isRecord(message)) {
+      continue;
+    }
+    const content = openCodeProxyMessageContent(message.content);
+    const role = String(message.role ?? "user");
+    if ((role === "tool" || isOpenCodeHostToolResultContent(content)) && finalAssistantIndexes.some((assistantIndex) => assistantIndex > index)) {
+      answered.add(index);
+    }
+  }
+  return answered;
+}
+
+function openCodeProxyAssistantHasFinalContent(content: string): boolean {
+  const parsed = parseDelimitedPlainOpenCodeText(content);
+  if (parsed.hasMarker && !parsed.malformed) {
+    return Boolean(parsed.content.trim());
+  }
+  if (content.trim()) {
+    return Boolean(plainGptOssTextWithoutProtocolMarkers(content).trim());
+  }
+  return false;
 }
 
 type OpenCodeProxyPromptPart = string | { kind: "toolResult"; content: string };
@@ -1685,7 +1794,8 @@ export function gptOssOpenCodeRequestMaxTokensForPromptTokens(
   maxTokenCap?: number
 ): number {
   const normalizedPromptTokens = Math.max(0, Math.floor(promptTokens));
-  const remainingContextTokens = Math.max(0, settings.nCtx - normalizedPromptTokens);
+  const reservedContextTokens = gptOssOpenCodeReservedContextTokens(settings);
+  const remainingContextTokens = Math.max(0, settings.nCtx - normalizedPromptTokens - reservedContextTokens);
   const configuredMaxTokens = settings.maxTokens > 0 ? settings.maxTokens : remainingContextTokens;
   const effectiveMaxTokenCap = maxTokenCap === undefined || maxTokenCap <= 0 ? configuredMaxTokens : maxTokenCap;
   const continuationReserve = Math.min(Math.max(0, Math.floor(continuationReserveTokens)), Math.max(0, remainingContextTokens - 1));
@@ -1694,9 +1804,15 @@ export function gptOssOpenCodeRequestMaxTokensForPromptTokens(
 
 function gptOssOpenCodePromptBudgetCharacters(settings: ChatRuntimeSettings): number {
   const continuationReserveTokens = OPENCODE_MIN_COMPLETION_TOKENS + Math.ceil(OPENCODE_FINAL_CONTINUATION_MARKER.length / 3);
-  const reservedCompletionTokens = Math.min(OPENCODE_MIN_COMPLETION_TOKENS + continuationReserveTokens, Math.max(1, settings.nCtx - 1));
+  const reservedCompletionTokens = Math.min(OPENCODE_MIN_COMPLETION_TOKENS + continuationReserveTokens + gptOssOpenCodeReservedContextTokens(settings), Math.max(1, settings.nCtx - 1));
   const promptTokens = Math.max(1, settings.nCtx - reservedCompletionTokens);
   return promptTokens * 3;
+}
+
+function gptOssOpenCodeReservedContextTokens(settings: ChatRuntimeSettings): number {
+  const configuredReserve = Math.max(0, Math.floor(settings.trimReserveTokens));
+  const percentReserve = Math.floor(settings.nCtx * Math.max(0, settings.trimReservePercent) / 100);
+  return Math.min(Math.max(configuredReserve, percentReserve), Math.max(0, settings.nCtx - OPENCODE_MIN_COMPLETION_TOKENS));
 }
 
 async function readOpenCodeProxyServerSentEvents(body: ReadableStream<Uint8Array>, onPayload: (payload: string) => void): Promise<void> {

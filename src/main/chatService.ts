@@ -396,10 +396,9 @@ export class ChatService {
     const usage = this.contextUsageByThreadId.get(selectedThread.id);
     if (
       !usage
+      || selectedThread.projectId !== state.selectedProjectId
       || usage.contextTokens !== selectedThread.runtimeSettings.nCtx
       || usage.framework !== selectedThread.builtinAgenticFramework
-      || usage.promptSignature !== this.contextUsagePromptSignatureForThread(state, selectedThread)
-      || usage.promptEpoch !== this.contextUsageEpochForThread(selectedThread.id)
     ) {
       return null;
     }
@@ -448,6 +447,12 @@ export class ChatService {
   private invalidateContextUsage(threadId: string | undefined): void {
     if (threadId) {
       this.contextUsageByThreadId.delete(threadId);
+      this.contextUsageEpochByThreadId.set(threadId, this.contextUsageEpochForThread(threadId) + 1);
+    }
+  }
+
+  private advanceContextUsageEpoch(threadId: string | undefined): void {
+    if (threadId) {
       this.contextUsageEpochByThreadId.set(threadId, this.contextUsageEpochForThread(threadId) + 1);
     }
   }
@@ -958,7 +963,7 @@ export class ChatService {
       this.setError(localToCodexBlockReason());
       return this.state();
     }
-    this.invalidateContextUsage(threadId);
+    this.advanceContextUsageEpoch(threadId);
     if (text && this.store.messageCount(threadId) === 0) {
       this.store.renameThread(threadId, text);
     }

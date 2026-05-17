@@ -11,6 +11,7 @@ const GPTOSS_RETURN_MARKER = "<|return|>";
 const GPTOSS_CHANNEL_TERMINATORS = [GPTOSS_END_MARKER, GPTOSS_CALL_MARKER, GPTOSS_RETURN_MARKER];
 const DOCUMENT_ANALYSIS_TOOL_RESULT_PREFIX = "Tool result:\n";
 const LOCAL_LLAMA_DEFAULT_PARALLEL_SLOTS = 1;
+let configuredLocalLlamaDebugLogPath = "";
 const GPTOSS_SYSTEM_PROMPT = [
   "You are ChatGPT, a large language model trained by OpenAI.",
   "Knowledge cutoff: 2024-06",
@@ -116,6 +117,10 @@ export type LocalLlamaOpenAiEndpoint = {
   rawCompletionSlotId?: number;
   tokenizeUrl?: string;
 };
+
+export function configureLocalLlamaDebugLogPath(logPath: string): void {
+  configuredLocalLlamaDebugLogPath = logPath;
+}
 
 type ServerKey = {
   modelPath: string;
@@ -335,20 +340,34 @@ export class LocalLlamaRuntime {
     reserveForGeneration?: boolean;
   }): Promise<LocalLlamaOpenAiEndpoint> {
     return this.withSlotLock(async () => {
+      debugLocalLlama("llama.endpoint.open.start", {
+        modelId: options.model.id,
+        modelLabel: options.model.label,
+        modelPath: options.model.path,
+        reserveForGeneration: options.reserveForGeneration !== false,
+        settings: localLlamaSettingsDebugSummary(options.settings)
+      });
       if (options.shouldCancel?.()) {
+        debugLocalLlama("llama.endpoint.open.cancelled", { stage: "before_server" });
         throw new LocalLlamaRuntimeError("Bundled llama-server request was cancelled.");
       }
       let server = await this.ensureServer(options.model, options.settings, LOCAL_LLAMA_DEFAULT_PARALLEL_SLOTS);
+      debugLocalLlama("llama.endpoint.open.server", localLlamaServerDebugSummary(server));
       if (options.shouldCancel?.()) {
+        debugLocalLlama("llama.endpoint.open.cancelled", { stage: "after_server", server: localLlamaServerDebugSummary(server) });
         throw new LocalLlamaRuntimeError("Bundled llama-server request was cancelled.");
       }
       if (server.activeSlotDirty && server.activeSlotCacheKey) {
+        debugLocalLlama("llama.endpoint.open.restart_dirty_cache_slot", localLlamaServerDebugSummary(server));
         this.close();
         if (options.shouldCancel?.()) {
+          debugLocalLlama("llama.endpoint.open.cancelled", { stage: "after_dirty_close" });
           throw new LocalLlamaRuntimeError("Bundled llama-server request was cancelled.");
         }
         server = await this.ensureServer(options.model, options.settings, LOCAL_LLAMA_DEFAULT_PARALLEL_SLOTS);
+        debugLocalLlama("llama.endpoint.open.restarted", localLlamaServerDebugSummary(server));
         if (options.shouldCancel?.()) {
+          debugLocalLlama("llama.endpoint.open.cancelled", { stage: "after_dirty_restart", server: localLlamaServerDebugSummary(server) });
           throw new LocalLlamaRuntimeError("Bundled llama-server request was cancelled.");
         }
       }
@@ -356,6 +375,7 @@ export class LocalLlamaRuntime {
         server.activeSlotCacheKey = "";
         server.activeSlotDirty = true;
       }
+      debugLocalLlama("llama.endpoint.open.done", localLlamaServerDebugSummary(server));
       return {
         baseUrl: server.baseUrl,
         modelId: server.modelId,
@@ -449,9 +469,23 @@ export class LocalLlamaRuntime {
     });
     const process = this.spawnImpl(command.command, command.args, {
       cwd: command.cwd,
+      env: localLlamaProcessEnv(),
       windowsHide: true,
-      stdio: "ignore"
+      stdio: ["ignore", "pipe", "pipe"]
     } as SpawnOptions);
+    this.attachProcessLogging(process, {
+      generation: startGeneration,
+      command: command.command,
+      args: command.args,
+      cwd: command.cwd,
+      baseUrl: `http://127.0.0.1:${port}`,
+      modelPath: key.modelPath,
+      nCtx: key.nCtx,
+      nGpuLayers: key.nGpuLayers,
+      nativeGptOss: key.nativeGptOss,
+      parallelSlots: key.parallelSlots,
+      slotSavePath
+    });
     this.startingProcess = process;
     if (this.serverGeneration !== startGeneration) {
       if (process.exitCode === null) {
@@ -548,12 +582,22 @@ export class LocalLlamaRuntime {
   private async restoreSlotIfNeeded(server: ActiveServer, cacheKey?: string): Promise<"ready" | "restart_required"> {
     const normalizedKey = normalizeSlotCacheKey(cacheKey);
     if (!normalizedKey) {
+      debugLocalLlama("llama.slot.restore.skip_no_key", localLlamaServerDebugSummary(server));
       return "ready";
     }
     if (server.activeSlotCacheKey === normalizedKey && !server.activeSlotDirty) {
+      debugLocalLlama("llama.slot.restore.skip_already_active", {
+        ...localLlamaServerDebugSummary(server),
+        cache: slotCacheDebugSummary(server, normalizedKey)
+      });
       return "ready";
     }
     if (server.activeSlotCacheKey && !server.activeSlotDirty) {
+      debugLocalLlama("llama.slot.restore.save_previous_clean_slot", {
+        ...localLlamaServerDebugSummary(server),
+        previousCache: slotCacheDebugSummary(server, server.activeSlotCacheKey),
+        nextCache: slotCacheDebugSummary(server, normalizedKey)
+      });
       await this.saveSlot(server, slotCacheFilename(server, server.activeSlotCacheKey));
     }
     const wasDirty = server.activeSlotDirty;
@@ -561,25 +605,51 @@ export class LocalLlamaRuntime {
     server.activeSlotDirty = false;
     const filename = slotCacheFilename(server, normalizedKey);
     if (fs.existsSync(path.join(server.slotSavePath, filename))) {
+      debugLocalLlama("llama.slot.restore.start", {
+        ...localLlamaServerDebugSummary(server),
+        cache: slotCacheDebugSummary(server, normalizedKey),
+        wasDirty
+      });
       await this.slotAction(server.baseUrl, "restore", filename);
       server.activeSlotCacheKey = normalizedKey;
       server.activeSlotDirty = false;
+      debugLocalLlama("llama.slot.restore.done", {
+        ...localLlamaServerDebugSummary(server),
+        cache: slotCacheDebugSummary(server, normalizedKey)
+      });
       return "ready";
     }
     if (wasDirty) {
+      debugLocalLlama("llama.slot.restore.restart_required_dirty_unsaved", {
+        ...localLlamaServerDebugSummary(server),
+        cache: slotCacheDebugSummary(server, normalizedKey)
+      });
       return "restart_required";
     }
+    debugLocalLlama("llama.slot.restore.no_saved_slot", {
+      ...localLlamaServerDebugSummary(server),
+      cache: slotCacheDebugSummary(server, normalizedKey)
+    });
     return "ready";
   }
 
   private async saveSlotIfNeeded(server: ActiveServer, cacheKey?: string): Promise<void> {
     const normalizedKey = normalizeSlotCacheKey(cacheKey);
     if (!normalizedKey) {
+      debugLocalLlama("llama.slot.save.skip_no_key", localLlamaServerDebugSummary(server));
       return;
     }
+    debugLocalLlama("llama.slot.save.start", {
+      ...localLlamaServerDebugSummary(server),
+      cache: slotCacheDebugSummary(server, normalizedKey)
+    });
     await this.saveSlot(server, slotCacheFilename(server, normalizedKey));
     server.activeSlotCacheKey = normalizedKey;
     server.activeSlotDirty = false;
+    debugLocalLlama("llama.slot.save.done", {
+      ...localLlamaServerDebugSummary(server),
+      cache: slotCacheDebugSummary(server, normalizedKey)
+    });
   }
 
   private async saveSlot(server: ActiveServer, filename: string): Promise<void> {
@@ -589,6 +659,8 @@ export class LocalLlamaRuntime {
   private async slotAction(baseUrl: string, action: "save" | "restore", filename: string): Promise<void> {
     const abortController = new AbortController();
     const timer = setTimeout(() => abortController.abort(), 30_000);
+    const startedAt = Date.now();
+    debugLocalLlama("llama.slot.action.start", { baseUrl, action, filename });
     try {
       const response = await this.fetchImpl(`${baseUrl}/slots/0?action=${action}`, {
         method: "POST",
@@ -596,13 +668,32 @@ export class LocalLlamaRuntime {
         body: JSON.stringify({ filename }),
         signal: abortController.signal
       });
+      debugLocalLlama("llama.slot.action.response", { baseUrl, action, filename, elapsedMs: Date.now() - startedAt, status: response.status });
       if (!response.ok) {
         const body = await response.text().catch(() => "");
         throw new LocalLlamaRuntimeError(`Bundled llama-server slot ${action} failed (${response.status}): ${body || response.statusText}`);
       }
+    } catch (error) {
+      debugLocalLlamaError("llama.slot.action.error", error, { baseUrl, action, filename, elapsedMs: Date.now() - startedAt, aborted: abortController.signal.aborted });
+      throw error;
     } finally {
       clearTimeout(timer);
     }
+  }
+
+  private attachProcessLogging(process: ChildProcess, context: Record<string, unknown>): void {
+    debugLocalLlama("llama.process.spawn", { ...context, pid: process.pid });
+    attachLlamaOutputLogging(process.stdout, "stdout", context);
+    attachLlamaOutputLogging(process.stderr, "stderr", context);
+    process.once("error", (error) => {
+      debugLocalLlamaError("llama.process.error", error, { ...context, pid: process.pid });
+    });
+    process.once("exit", (code, signal) => {
+      debugLocalLlama("llama.process.exit", { ...context, pid: process.pid, code, signal });
+    });
+    process.once("close", (code, signal) => {
+      debugLocalLlama("llama.process.close", { ...context, pid: process.pid, code, signal });
+    });
   }
 
   private assertCurrentServerGeneration(startGeneration: number): void {
@@ -741,6 +832,150 @@ function normalizeSlotCacheKey(value: string | undefined): string {
 
 function slotCacheFilename(server: ActiveServer, cacheKey: string): string {
   return `${createHash("sha256").update(JSON.stringify({ server: server.key, cacheKey })).digest("hex")}.slot`;
+}
+
+function localLlamaServerDebugSummary(server: ActiveServer): Record<string, unknown> {
+  return {
+    baseUrl: server.baseUrl,
+    modelId: server.modelId,
+    modelPath: server.key.modelPath,
+    nCtx: server.key.nCtx,
+    nGpuLayers: server.key.nGpuLayers,
+    nativeGptOss: server.key.nativeGptOss,
+    parallelSlots: server.key.parallelSlots,
+    slotSavePath: server.slotSavePath,
+    activeSlotCacheKeyHash: server.activeSlotCacheKey ? createHash("sha256").update(server.activeSlotCacheKey).digest("hex").slice(0, 16) : "",
+    activeSlotDirty: server.activeSlotDirty,
+    processExitCode: server.process.exitCode,
+    processPid: server.process.pid
+  };
+}
+
+function localLlamaSettingsDebugSummary(settings: ChatRuntimeSettings): Record<string, unknown> {
+  return {
+    nCtx: settings.nCtx,
+    nGpuLayers: settings.nGpuLayers,
+    maxTokens: settings.maxTokens,
+    temperature: settings.temperature,
+    repeatPenalty: settings.repeatPenalty,
+    reasoningEffort: settings.reasoningEffort,
+    trimReserveTokens: settings.trimReserveTokens,
+    trimReservePercent: settings.trimReservePercent,
+    trimAmountTokens: settings.trimAmountTokens,
+    trimAmountPercent: settings.trimAmountPercent,
+    systemPromptChars: settings.systemPrompt.length
+  };
+}
+
+function localLlamaProcessEnv(): NodeJS.ProcessEnv {
+  return {
+    ...process.env,
+    GGML_CUDA_DISABLE_GRAPHS: process.env.GGML_CUDA_DISABLE_GRAPHS ?? "1"
+  };
+}
+
+function slotCacheDebugSummary(server: ActiveServer, cacheKey: string): Record<string, unknown> {
+  const filename = slotCacheFilename(server, cacheKey);
+  return {
+    cacheKeyHash: createHash("sha256").update(cacheKey).digest("hex").slice(0, 16),
+    filename,
+    exists: fs.existsSync(path.join(server.slotSavePath, filename))
+  };
+}
+
+function attachLlamaOutputLogging(stream: NodeJS.ReadableStream | null | undefined, streamName: "stdout" | "stderr", context: Record<string, unknown>): void {
+  if (!stream || typeof stream.on !== "function") {
+    debugLocalLlama("llama.process.stream.unavailable", { ...context, stream: streamName });
+    return;
+  }
+  let buffer = "";
+  stream.on("data", (chunk: unknown) => {
+    buffer += Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk);
+    const lines = buffer.split(/\r?\n/u);
+    buffer = lines.pop() ?? "";
+    for (const line of lines) {
+      logLlamaOutputLine(streamName, line, context);
+    }
+  });
+  stream.on("end", () => {
+    if (buffer) {
+      logLlamaOutputLine(streamName, buffer, context);
+      buffer = "";
+    }
+    debugLocalLlama("llama.process.stream.end", { ...context, stream: streamName });
+  });
+  stream.on("error", (error) => {
+    debugLocalLlamaError("llama.process.stream.error", error, { ...context, stream: streamName });
+  });
+}
+
+function logLlamaOutputLine(streamName: "stdout" | "stderr", line: string, context: Record<string, unknown>): void {
+  const text = line.trimEnd();
+  if (!text) {
+    return;
+  }
+  debugLocalLlama("llama.process.output", { ...context, stream: streamName, line: text });
+}
+
+function debugLocalLlama(label: string, data: unknown): void {
+  try {
+    const logPath = localLlamaDebugLogPath();
+    fs.mkdirSync(path.dirname(logPath), { recursive: true });
+    fs.appendFileSync(logPath, `${JSON.stringify({ ts: new Date().toISOString(), label, data: boundedLocalLlamaDebugValue(data) })}\n`);
+  } catch {
+    return;
+  }
+}
+
+function debugLocalLlamaError(label: string, error: unknown, data: Record<string, unknown> = {}): void {
+  debugLocalLlama(label, {
+    ...data,
+    error: describeLocalLlamaError(error)
+  });
+}
+
+function localLlamaDebugLogPath(): string {
+  return process.env.UNIT0_LLAMA_DEBUG_LOG
+    || configuredLocalLlamaDebugLogPath
+    || path.join(process.env.UNIT0_DATA_DIR || process.cwd(), "logs", "local-llama-debug.log");
+}
+
+function describeLocalLlamaError(error: unknown, depth = 0): unknown {
+  if (!(error instanceof Error)) {
+    return error;
+  }
+  const record = error as Error & { code?: unknown; cause?: unknown; errno?: unknown; syscall?: unknown; address?: unknown; port?: unknown };
+  return {
+    name: error.name,
+    message: error.message,
+    code: record.code,
+    errno: record.errno,
+    syscall: record.syscall,
+    address: record.address,
+    port: record.port,
+    stack: error.stack?.split(/\r?\n/u).slice(0, 8).join("\n"),
+    cause: record.cause && depth < 3 ? describeLocalLlamaError(record.cause, depth + 1) : undefined
+  };
+}
+
+function boundedLocalLlamaDebugValue(value: unknown, depth = 0): unknown {
+  if (typeof value === "string") {
+    return value.length > 4000 ? `${value.slice(0, 4000)}...[${value.length - 4000} chars truncated]` : value;
+  }
+  if (typeof value !== "object" || value === null) {
+    return value;
+  }
+  if (depth >= 4) {
+    return "[object truncated]";
+  }
+  if (Array.isArray(value)) {
+    return value.slice(0, 40).map((item) => boundedLocalLlamaDebugValue(item, depth + 1));
+  }
+  const output: Record<string, unknown> = {};
+  for (const [key, item] of Object.entries(value).slice(0, 60)) {
+    output[key] = boundedLocalLlamaDebugValue(item, depth + 1);
+  }
+  return output;
 }
 
 function extractText(value: unknown): string {
@@ -1142,10 +1377,21 @@ function appendCommentaryToolCallJson(toolRecipient: string, text: string, conte
       toolCalls?.push(toolCall);
       return;
     }
-  } catch {
-    throw new Error("GPT-OSS emitted malformed tool-call JSON.");
+  } catch (error) {
+    const payload = { tool: toolRecipient, __unit0_tool_call_error: `malformed tool-call JSON (${localLlamaErrorMessage(error)})`, raw: normalized };
+    const toolCall = `<tool_call>${JSON.stringify(payload)}</tool_call>`;
+    content.push(toolCall);
+    toolCalls?.push(toolCall);
+    return;
   }
-  throw new Error("GPT-OSS emitted malformed tool-call JSON.");
+  const payload = { tool: toolRecipient, __unit0_tool_call_error: "tool call must be a JSON object", raw: normalized };
+  const toolCall = `<tool_call>${JSON.stringify(payload)}</tool_call>`;
+  content.push(toolCall);
+  toolCalls?.push(toolCall);
+}
+
+function localLlamaErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function sleep(ms: number): Promise<void> {

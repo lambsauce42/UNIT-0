@@ -84,7 +84,7 @@ import { TerminalManager } from "./terminalManager.js";
 import { BrowserViewManager } from "./browserViewManager.js";
 import { ChatStore } from "./chatStore.js";
 import { ChatService } from "./chatService.js";
-import { LocalLlamaRuntime } from "./localLlamaRuntime.js";
+import { configureLocalLlamaDebugLogPath, LocalLlamaRuntime } from "./localLlamaRuntime.js";
 import { RemoteHostRuntime } from "./remoteHostRuntime.js";
 import { CodexAppServerRuntime, MockCodexRuntime } from "./codexRuntime.js";
 import { configureOpenCodeDebugLogPath } from "./openCodeRuntime.js";
@@ -839,6 +839,7 @@ const defaultFileViewerRoot = path.resolve(process.cwd());
 function workspaceDatabasePath(): string {
   const dataDir = process.env.UNIT0_DATA_DIR ?? (app.isPackaged ? path.join(path.dirname(app.getPath("exe")), "Unit 0 Data") : app.getPath("userData"));
   configureOpenCodeDebugLogPath(path.join(dataDir, "logs", "opencode-debug.log"));
+  configureLocalLlamaDebugLogPath(path.join(dataDir, "logs", "local-llama-debug.log"));
   return path.join(dataDir, "unit0.sqlite");
 }
 
