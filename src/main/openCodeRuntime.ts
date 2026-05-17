@@ -11,7 +11,7 @@ import { GptOssChannelParser, renderGptOssOpenCodeSystemPrompt, type GptOssChann
 const requireFromOpenCodeRuntime = createRequire(__filename);
 const OPENCODE_PROVIDER_ID = "unit0-local";
 const OPENCODE_MODEL_ID = "unit0-model";
-const OPENCODE_DEBUG_LOG = process.env.UNIT0_OPENCODE_DEBUG_LOG;
+let configuredOpenCodeDebugLogPath = "";
 const OPENCODE_MIN_COMPLETION_TOKENS = 64;
 const OPENCODE_FINAL_CONTINUATION_PREFIX = "<|start|>assistant<|channel|>final<|message|>";
 const OPENCODE_FINAL_CONTINUATION_MARKER = `<|end|>${OPENCODE_FINAL_CONTINUATION_PREFIX}`;
@@ -185,6 +185,10 @@ export interface OpenCodeRuntime {
   close(): void;
 }
 
+export function configureOpenCodeDebugLogPath(logPath: string): void {
+  configuredOpenCodeDebugLogPath = logPath;
+}
+
 export class RealOpenCodeRuntime implements OpenCodeRuntime {
   private activeAbortController: AbortController | null = null;
   private activeSessionId = "";
@@ -293,6 +297,7 @@ export class RealOpenCodeRuntime implements OpenCodeRuntime {
     const releaseTurn = await this.acquireTurnLock();
     const abortController = new AbortController();
     this.activeAbortController = abortController;
+    const turnId = randomUUID();
     let server: OpenCodeServer | null = null;
     let eventStream: Promise<void> | null = null;
     const eventQueue = new AsyncEventQueue();
@@ -303,10 +308,28 @@ export class RealOpenCodeRuntime implements OpenCodeRuntime {
     const harmonyStates = new Map<string, OpenCodeHarmonyState>();
     const normalizeGptOss = options.nativeGptOss;
     const onAbort = () => eventQueue.push({ kind: "stream.closed" });
+    const eventCounts = new Map<string, number>();
+    let sawTurnCompleted = false;
+    let sawTerminalError = false;
+    let sawAnyTurnEvent = false;
+    const recordEvent = (event: OpenCodeRuntimeEvent) => {
+      eventCounts.set(event.type, (eventCounts.get(event.type) ?? 0) + 1);
+    };
     try {
       if (this.closed) {
         throw new Error("OpenCode runtime is closed.");
       }
+      debugOpenCode("opencode.turn.start", {
+        turnId,
+        cwd: options.cwd,
+        hasExistingSession: Boolean(sessionId),
+        modelLabel: options.modelLabel,
+        nativeGptOss: options.nativeGptOss,
+        permissionMode: options.permissionMode,
+        endpoint: openCodeEndpointDebugSummary(options.endpoint),
+        settings: openCodeSettingsDebugSummary(options.settings),
+        promptChars: options.prompt.length
+      });
       const cached = await this.openCodeServer(options, eventQueue, abortController.signal);
       server = cached.server;
       providerEndpoint = cached.providerEndpoint;
@@ -315,14 +338,15 @@ export class RealOpenCodeRuntime implements OpenCodeRuntime {
       this.activeCwd = options.cwd;
       if (!sessionId) {
         const sessionStartedAt = Date.now();
-        debugOpenCode("opencode.session.create.start", {});
+        debugOpenCode("opencode.session.create.start", { turnId, serverUrl: server.url });
         const session = await openCodeJson<{ id?: string }>(server.url, "/session", {
           method: "POST",
           cwd: options.cwd,
           body: { title: options.prompt.slice(0, 80) || "OpenCode session" },
-          signal: abortController.signal
+          signal: abortController.signal,
+          diagnostics: { turnId, label: "session.create" }
         });
-        debugOpenCode("opencode.session.create.done", { elapsedMs: Date.now() - sessionStartedAt });
+        debugOpenCode("opencode.session.create.done", { elapsedMs: Date.now() - sessionStartedAt, turnId });
         sessionId = String(session.id ?? "");
         if (!sessionId) {
           throw new Error("OpenCode did not return a session id.");
@@ -330,9 +354,15 @@ export class RealOpenCodeRuntime implements OpenCodeRuntime {
       }
       this.activeSessionId = sessionId;
       abortController.signal.addEventListener("abort", onAbort, { once: true });
-      const eventReader = readOpenCodeEvents(server.url, options.cwd, abortController.signal, (event) => {
+      const eventReader = readOpenCodeEvents(server.url, options.cwd, abortController.signal, { turnId, sessionId }, (event) => {
         const eventSessionId = eventSessionIdOf(event);
         if (eventSessionId && eventSessionId !== sessionId) {
+          debugOpenCode("opencode.event.ignored_session", {
+            turnId,
+            expectedSessionId: sessionId,
+            eventSessionId,
+            eventType: event.type
+          });
           return;
         }
         if (event.type === "session.started") {
@@ -356,24 +386,29 @@ export class RealOpenCodeRuntime implements OpenCodeRuntime {
           }
         }
         for (const normalizedEvent of normalizeOpenCodeHarmonyEvent(event, harmonyStates, normalizeGptOss, providerEndpoint?.markerSecret)) {
+          recordEvent(normalizedEvent);
           eventQueue.push({ kind: "event", event: normalizedEvent });
         }
       }, (message, details) => {
+        debugOpenCode("opencode.event.normalization_error", { turnId, sessionId, message, details });
         eventQueue.push({ kind: "event", event: { type: "error", message, details } });
       });
       eventStream = eventReader.done.then(() => eventQueue.push({ kind: "stream.closed" }), (error) => {
         if (!abortController.signal.aborted) {
+          debugOpenCodeError("opencode.event.stream.error", error, { turnId, sessionId });
           eventQueue.push({ kind: "error", error: error instanceof Error ? error : new Error(String(error)) });
         } else {
+          debugOpenCode("opencode.event.stream.aborted", { turnId, sessionId });
           eventQueue.push({ kind: "stream.closed" });
         }
       });
       const eventConnectedStartedAt = Date.now();
       await eventReader.connected;
-      debugOpenCode("opencode.event.connected", { elapsedMs: Date.now() - eventConnectedStartedAt });
+      debugOpenCode("opencode.event.connected", { elapsedMs: Date.now() - eventConnectedStartedAt, turnId, sessionId });
+      recordEvent({ type: "session.started", sessionId });
       yield { type: "session.started", sessionId };
       const promptAsyncStartedAt = Date.now();
-      debugOpenCode("opencode.prompt_async.start", {});
+      debugOpenCode("opencode.prompt_async.start", { turnId, sessionId });
       await openCodeJson<void>(server.url, `/session/${encodeURIComponent(sessionId)}/prompt_async`, {
         method: "POST",
         cwd: options.cwd,
@@ -384,39 +419,42 @@ export class RealOpenCodeRuntime implements OpenCodeRuntime {
           parts: [{ type: "text", text: openCodePrompt(options) }]
         },
         signal: abortController.signal,
-          emptyOk: true
+        emptyOk: true,
+        diagnostics: { turnId, sessionId, label: "prompt_async" }
         });
-      debugOpenCode("opencode.prompt_async.done", { elapsedMs: Date.now() - promptAsyncStartedAt });
-      let sawTurnCompleted = false;
-      let sawTerminalError = false;
+      debugOpenCode("opencode.prompt_async.done", { elapsedMs: Date.now() - promptAsyncStartedAt, turnId, sessionId });
       const consumeQueuedEvent = (queued: QueuedOpenCodeEvent): OpenCodeRuntimeEvent | null => {
         if (queued.kind === "stream.closed") {
+          debugOpenCode("opencode.queue.stream_closed", { turnId, sessionId, sawTurnCompleted, sawAnyTurnEvent });
           if (sawTurnCompleted) {
             return null;
           }
           throw new Error("OpenCode event stream closed before turn completion.");
         }
         if (queued.kind === "error") {
+          debugOpenCodeError("opencode.queue.error", queued.error, { turnId, sessionId, sawAnyTurnEvent });
           throw queued.error;
         }
         const event = queued.event.type === "context.updated" && !queued.event.sessionId
           ? { ...queued.event, sessionId }
           : queued.event;
         if (!isSessionScopedEvent(event, sessionId)) {
+          debugOpenCode("opencode.queue.ignored_unscoped", { turnId, sessionId, eventType: event.type, eventSessionId: eventSessionIdOf(event) });
           return null;
         }
         if (event.type === "error") {
           sawTurnCompleted = true;
           sawTerminalError = true;
+          debugOpenCode("opencode.queue.terminal_error", { turnId, sessionId, message: event.message, details: event.details });
           return event;
         }
         if (event.type === "turn.completed") {
           sawTurnCompleted = true;
+          debugOpenCode("opencode.queue.turn_completed", { turnId, sessionId });
           return null;
         }
         return event;
       };
-      let sawAnyTurnEvent = false;
       while (!sawTurnCompleted) {
         const next = await eventQueue.shift(
           sawAnyTurnEvent ? undefined : openCodeEventIdleTimeoutMs(),
@@ -442,17 +480,58 @@ export class RealOpenCodeRuntime implements OpenCodeRuntime {
         ? await openCodeJson<{ info?: unknown; parts?: OpenCodePart[] }>(server.url, `/session/${encodeURIComponent(sessionId)}/message/${encodeURIComponent(latestAssistantMessageId)}`, {
           method: "GET",
           cwd: options.cwd,
-          signal: abortController.signal
-        }).catch(() => null)
+          signal: abortController.signal,
+          diagnostics: { turnId, sessionId, label: "message.snapshot" }
+        }).catch((error) => {
+          debugOpenCodeError("opencode.snapshot.fetch_ignored_error", error, { turnId, sessionId, latestAssistantMessageId });
+          return null;
+        })
         : null;
       if (snapshot?.parts) {
-        yield finalSnapshotEvent(snapshot.parts, normalizeGptOss, latestAssistantMessageId);
+        const snapshotEvent = finalSnapshotEvent(snapshot.parts, normalizeGptOss, latestAssistantMessageId);
+        recordEvent(snapshotEvent);
+        yield snapshotEvent;
       }
       completedNormally = true;
-      yield { type: "turn.completed" };
+      const completedEvent: OpenCodeRuntimeEvent = { type: "turn.completed" };
+      recordEvent(completedEvent);
+      yield completedEvent;
       abortController.abort();
       await eventStream.catch(() => undefined);
+      debugOpenCode("opencode.turn.done", {
+        turnId,
+        sessionId,
+        completedNormally,
+        sawAnyTurnEvent,
+        sawTurnCompleted,
+        sawTerminalError,
+        latestAssistantMessageId,
+        eventCounts: Object.fromEntries(eventCounts)
+      });
+    } catch (error) {
+      debugOpenCodeError("opencode.turn.error", error, {
+        turnId,
+        sessionId,
+        serverUrl: server?.url,
+        serverPid: server?.process.pid,
+        completedNormally,
+        sawAnyTurnEvent,
+        sawTurnCompleted,
+        sawTerminalError,
+        latestAssistantMessageId,
+        eventCounts: Object.fromEntries(eventCounts)
+      });
+      throw error;
     } finally {
+      debugOpenCode("opencode.turn.cleanup.start", {
+        turnId,
+        sessionId,
+        completedNormally,
+        hasServer: Boolean(server),
+        cachedServerSame: Boolean(server && this.cachedServer?.server === server),
+        cachedProviderSame: Boolean(providerEndpoint && this.cachedServer?.providerEndpoint === providerEndpoint),
+        abortSignalAborted: abortController.signal.aborted
+      });
       abortController.abort();
       await eventStream?.catch(() => undefined);
       if (this.activeAbortController === abortController) {
@@ -480,6 +559,7 @@ export class RealOpenCodeRuntime implements OpenCodeRuntime {
         this.activeServer = null;
       }
       abortController.signal.removeEventListener("abort", onAbort);
+      debugOpenCode("opencode.turn.cleanup.done", { turnId, sessionId, completedNormally });
       releaseTurn();
     }
   }
@@ -518,17 +598,32 @@ export class RealOpenCodeRuntime implements OpenCodeRuntime {
   }
 
   cancelActiveRequest(): void {
+    debugOpenCode("opencode.runtime.cancel", {
+      activeServerUrl: this.activeServerUrl,
+      activeSessionId: this.activeSessionId,
+      activeCwd: this.activeCwd,
+      hasActiveAbortController: Boolean(this.activeAbortController)
+    });
     if (this.activeServerUrl && this.activeSessionId) {
       void openCodeJson<boolean>(this.activeServerUrl, `/session/${encodeURIComponent(this.activeSessionId)}/abort`, {
         method: "POST",
         cwd: this.activeCwd,
-        emptyOk: true
+        emptyOk: true,
+        diagnostics: { sessionId: this.activeSessionId, label: "session.abort" }
       }).catch(() => undefined);
     }
     this.activeAbortController?.abort();
   }
 
   close(): void {
+    debugOpenCode("opencode.runtime.close", {
+      activeServerUrl: this.activeServerUrl,
+      activeSessionId: this.activeSessionId,
+      hasCachedServer: Boolean(this.cachedServer),
+      hasActiveServer: Boolean(this.activeServer),
+      pendingPermissions: this.pendingPermissions.size,
+      pendingQuestions: this.pendingQuestions.size
+    });
     this.closed = true;
     this.cancelActiveRequest();
     this.activeWarmAbortController?.abort();
@@ -663,7 +758,22 @@ function openCodePrompt(options: OpenCodeRunOptions): string {
 
 function openCodePermissions(permissionMode: ChatPermissionMode): unknown {
   if (permissionMode === "full_access") {
-    return "allow";
+    return {
+      read: "allow",
+      edit: "allow",
+      glob: "allow",
+      grep: "allow",
+      list: "allow",
+      todowrite: "allow",
+      skill: "allow",
+      lsp: "allow",
+      doom_loop: "allow",
+      bash: "allow",
+      external_directory: "allow",
+      webfetch: "allow",
+      websearch: "allow",
+      question: "allow"
+    };
   }
   return {
     read: "allow",
@@ -672,7 +782,6 @@ function openCodePermissions(permissionMode: ChatPermissionMode): unknown {
     grep: "allow",
     list: "allow",
     todowrite: "allow",
-    task: "allow",
     skill: "allow",
     lsp: "allow",
     doom_loop: "ask",
@@ -687,6 +796,7 @@ function openCodePermissions(permissionMode: ChatPermissionMode): unknown {
 async function startOpenCodeServer(options: { config: OpenCodeConfig; signal: AbortSignal }): Promise<OpenCodeServer> {
   const port = await reserveLocalPort();
   const command = resolveOpenCodeBinary();
+  debugOpenCode("opencode.server.spawn.start", { command, port });
   const server = spawn(command, ["serve", "--hostname=127.0.0.1", `--port=${port}`], {
     env: {
       ...process.env,
@@ -694,6 +804,13 @@ async function startOpenCodeServer(options: { config: OpenCodeConfig; signal: Ab
     },
     windowsHide: true,
     stdio: ["ignore", "pipe", "pipe"]
+  });
+  debugOpenCode("opencode.server.spawn.done", { command, port, pid: server.pid });
+  server.once("exit", (code, signal) => {
+    debugOpenCode("opencode.server.process.exit", { pid: server.pid, code, signal });
+  });
+  server.once("error", (error) => {
+    debugOpenCodeError("opencode.server.process.error", error, { pid: server.pid, port });
   });
   const url = await waitForOpenCodeServer(server, port, options.signal);
   return { url, process: server };
@@ -790,7 +907,7 @@ async function handleGptOssOpenCodeProxyRequest(
     return;
   }
   const body = await readJsonRequestBody(request);
-  const debugRequestSummary = OPENCODE_DEBUG_LOG ? openCodeProxyRequestSummary(body) : null;
+  const debugRequestSummary = openCodeDebugLogPath() ? openCodeProxyRequestSummary(body) : null;
   debugOpenCode("proxy.chat.body", debugRequestSummary);
   debugOpenCode("proxy.tools.completed_emit.start", debugRequestSummary);
   emitCompletedOpenCodeProxyToolEvents(body, toolSink);
@@ -858,8 +975,17 @@ async function handleGptOssOpenCodeProxyRequest(
         repeat_penalty: options.settings.repeatPenalty,
         n_predict: nPredict,
         cache_prompt: true,
-        id_slot: options.endpoint.rawCompletionSlotId ?? 0
+        id_slot: options.endpoint.rawCompletionSlotId ?? 0,
+        stop: ["<|return|>"]
       })
+    }).catch((error) => {
+      debugOpenCodeError("proxy.raw_completion.fetch.error", error, {
+        elapsedMs: Date.now() - upstreamStartedAt,
+        url: options.endpoint.rawCompletionUrl,
+        aborted: upstreamAbortController.signal.aborted,
+        parentAborted: request.destroyed
+      });
+      throw error;
     }).finally(() => clearTimeout(providerTimeout));
     debugOpenCode("proxy.raw_completion.response_headers", { elapsedMs: Date.now() - upstreamStartedAt });
     if (!upstream.ok || !upstream.body) {
@@ -944,6 +1070,13 @@ async function countGptOssOpenCodePromptTokens(options: OpenCodeRunOptions, prom
         with_pieces: false
       })
     }).catch((error) => {
+      debugOpenCodeError("proxy.tokenize.fetch.error", error, {
+        elapsedMs: Date.now() - startedAt,
+        tokenizeUrl,
+        timeoutAborted: timeoutController.signal.aborted,
+        parentAborted: signal.aborted,
+        contentChars: prompt.length
+      });
       if (timeoutController.signal.aborted && !signal.aborted) {
         throw new Error("OpenCode GPT-OSS tokenizer did not respond before the idle timeout.");
       }
@@ -975,7 +1108,7 @@ async function streamGptOssOpenCodeProxyResponse(
   stream: boolean,
   continueToFinal: (generatedText: string) => Promise<ReadableStream<Uint8Array>>
 ): Promise<void> {
-  let parser = new GptOssChannelParser({ defaultChannel: "analysis", toolRecipients });
+  let parser = new GptOssChannelParser({ defaultChannel: "analysis", toolRecipients, stopAfterFinalEnd: true });
   let rawGeneratedText = "";
   let content = "";
   const markerState = { sentAnalysis: false, sentCommentary: false, sentFinal: false, sentToolCompletion: false };
@@ -1003,6 +1136,9 @@ async function streamGptOssOpenCodeProxyResponse(
   }
   const applyParsedDelta = (delta: GptOssChannelParserResult) => {
     if (delta.reasoning) {
+      if (markerState.sentFinal) {
+        throw new Error("OpenCode GPT-OSS emitted reasoning after final output.");
+      }
       const prefix = markerState.sentAnalysis ? "" : "[[UNIT0_ANALYSIS]]";
       markerState.sentAnalysis = true;
       toolSink.sawReasoning = true;
@@ -1049,7 +1185,7 @@ async function streamGptOssOpenCodeProxyResponse(
   };
   await consumeBody(body);
   for (let continuationAttempts = 0; continuationAttempts < 4 && sawReasoning && !sawCommentaryContent && !sawFinalContent && !finishedWithToolCall; continuationAttempts += 1) {
-    parser = new GptOssChannelParser({ defaultChannel: "final", toolRecipients });
+    parser = new GptOssChannelParser({ defaultChannel: "final", toolRecipients, stopAfterFinalEnd: true });
     await consumeBody(await continueToFinal(rawGeneratedText));
   }
   if (toolCallFinishPending) {
@@ -1099,6 +1235,9 @@ function writeOpenCodeProxyContentOrToolDelta(
 ): { toolCall: boolean } {
   const toolCall = allowToolCall ? parseOpenCodeToolCallContent(content, toolRecipients) : null;
   if (toolCall) {
+    if (markerState.sentFinal) {
+      throw new Error("OpenCode GPT-OSS emitted a tool call after final output.");
+    }
     const callId = `call_${randomUUID().replace(/-/g, "")}`;
     const record = {
       id: callId,
@@ -1299,10 +1438,12 @@ export function renderGptOssOpenCodeProxyPrompt(body: unknown, options: OpenCode
     }
     if (role === "assistant") {
       parts.push(...renderOpenCodeProxyAssistantTranscript(message, content));
-    } else if (role === "tool") {
-      parts.push({ kind: "toolResult", content });
+    } else if (role === "tool" || isOpenCodeHostToolResultContent(content)) {
+      parts.push({ kind: "toolResult", content: sanitizeOpenCodeProxyToolResultContent(content) });
+    } else if (role === "system") {
+      continue;
     } else {
-      parts.push(`<|start|>${role === "system" ? "developer" : "user"}<|message|>${escapeGptOssTranscriptText(content)}<|end|>`);
+      parts.push(`<|start|>user<|message|>${escapeGptOssTranscriptText(content)}<|end|>`);
     }
   }
   parts.push("<|start|>assistant");
@@ -1367,6 +1508,17 @@ function fitOpenCodeToolResultContent(content: string, maxCharacters: number): s
   return `${content.slice(0, headLength)}${marker}${content.slice(content.length - tailLength)}`;
 }
 
+function isOpenCodeHostToolResultContent(content: string): boolean {
+  return /Full output saved to:/u.test(content) && /The tool call succeeded but the output was truncated/u.test(content);
+}
+
+function sanitizeOpenCodeProxyToolResultContent(content: string): string {
+  return content
+    .split(/\r?\n/u)
+    .filter((line) => !/^\s*Use the Task tool\b/iu.test(line))
+    .join("\n");
+}
+
 function renderOpenCodeProxyToolInstructions(body: unknown): string {
   const tools = openCodeProxyToolDefinitions(body);
   if (tools.length === 0) {
@@ -1404,7 +1556,7 @@ function openCodeProxyToolDefinitions(body: unknown): Array<{ name: string; desc
     }
     const fn = isRecord(tool.function) ? tool.function : tool;
     const name = typeof fn.name === "string" ? fn.name.trim() : "";
-    if (!name) {
+    if (!name || isDisabledOpenCodeProxyToolName(name)) {
       continue;
     }
     tools.push({
@@ -1440,11 +1592,15 @@ function renderOpenCodeProxyAssistantTranscript(message: Record<string, unknown>
     const fn = isRecord(toolCall.function) ? toolCall.function : {};
     const name = typeof fn.name === "string" ? fn.name.trim() : "";
     const args = typeof fn.arguments === "string" ? fn.arguments : "";
-    if (name) {
+    if (name && !isDisabledOpenCodeProxyToolName(name)) {
       parts.push(`<|start|>assistant<|channel|>commentary to=${name} code<|message|>${escapeGptOssTranscriptText(args || "{}")}<|call|>`);
     }
   }
   return parts;
+}
+
+function isDisabledOpenCodeProxyToolName(name: string): boolean {
+  return name.trim().toLowerCase() === "task";
 }
 
 function openCodeProxyMessageContent(value: unknown): string {
@@ -1462,7 +1618,7 @@ function openCodeProxyRequestSummary(body: unknown): Record<string, unknown> {
     return { type: typeof body };
   }
   const messages = Array.isArray(body.messages) ? body.messages : [];
-  const tools = Array.isArray(body.tools) ? body.tools : [];
+  const tools = openCodeProxyToolDefinitions(body);
   return {
     model: typeof body.model === "string" ? body.model : undefined,
     stream: body.stream,
@@ -1470,7 +1626,8 @@ function openCodeProxyRequestSummary(body: unknown): Record<string, unknown> {
     messageCount: messages.length,
     messageRoles: messages.map((message) => isRecord(message) ? String(message.role ?? "") : "").filter(Boolean),
     messageContentChars: messages.map((message) => isRecord(message) ? openCodeProxyMessageContent(message.content).length : 0),
-    toolCount: tools.length
+    toolCount: tools.length,
+    toolNames: tools.map((tool) => tool.name)
   };
 }
 
@@ -1480,6 +1637,32 @@ function escapeGptOssTranscriptText(text: string): string {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function openCodeEndpointDebugSummary(endpoint: LocalLlamaOpenAiEndpoint): Record<string, unknown> {
+  return {
+    baseUrl: endpoint.baseUrl,
+    modelId: endpoint.modelId,
+    rawCompletionUrl: endpoint.rawCompletionUrl,
+    rawCompletionSlotId: endpoint.rawCompletionSlotId,
+    tokenizeUrl: endpoint.tokenizeUrl
+  };
+}
+
+function openCodeSettingsDebugSummary(settings: ChatRuntimeSettings): Record<string, unknown> {
+  return {
+    nCtx: settings.nCtx,
+    nGpuLayers: settings.nGpuLayers,
+    maxTokens: settings.maxTokens,
+    temperature: settings.temperature,
+    repeatPenalty: settings.repeatPenalty,
+    reasoningEffort: settings.reasoningEffort,
+    trimReserveTokens: settings.trimReserveTokens,
+    trimReservePercent: settings.trimReservePercent,
+    trimAmountTokens: settings.trimAmountTokens,
+    trimAmountPercent: settings.trimAmountPercent,
+    systemPromptChars: settings.systemPrompt.length
+  };
 }
 
 function openCodeProviderIdleTimeoutMs(): number {
@@ -1562,6 +1745,7 @@ function waitForOpenCodeServer(server: ChildProcess, port: number, signal: Abort
   return new Promise((resolve, reject) => {
     let output = "";
     let settled = false;
+    const startedAt = Date.now();
     const cleanup = () => {
       clearTimeout(timer);
       signal.removeEventListener("abort", onAbort);
@@ -1579,16 +1763,20 @@ function waitForOpenCodeServer(server: ChildProcess, port: number, signal: Abort
       for (const line of output.split(/\r?\n/g)) {
         if (line.startsWith("opencode server listening")) {
           const match = /on\s+(https?:\/\/[^\s]+)/u.exec(line);
-          settle(() => resolve(match?.[1] ?? `http://127.0.0.1:${port}`));
+          const url = match?.[1] ?? `http://127.0.0.1:${port}`;
+          debugOpenCode("opencode.server.ready_line", { pid: server.pid, port, url, elapsedMs: Date.now() - startedAt });
+          settle(() => resolve(url));
           return;
         }
       }
     };
     const onAbort = () => {
+      debugOpenCode("opencode.server.startup.abort", { pid: server.pid, port, elapsedMs: Date.now() - startedAt });
       stopOpenCodeProcess(server);
       settle(() => reject(new Error("OpenCode server startup was cancelled.")));
     };
     const timer = setTimeout(() => {
+      debugOpenCode("opencode.server.startup.timeout", { pid: server.pid, port, elapsedMs: Date.now() - startedAt, output: output.trim() });
       stopOpenCodeProcess(server);
       settle(() => reject(new Error(`OpenCode server startup timed out.${output.trim() ? `\n${output.trim()}` : ""}`)));
     }, 30_000);
@@ -1596,8 +1784,14 @@ function waitForOpenCodeServer(server: ChildProcess, port: number, signal: Abort
     server.stderr?.on("data", (chunk) => {
       output += chunk.toString();
     });
-    server.on("error", (error) => settle(() => reject(error)));
-    server.on("exit", (code) => settle(() => reject(new Error(`OpenCode server exited during startup with code ${code}.${output.trim() ? `\n${output.trim()}` : ""}`))));
+    server.on("error", (error) => {
+      debugOpenCodeError("opencode.server.startup.process_error", error, { pid: server.pid, port, elapsedMs: Date.now() - startedAt });
+      settle(() => reject(error));
+    });
+    server.on("exit", (code, exitSignal) => {
+      debugOpenCode("opencode.server.startup.exit", { pid: server.pid, port, code, signal: exitSignal, elapsedMs: Date.now() - startedAt, output: output.trim() });
+      settle(() => reject(new Error(`OpenCode server exited during startup with code ${code}.${output.trim() ? `\n${output.trim()}` : ""}`)));
+    });
     signal.addEventListener("abort", onAbort, { once: true });
   });
 }
@@ -1606,6 +1800,7 @@ function readOpenCodeEvents(
   serverUrl: string,
   cwd: string,
   signal: AbortSignal,
+  diagnostics: { turnId?: string; sessionId?: string },
   onEvent: (event: OpenCodeRuntimeEvent) => void,
   onErrorEvent: (message: string, details?: string) => void
 ): OpenCodeEventReader {
@@ -1616,14 +1811,26 @@ function readOpenCodeEvents(
     rejectConnected = reject;
   });
   const done = (async () => {
+    const url = openCodeUrl(serverUrl, "/event", cwd);
+    const startedAt = Date.now();
     try {
-      const response = await fetch(openCodeUrl(serverUrl, "/event", cwd), {
+      debugOpenCode("opencode.event.fetch.start", { ...diagnostics, url });
+      const response = await fetch(url, {
         headers: { Accept: "text/event-stream" },
         signal
+      }).catch((error) => {
+        debugOpenCodeError("opencode.event.fetch.error", error, {
+          ...diagnostics,
+          url,
+          elapsedMs: Date.now() - startedAt,
+          aborted: signal.aborted
+        });
+        throw error;
       });
       if (!response.ok || !response.body) {
         throw new Error(`OpenCode event stream failed (${response.status}): ${response.statusText}`);
       }
+      debugOpenCode("opencode.event.fetch.response", { ...diagnostics, elapsedMs: Date.now() - startedAt, status: response.status });
       resolveConnected();
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
@@ -1660,7 +1867,9 @@ function readOpenCodeEvents(
           processChunk(chunk);
         }
       }
+      debugOpenCode("opencode.event.reader.done", { ...diagnostics, elapsedMs: Date.now() - startedAt, aborted: signal.aborted });
     } catch (error) {
+      debugOpenCodeError("opencode.event.reader.error", error, { ...diagnostics, elapsedMs: Date.now() - startedAt, aborted: signal.aborted });
       rejectConnected(error);
       throw error;
     }
@@ -2030,7 +2239,7 @@ export function normalizeOpenCodeHarmonyEvent(event: OpenCodeRuntimeEvent, state
     const parsed = parseDelimitedPlainOpenCodeText(state.rawText, markerSecret);
     if (parsed.malformed) {
       state.plainProtocolInvalid = true;
-      return [{ type: "error", message: "OpenCode GPT-OSS emitted malformed channel delimiters." }];
+      return openCodeMalformedChannelEvents(event, state);
     }
     state.sawPlainProtocolMarker = state.sawPlainProtocolMarker || parsed.hasMarker;
     if (state.rawText.includes("<|return|>")) {
@@ -2154,6 +2363,20 @@ function normalizeOpenCodeNativeReasoningEvent(event: Extract<OpenCodeRuntimeEve
     openCodeGlobalReasoningSeen(states).value = true;
   }
   return visibleText || replace ? [{ ...event, text: visibleText, replace: replace || undefined }] : [];
+}
+
+function openCodeMalformedChannelEvents(event: Extract<OpenCodeRuntimeEvent, { type: "assistant.delta" }>, state: OpenCodeHarmonyState): OpenCodeRuntimeEvent[] {
+  const events: OpenCodeRuntimeEvent[] = [];
+  if (state.streamedFlattenedContentLength > 0) {
+    state.streamedFlattenedContentLength = 0;
+    events.push({
+      ...event,
+      text: "",
+      replace: true
+    });
+  }
+  events.push({ type: "error", message: "OpenCode GPT-OSS emitted malformed channel delimiters." });
+  return events;
 }
 
 function normalizeParsedOpenCodeReasoningEvent(event: Extract<OpenCodeRuntimeEvent, { type: "reasoning.delta" }>, states: Map<string, OpenCodeHarmonyState>): OpenCodeRuntimeEvent | null {
@@ -2449,21 +2672,62 @@ async function openCodeJson<T>(serverUrl: string, route: string, options: {
   body?: unknown;
   signal?: AbortSignal;
   emptyOk?: boolean;
+  diagnostics?: { turnId?: string; sessionId?: string; label?: string };
 }): Promise<T> {
-  const response = await fetch(openCodeUrl(serverUrl, route, options.cwd), {
+  const url = openCodeUrl(serverUrl, route, options.cwd);
+  const startedAt = Date.now();
+  const requestSummary = {
+    ...options.diagnostics,
+    method: options.method,
+    route,
+    url,
+    hasBody: options.body !== undefined,
+    aborted: options.signal?.aborted ?? false
+  };
+  debugOpenCode("opencode.http.start", requestSummary);
+  const response = await fetch(url, {
     method: options.method,
     headers: options.body === undefined ? undefined : { "Content-Type": "application/json" },
     body: options.body === undefined ? undefined : JSON.stringify(options.body),
     signal: options.signal
+  }).catch((error) => {
+    debugOpenCodeError("opencode.http.fetch.error", error, {
+      ...requestSummary,
+      elapsedMs: Date.now() - startedAt,
+      aborted: options.signal?.aborted ?? false
+    });
+    throw error;
+  });
+  debugOpenCode("opencode.http.response", {
+    ...requestSummary,
+    elapsedMs: Date.now() - startedAt,
+    status: response.status,
+    ok: response.ok,
+    contentType: response.headers.get("content-type")
   });
   if (!response.ok) {
     const body = await response.text().catch(() => "");
+    debugOpenCode("opencode.http.non_ok", {
+      ...requestSummary,
+      elapsedMs: Date.now() - startedAt,
+      status: response.status,
+      body: body.slice(0, 2000)
+    });
     throw new Error(`OpenCode request failed (${response.status}): ${body || response.statusText}`);
   }
   if (response.status === 204 || !response.headers.get("content-type")?.includes("application/json")) {
     return undefined as T;
   }
-  return await response.json() as T;
+  try {
+    return await response.json() as T;
+  } catch (error) {
+    debugOpenCodeError("opencode.http.json.error", error, {
+      ...requestSummary,
+      elapsedMs: Date.now() - startedAt,
+      status: response.status
+    });
+    throw error;
+  }
 }
 
 function openCodeUrl(serverUrl: string, route: string, cwd: string): string {
@@ -2499,8 +2763,10 @@ function stopOpenCodeServer(server: OpenCodeServer): void {
 
 function stopOpenCodeProcess(child: ChildProcess): void {
   if (child.exitCode !== null || child.killed) {
+    debugOpenCode("opencode.server.stop.skip", { pid: child.pid, exitCode: child.exitCode, killed: child.killed });
     return;
   }
+  debugOpenCode("opencode.server.stop.start", { pid: child.pid, platform: process.platform });
   if (process.platform === "win32" && child.pid) {
     spawn("taskkill", ["/pid", String(child.pid), "/t", "/f"], { windowsHide: true, stdio: "ignore" });
     return;
@@ -2606,11 +2872,45 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+export function debugOpenCodeDiagnostic(label: string, data: unknown): void {
+  debugOpenCode(label, data);
+}
+
 function debugOpenCode(label: string, data: unknown): void {
-  if (!OPENCODE_DEBUG_LOG) {
-    return;
+  const logPath = openCodeDebugLogPath();
+  fs.mkdirSync(path.dirname(logPath), { recursive: true });
+  fs.appendFileSync(logPath, `${JSON.stringify({ ts: new Date().toISOString(), label, data: boundedDebugValue(data) })}\n`);
+}
+
+function debugOpenCodeError(label: string, error: unknown, data: Record<string, unknown> = {}): void {
+  debugOpenCode(label, {
+    ...data,
+    error: describeError(error)
+  });
+}
+
+function describeError(error: unknown, depth = 0): unknown {
+  if (!(error instanceof Error)) {
+    return error;
   }
-  fs.appendFileSync(OPENCODE_DEBUG_LOG, `${JSON.stringify({ ts: new Date().toISOString(), label, data: boundedDebugValue(data) })}\n`);
+  const record = error as Error & { code?: unknown; cause?: unknown; errno?: unknown; syscall?: unknown; address?: unknown; port?: unknown };
+  return {
+    name: error.name,
+    message: error.message,
+    code: record.code,
+    errno: record.errno,
+    syscall: record.syscall,
+    address: record.address,
+    port: record.port,
+    stack: error.stack?.split(/\r?\n/u).slice(0, 8).join("\n"),
+    cause: record.cause && depth < 3 ? describeError(record.cause, depth + 1) : undefined
+  };
+}
+
+function openCodeDebugLogPath(): string {
+  return process.env.UNIT0_OPENCODE_DEBUG_LOG
+    || configuredOpenCodeDebugLogPath
+    || path.join(process.env.UNIT0_DATA_DIR || process.cwd(), "logs", "opencode-debug.log");
 }
 
 function boundedDebugValue(value: unknown, depth = 0): unknown {

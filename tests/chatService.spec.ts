@@ -1543,6 +1543,43 @@ test("does not mine OpenCode answers from reasoning-channel text", async () => {
   }
 });
 
+test("clears partial OpenCode assistant content after GPT-OSS protocol errors", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-chat-opencode-protocol-error-clear-test-"));
+  const modelPath = path.join(dir, "model.gguf");
+  fs.writeFileSync(modelPath, "");
+  const store = new ChatStore(path.join(dir, "chat.sqlite"));
+  const openCodeRuntime = new ScriptedOpenCodeRuntime([[
+    { type: "reasoning.delta", id: "reasoning-1", status: "updated", text: "Need concise answer." },
+    { type: "assistant.delta", id: "assistant-1", status: "updated", text: "?We can end." },
+    { type: "error", message: "OpenCode GPT-OSS emitted reasoning after final output." }
+  ]]);
+  const service = new ChatService(store, new EndpointOnlyLlamaRuntime(), new RemoteHostRuntime(), new MockCodexRuntime(), () => undefined, new TestEmbeddingRuntime(), openCodeRuntime);
+  try {
+    let state = store.loadState();
+    store.updateProjectSettings(state.selectedProjectId, "OpenCode Protocol Error Clear Project", dir);
+    store.addLocalModel(modelPath);
+    state = store.loadState();
+    store.updateThreadSettings(state.selectedThreadId, {
+      builtinAgenticFramework: "opencode",
+      builtinModelId: state.selectedModelId
+    });
+
+    await service.submit({ text: "asdg" });
+    await expect.poll(() => service.state().generation.status).toBe("error");
+
+    state = store.loadState();
+    const assistant = state.messages.find((message) => message.role === "assistant");
+    expect(assistant?.content).toBe("");
+    expect(assistant?.reasoning).toBe("Need concise answer.");
+    expect(assistant?.status).toBe("error");
+    expect(assistant?.timelineBlocks?.some((block) => block.kind === "assistant_message")).toBe(false);
+    expect(assistant?.timelineBlocks?.some((block) => block.kind === "status" && block.code === "opencode_failed" && block.message.includes("reasoning after final output"))).toBe(true);
+  } finally {
+    service.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("maps OpenCode server permission events to Unit-0 approval blocks", () => {
   const errors: string[] = [];
   const events = Array.from(mapOpenCodeEvent({
@@ -3155,7 +3192,29 @@ test("surfaces malformed delimited OpenCode GPT-OSS streams as errors", () => {
   }, parsers);
 
   expect(first.some((event) => event.type === "assistant.delta")).toBe(true);
-  expect(second).toEqual([{ type: "error", message: "OpenCode GPT-OSS emitted malformed channel delimiters." }]);
+  expect(second).toEqual([
+    {
+      type: "assistant.delta",
+      id: "msg_bad_markers:prt_bad_markers",
+      status: "updated",
+      text: "",
+      replace: true,
+      sessionId: "ses_bad_markers"
+    },
+    { type: "error", message: "OpenCode GPT-OSS emitted malformed channel delimiters." }
+  ]);
+});
+
+test("does not emit assistant text when delimited OpenCode GPT-OSS content is already malformed", () => {
+  const events = normalizeOpenCodeHarmonyEvent({
+    type: "assistant.delta",
+    id: "msg_bad_markers_immediate:prt_bad_markers_immediate",
+    status: "updated",
+    sessionId: "ses_bad_markers_immediate",
+    text: "[[UNIT0_ANALYSIS]]think[[UNIT0_FINAL]]answer[[UNIT0_ANALYSIS]]more"
+  }, new Map());
+
+  expect(events).toEqual([{ type: "error", message: "OpenCode GPT-OSS emitted malformed channel delimiters." }]);
 });
 
 test("preserves multi-paragraph delimited GPT-OSS final snapshots", () => {

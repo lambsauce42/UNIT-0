@@ -3,7 +3,7 @@ import fs from "node:fs";
 import http, { type Server } from "node:http";
 import os from "node:os";
 import path from "node:path";
-import { gptOssOpenCodeRequestMaxTokensForPromptTokens, openCodeConfig, openCodeProxyBodyIncludesToolDefinitions, RealOpenCodeRuntime, renderGptOssOpenCodeProxyPrompt, shouldTrackOpenCodePendingApproval, type OpenCodeRuntimeEvent, type OpenCodeRunOptions } from "../src/main/openCodeRuntime";
+import { configureOpenCodeDebugLogPath, gptOssOpenCodeRequestMaxTokensForPromptTokens, mapOpenCodeEvent, openCodeConfig, openCodeProxyBodyIncludesToolDefinitions, RealOpenCodeRuntime, renderGptOssOpenCodeProxyPrompt, shouldTrackOpenCodePendingApproval, type OpenCodeRuntimeEvent, type OpenCodeRunOptions } from "../src/main/openCodeRuntime";
 import type { ChatRuntimeSettings } from "../src/shared/types";
 
 const baseSettings: ChatRuntimeSettings = {
@@ -39,7 +39,16 @@ test("OpenCode config maps Unit-0 full access to OpenCode web permissions", () =
     settings: baseSettings,
     permissionMode: "full_access"
   });
-  expect(fullAccess.permission).toBe("allow");
+  expect(fullAccess.permission).toMatchObject({
+    bash: "allow",
+    doom_loop: "allow",
+    external_directory: "allow",
+    lsp: "allow",
+    skill: "allow",
+    webfetch: "allow",
+    websearch: "allow"
+  });
+  expect(JSON.stringify(fullAccess.permission)).not.toContain("\"task\"");
 
   const defaultPermissions = openCodeConfig({
     cwd: "C:\\Project",
@@ -59,12 +68,33 @@ test("OpenCode config maps Unit-0 full access to OpenCode web permissions", () =
     webfetch: "ask",
     websearch: "ask"
   });
+  expect(JSON.stringify(defaultPermissions.permission)).not.toContain("\"task\"");
 });
 
-test("OpenCode context usage reports tool definitions only when the actual proxy body includes tools", () => {
+test("OpenCode context usage reports only enabled local proxy tool definitions", () => {
   expect(openCodeProxyBodyIncludesToolDefinitions({ messages: [{ role: "user", content: "hi" }] })).toBe(false);
   expect(openCodeProxyBodyIncludesToolDefinitions({
     tools: [
+      {
+        type: "function",
+        function: {
+          name: "task",
+          description: "Spawn a subagent",
+          parameters: { type: "object", properties: {} }
+        }
+      }
+    ]
+  })).toBe(false);
+  expect(openCodeProxyBodyIncludesToolDefinitions({
+    tools: [
+      {
+        type: "function",
+        function: {
+          name: "task",
+          description: "Spawn a subagent",
+          parameters: { type: "object", properties: {} }
+        }
+      },
       {
         type: "function",
         function: {
@@ -75,6 +105,53 @@ test("OpenCode context usage reports tool definitions only when the actual proxy
       }
     ]
   })).toBe(true);
+});
+
+test("OpenCode GPT-OSS proxy strips subagent task tool exposure from local prompts", () => {
+  const prompt = renderGptOssOpenCodeProxyPrompt({
+    messages: [
+      { role: "system", content: "Use the task tool to spawn subagents for searches." },
+      { role: "user", content: "find the date" },
+      {
+        role: "user",
+        content: [
+          "Tool output:",
+          "important result",
+          "The tool call succeeded but the output was truncated. Full output saved to: C:\\Users\\Max\\.local\\share\\opencode\\tool-output\\tool_test",
+          "Use the Task tool to have explore agent process this file with Grep and Read (with offset/limit). Do NOT read the full file yourself - delegate to save context."
+        ].join("\n")
+      },
+      {
+        role: "assistant",
+        content: "[[UNIT0_ANALYSIS]]Need search.",
+        tool_calls: [{
+          id: "call_task",
+          type: "function",
+          function: { name: "task", arguments: "{\"description\":\"spawn subagent\"}" }
+        }]
+      }
+    ],
+    tools: [
+      { type: "function", function: { name: "task", description: "Spawn a subagent", parameters: { type: "object" } } },
+      { type: "function", function: { name: "grep", description: "Search files", parameters: { type: "object" } } }
+    ]
+  }, {
+    cwd: "C:\\Project",
+    prompt: "find the date",
+    modelLabel: "fake-gpt-oss",
+    nativeGptOss: true,
+    endpoint: { baseUrl: "http://127.0.0.1:1234", modelId: "fake-gpt-oss" },
+    settings: baseSettings,
+    permissionMode: "full_access"
+  });
+
+  expect(prompt).toContain("\"name\":\"grep\"");
+  expect(prompt).toContain("# OpenCode Tool Result");
+  expect(prompt).toContain("important result");
+  expect(prompt).not.toContain("\"name\":\"task\"");
+  expect(prompt.toLowerCase()).not.toContain("subagent");
+  expect(prompt).not.toContain("to=task");
+  expect(prompt).not.toContain("Use the Task tool");
 });
 
 test("real OpenCode approval reply remains retryable after a failed POST", async () => {
@@ -122,6 +199,36 @@ test("OpenCode tracks only requested approval events as pending approvals", () =
 
   expect(shouldTrackOpenCodePendingApproval(requested)).toBe(true);
   expect(shouldTrackOpenCodePendingApproval(completed)).toBe(false);
+});
+
+test("OpenCode diagnostics write to the default data-dir log path", () => {
+  const previousEnvLog = process.env.UNIT0_OPENCODE_DEBUG_LOG;
+  const previousDataDir = process.env.UNIT0_DATA_DIR;
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-opencode-debug-path-"));
+  try {
+    delete process.env.UNIT0_OPENCODE_DEBUG_LOG;
+    process.env.UNIT0_DATA_DIR = dir;
+    configureOpenCodeDebugLogPath("");
+
+    Array.from(mapOpenCodeEvent({ type: "server.connected", properties: {} }, () => undefined));
+
+    const logPath = path.join(dir, "logs", "opencode-debug.log");
+    expect(fs.existsSync(logPath)).toBe(true);
+    expect(fs.readFileSync(logPath, "utf8")).toContain("\"label\":\"opencode.raw_event\"");
+  } finally {
+    configureOpenCodeDebugLogPath("");
+    if (previousEnvLog === undefined) {
+      delete process.env.UNIT0_OPENCODE_DEBUG_LOG;
+    } else {
+      process.env.UNIT0_OPENCODE_DEBUG_LOG = previousEnvLog;
+    }
+    if (previousDataDir === undefined) {
+      delete process.env.UNIT0_DATA_DIR;
+    } else {
+      process.env.UNIT0_DATA_DIR = previousDataDir;
+    }
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("real OpenCode GPT-OSS proxy rejects final-only output before rendering it", async () => {
@@ -345,6 +452,49 @@ test("real OpenCode GPT-OSS proxy streams valid final tokens before upstream com
     expect(events.find((event) => event.type === "final.snapshot")).toMatchObject({ type: "final.snapshot", content: "ok", strict: true, malformed: undefined });
     expect(events.find((event) => event.type === "final.snapshot" && event.messageId)).toBeTruthy();
     expect(events.some((event) => event.type === "error")).toBe(false);
+  } finally {
+    runtime.close();
+    await fakeLlama.close();
+    fs.rmSync(projectDir, { recursive: true, force: true });
+  }
+});
+
+test("real OpenCode GPT-OSS proxy terminates final-channel overruns before later reasoning", async () => {
+  test.setTimeout(90_000);
+  const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), "unit0-opencode-runtime-final-overrun-"));
+  const fakeLlama = await startFakeRawCompletionServer([
+    [
+      "<|channel|>analysis<|message|>Need answer.",
+      "<|end|><|start|>assistant<|channel|>final<|message|>",
+      "ok",
+      "<|end|><|start|>assistant<|channel|>analysis<|message|>",
+      "This should not be visible.",
+      "<|return|>"
+    ]
+  ]);
+  const runtime = new RealOpenCodeRuntime();
+  try {
+    const events = await collectOpenCodeEvents(runtime, {
+      cwd: projectDir,
+      prompt: "Answer ok.",
+      modelLabel: "fake-gpt-oss",
+      nativeGptOss: true,
+      endpoint: {
+        baseUrl: fakeLlama.url,
+        modelId: "fake-gpt-oss",
+        rawCompletionUrl: `${fakeLlama.url}/completion`,
+        tokenizeUrl: `${fakeLlama.url}/tokenize`
+      },
+      settings: baseSettings,
+      permissionMode: "full_access"
+    });
+
+    expect(events.some((event) => event.type === "error"), JSON.stringify(events)).toBe(false);
+    expect(events.filter((event) => event.type === "reasoning.delta").map((event) => event.text).join("")).toBe("Need answer.");
+    expect(events.filter((event) => event.type === "assistant.delta").map((event) => event.text).join("")).toBe("ok");
+    expect(events.some((event) => event.type === "turn.completed")).toBe(true);
+    expect(events.find((event) => event.type === "final.snapshot")).toMatchObject({ type: "final.snapshot", content: "ok", malformed: undefined });
+    expect(fakeLlama.requests[0]?.stop).toEqual(["<|return|>"]);
   } finally {
     runtime.close();
     await fakeLlama.close();
@@ -902,11 +1052,11 @@ test("real OpenCode GPT-OSS proxy budgets large webfetch output before post-tool
     await fakeLlama.waitForPause("large-webfetch-final");
     await expect.poll(() => fakeLlama.requests.length).toBe(3);
     expect(fakeLlama.requests[1]?.prompt).toContain("# OpenCode Tool Result");
-    expect(fakeLlama.requests[1]?.prompt).toContain("OpenCode tool result truncated to fit the local model context window");
+    expect(fakeLlama.requests[1]?.prompt).not.toContain("Use the Task tool");
     expect(fakeLlama.requests[1]?.nPredict).toBeGreaterThan(0);
     expect(fakeLlama.requests[1]?.nPredict).toBeLessThanOrEqual(gptOssOpenCodeRequestMaxTokensForPromptTokens(fakePromptTokens(fakeLlama.requests[1]?.prompt ?? ""), { ...baseSettings, nCtx: 32768, maxTokens: 512 }, fakeContinuationReserveTokens));
     expect(fakeLlama.requests[2]?.prompt).toContain("<|channel|>final<|message|>");
-    expect(fakeLlama.requests[2]?.prompt).toContain("OpenCode tool result truncated to fit the local model context window");
+    expect(fakeLlama.requests[2]?.prompt).not.toContain("Use the Task tool");
     expect(fakeLlama.requests[2]?.prompt).toContain("Tool output enough.");
     expect(fakeLlama.requests[2]?.nPredict).toBeGreaterThan(0);
     expect(fakeLlama.requests[2]?.nPredict).toBeLessThanOrEqual(gptOssOpenCodeRequestMaxTokensForPromptTokens(fakePromptTokens(fakeLlama.requests[2]?.prompt ?? ""), { ...baseSettings, nCtx: 32768, maxTokens: 512 }));
@@ -1171,7 +1321,7 @@ async function startFakeRawCompletionServer(responses: FakeChunk[][], options: {
   release: (label: string) => void;
   close: () => Promise<void>;
 }> {
-  const requests: Array<{ prompt: string; nPredict: number; cachePrompt: boolean | null; idSlot: number | null }> = [];
+  const requests: Array<{ prompt: string; nPredict: number; cachePrompt: boolean | null; idSlot: number | null; stop?: string[] }> = [];
   const tokenizeRequests: string[] = [];
   const tokenize = options.tokenize ?? ((content: string) => Array.from({ length: Math.ceil(content.length / 3) }, (_, index) => index));
   const pauses = new Map<string, { paused: Promise<void>; released: Promise<void>; release: () => void; resolvePaused: () => void }>();
@@ -1213,7 +1363,8 @@ async function startFakeRawCompletionServer(responses: FakeChunk[][], options: {
         prompt: typeof body.prompt === "string" ? body.prompt : "",
         nPredict,
         cachePrompt: typeof body.cache_prompt === "boolean" ? body.cache_prompt : null,
-        idSlot: typeof body.id_slot === "number" ? body.id_slot : null
+        idSlot: typeof body.id_slot === "number" ? body.id_slot : null,
+        stop: Array.isArray(body.stop) ? body.stop.filter((value: unknown): value is string => typeof value === "string") : undefined
       });
       const chunks = responses[Math.min(requestIndex, responses.length - 1)] ?? [];
       requestIndex += 1;

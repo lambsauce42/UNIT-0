@@ -861,9 +861,10 @@ export class GptOssChannelParser {
   private buffer = "";
   private activeChannel: "analysis" | "commentary" | "final" | "final_json" | "tool_json" | null = null;
   private activeToolRecipient = "";
+  private emittedFinalContent = false;
   private done = false;
 
-  constructor(private readonly options: { defaultChannel?: "analysis" | "final"; toolRecipients?: string[] } = {}) {}
+  constructor(private readonly options: { defaultChannel?: "analysis" | "final"; toolRecipients?: string[]; stopAfterFinalEnd?: boolean } = {}) {}
 
   push(text: string): GptOssChannelParserResult {
     if (this.done || !text) {
@@ -886,6 +887,7 @@ export class GptOssChannelParser {
       const terminator = firstSpecialTerminator(this.buffer);
       if (terminator) {
         const endIndex = terminator.index;
+        const terminatedChannel = this.activeChannel;
         if (this.activeChannel === "final_json") {
           appendCommentaryFinalJson(this.buffer.slice(0, endIndex), content);
         } else if (this.activeChannel === "tool_json") {
@@ -896,6 +898,11 @@ export class GptOssChannelParser {
         this.buffer = this.buffer.slice(endIndex + terminator.marker.length);
         this.activeChannel = null;
         this.activeToolRecipient = "";
+        if (this.options.stopAfterFinalEnd && terminatedChannel === "final" && terminator.marker === GPTOSS_END_MARKER && this.emittedFinalContent) {
+          this.buffer = "";
+          this.done = true;
+          return channelParserResult(content, reasoning, commentary, toolCalls);
+        }
         if (terminator.marker === GPTOSS_RETURN_MARKER || terminator.marker === GPTOSS_CALL_MARKER) {
           this.buffer = "";
           this.done = true;
@@ -1034,6 +1041,9 @@ export class GptOssChannelParser {
     if (this.activeChannel === "commentary") {
       commentary.push(text);
       return;
+    }
+    if (this.activeChannel === "final") {
+      this.emittedFinalContent = true;
     }
     content.push(text);
   }

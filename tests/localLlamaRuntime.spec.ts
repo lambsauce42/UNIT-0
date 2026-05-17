@@ -143,6 +143,15 @@ test("stops GPT-OSS channel parsing after terminal return and call markers", () 
   expect(toolParser.finish()).toEqual({ content: "", reasoning: "" });
 });
 
+test("optionally treats final channel end as the assistant message boundary", () => {
+  const parser = new GptOssChannelParser({ defaultChannel: "analysis", stopAfterFinalEnd: true });
+  expect(parser.push("<|channel|>analysis<|message|>Need answer.<|end|><|start|>assistant<|channel|>final<|message|>ok<|end|><|start|>assistant<|channel|>analysis<|message|>leaked")).toEqual({
+    content: "ok",
+    reasoning: "Need answer."
+  });
+  expect(parser.finish()).toEqual({ content: "", reasoning: "" });
+});
+
 test("parses GPT-OSS commentary prose separately from final and tool calls", () => {
   const bareCommentaryParser = new GptOssChannelParser({ defaultChannel: "analysis", toolRecipients: ["glob"] });
   expect(bareCommentaryParser.push("<|channel|>analysis<|message|>Need acknowledge.<|end|><|start|>assistant<|channel|>commentary<|message|>Ok<|return|>")).toEqual({

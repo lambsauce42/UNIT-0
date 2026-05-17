@@ -35,7 +35,7 @@ import { codexItemToTimelineBlock, type CodexRuntime, type CodexThreadEvent, typ
 import { LocalEmbeddingRuntime, type DocumentEmbeddingRuntime } from "./embeddingRuntime.js";
 import { ChatStore, DEFAULT_CODEX_MODELS, type ChatDocumentSearchEntry } from "./chatStore.js";
 import { LocalLlamaRuntime } from "./localLlamaRuntime.js";
-import { RealOpenCodeRuntime, type OpenCodeRuntime, type OpenCodeRuntimeEvent } from "./openCodeRuntime.js";
+import { debugOpenCodeDiagnostic, RealOpenCodeRuntime, type OpenCodeRuntime, type OpenCodeRuntimeEvent } from "./openCodeRuntime.js";
 import { RemoteHostRuntime, type RemoteStreamMetrics } from "./remoteHostRuntime.js";
 
 const execFileAsync = promisify(execFile);
@@ -1582,6 +1582,23 @@ export class ChatService {
     } catch (error) {
       resetLocalRuntimeAfterTurn = true;
       const message = errorMessage(error);
+      if (shouldDiscardOpenCodeAssistantContentAfterError(message)) {
+        this.store.replaceMessageContent(options.assistantMessageId, "");
+        removeOpenCodeAssistantMessageBlocks(timelineBlocks);
+        this.store.updateMessageTimelineBlocks(options.assistantMessageId, timelineBlocks);
+      }
+      debugOpenCodeDiagnostic("chat.opencode_failed", {
+        threadId: options.thread.id,
+        assistantMessageId: options.assistantMessageId,
+        modelId: options.model.id,
+        modelLabel: options.model.label,
+        runCancelled: options.runCancelled(),
+        ownsActiveGeneration: options.ownsActiveGeneration(),
+        timelineBlockCount: timelineBlocks.length,
+        assistantTextChars: assistantTextStream.reduce((total, entry) => total + entry.text.length, 0),
+        reasoningTextChars: reasoningTextStream.reduce((total, entry) => total + entry.text.length, 0),
+        message
+      });
       this.store.updateMessageStatus(options.assistantMessageId, options.runCancelled() ? "interrupted" : "error");
       if (!options.runCancelled()) {
         this.appendAssistantErrorBlock(options.assistantMessageId, message, "opencode_failed");
@@ -3036,6 +3053,27 @@ function replaceOpenCodeStreamEntries(entries: Array<{ id: string; text: string 
     }
   }
   entries.splice(firstIndex >= 0 ? firstIndex : entries.length, 0, { id, text });
+}
+
+function removeOpenCodeAssistantMessageBlocks(blocks: ChatTimelineBlock[]): void {
+  for (let index = blocks.length - 1; index >= 0; index -= 1) {
+    if (blocks[index].kind === "assistant_message") {
+      blocks.splice(index, 1);
+    }
+  }
+}
+
+function shouldDiscardOpenCodeAssistantContentAfterError(message: string): boolean {
+  return [
+    "OpenCode GPT-OSS emitted malformed channel delimiters.",
+    "OpenCode GPT-OSS emitted reasoning after final output.",
+    "OpenCode GPT-OSS emitted commentary after final output.",
+    "OpenCode GPT-OSS emitted a tool call after final output.",
+    "OpenCode GPT-OSS emitted final output before streamed reasoning.",
+    "OpenCode GPT-OSS emitted commentary before streamed reasoning.",
+    "OpenCode GPT-OSS emitted a tool call before streamed reasoning.",
+    "OpenCode GPT-OSS emitted divergent native and parsed reasoning."
+  ].some((needle) => message.includes(needle));
 }
 
 function questionActionAnswers(block: Extract<ChatTimelineBlock, { kind: "question" }>, payload: ChatTimelineActionPayload): Record<string, string> {
